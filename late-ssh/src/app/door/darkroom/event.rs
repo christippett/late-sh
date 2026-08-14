@@ -767,6 +767,29 @@ impl Active {
                 }
                 rows.push(Row::DropCancel);
             }
+            Phase::DropFor { loot_index } => {
+                if let Some(target) = self.loot.get(*loot_index) {
+                    let needed = world_data::weight(target.item) - look.free_space();
+                    if let Some(trip) = look.trip {
+                        for item in world_data::CARRYABLE {
+                            let count = trip.carrying(item);
+                            if count > 0 && item != target.item {
+                                let item_weight = world_data::weight(item);
+                                if item_weight > 0.0 {
+                                    let num_to_drop = (needed / item_weight).ceil() as i64;
+                                    if num_to_drop <= count {
+                                        rows.push(Row::Drop {
+                                            item,
+                                            count: num_to_drop.max(1),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                rows.push(Row::DropCancel);
+            }
             Phase::Story | Phase::Spoils { .. } => {
                 for (index, _) in self.loot.iter().enumerate() {
                     rows.push(Row::Take(index));
