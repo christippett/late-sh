@@ -19,8 +19,12 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from typing import Dict, List, Optional, Set, Tuple
 
+def char_display_width(ch: str) -> int:
+    """Return display column width of a character on the terminal canvas (1 or 2)."""
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 # late-ssh/src/app/artboard/state.rs: PAINT_PALETTE (16 colors)
 # Index 0..15
 PAINT_PALETTE: List[Tuple[int, int, int]] = [
@@ -209,13 +213,23 @@ def parse_chafa_ansi(text: str) -> List[List[Cell]]:
 
 
 def run_chafa(image_path: str, chafa_flags: List[str]) -> str:
-    """Execute chafa on image_path with provided flags, ensuring --fg-only and --format=symbols."""
+    """Execute chafa on image_path with provided flags, ensuring --fg-only and symbol format."""
     if not shutil.which("chafa"):
         raise RuntimeError("chafa binary not found in PATH. Install via `brew install chafa`.")
 
     flags = list(chafa_flags)
-    if not any(f.startswith("--format") for f in flags):
+    # Check if format flag was passed (-f or --format)
+    has_format = False
+    i = 0
+    while i < len(flags):
+        f = flags[i]
+        if f == "-f" or f.startswith("--format"):
+            has_format = True
+            break
+        i += 1
+    if not has_format:
         flags.append("--format=symbols")
+
     if not any(f.startswith("--fg-only") for f in flags):
         flags.append("--fg-only")
 
@@ -224,7 +238,6 @@ def run_chafa(image_path: str, chafa_flags: List[str]) -> str:
     if res.returncode != 0:
         raise RuntimeError(f"chafa execution failed (code {res.returncode}): {res.stderr.strip()}")
     return res.stdout
-
 
 def map_colors_with_contrast(grid: List[List[Cell]]) -> None:
     """
@@ -358,7 +371,7 @@ def optimize_drawing_stream(
 ) -> Tuple[bytes, Dict[str, int]]:
     """
     Generate the minimal byte sequence to draw grid onto late.sh Artboard.
-    Tracks cursor position and active color state.
+    Tracks visual cursor column (accounting for wide characters) and active color state.
     Color cycling:
       Ctrl+U (0x15) = cycle_paint_color(-1)
       Ctrl+Y (0x19) = cycle_paint_color(+1)
@@ -366,9 +379,9 @@ def optimize_drawing_stream(
       Arrow keys: Up (\x1b[A), Down (\x1b[B), Right (\x1b[C), Left (\x1b[D)
     Painting:
       Emits contiguous same-colored character runs wrapped in bracketed paste
-      (\\x1b[200~...\\x1b[201~). This guarantees full UTF-8 Unicode support (e.g.
-      block characters like █, ▄, ▀) while maintaining 100% color fidelity and
-      drastically reducing transmission overhead.
+      (\\x1b[200~...\\x1b[201~). Automatically tracks display width (e.g. wide
+      glyphs occupy 2 columns) so cursor navigation stays 100% synchronized with
+      the artboard canvas engine.
     """
     stream = bytearray()
     stats = {
@@ -424,22 +437,33 @@ def optimize_drawing_stream(
     height = len(grid)
     for y in range(height):
         row = grid[y]
-        x = 0
-        while x < len(row):
-            cell = row[x]
+        col = 0
+        idx = 0
+        while idx < len(row):
+            cell = row[idx]
+            w = char_display_width(cell.char)
             if cell.char == " ":
-                x += 1
+                col += w
+                idx += 1
                 continue
 
             # Find contiguous run of cells on the same row with the same palette_idx
-            run_chars = []
-            start_x = x
+            start_col = col
             target_pal = cell.palette_idx
-            while x < len(row) and row[x].char != " " and row[x].palette_idx == target_pal:
-                run_chars.append(row[x].char)
-                x += 1
+            run_chars = []
+            run_visual_width = 0
 
-            tx = origin_x + start_x
+            while idx < len(row):
+                c = row[idx]
+                cw = char_display_width(c.char)
+                if c.char == " " or c.palette_idx != target_pal:
+                    break
+                run_chars.append(c.char)
+                run_visual_width += cw
+                col += cw
+                idx += 1
+
+            tx = origin_x + start_col
             ty = origin_y + y
 
             if curr_x != tx or curr_y != ty:
@@ -452,7 +476,7 @@ def optimize_drawing_stream(
             run_bytes = run_text.encode("utf-8")
             stream.extend(b"\x1b[200~" + run_bytes + b"\x1b[201~")
             stats["chars_typed"] += len(run_chars)
-            curr_x += len(run_chars)
+            curr_x += run_visual_width
 
     stats["total_bytes"] = len(stream)
     return bytes(stream), stats

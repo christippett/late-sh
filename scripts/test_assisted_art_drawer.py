@@ -11,14 +11,16 @@ Tests for scripts/assisted_art_drawer.py:
 1. CIELAB color conversion and CIE76 Delta-E distance metrics.
 2. Chafa ANSI parser (24-bit SGR, 16-color ANSI, extended 256-color cube, control stripping).
 3. Contrast-preserving color mapping to PAINT_PALETTE.
-4. Keystroke optimization and virtual artboard canvas simulation.
+4. Keystroke optimization, wide-character display tracking, and virtual artboard canvas simulation.
 5. Production safety gate preventing connections to production late.sh.
+6. Chafa flags preservation (-c 16, -f symbols, etc.).
 """
 
 import math
 import os
 import pathlib
 import sys
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -27,12 +29,14 @@ from scripts.assisted_art_drawer import (
     PAINT_PALETTE,
     CANVAS_WIDTH,
     CANVAS_HEIGHT,
+    char_display_width,
     rgb_to_cielab,
     delta_e_cielab,
     parse_chafa_ansi,
     map_colors_with_contrast,
     generate_ansi_preview,
     optimize_drawing_stream,
+    run_chafa,
 )
 
 
@@ -55,6 +59,15 @@ def test_rgb_to_cielab_and_delta_e():
 
     # Self distance is 0
     assert delta_e_cielab((l_w, a_w, b_w), (l_w, a_w, b_w)) == 0.0
+
+
+def test_char_display_width():
+    assert char_display_width("A") == 1
+    assert char_display_width(" ") == 1
+    assert char_display_width("█") == 1  # block characters
+    assert char_display_width("こ") == 2  # hiragana
+    assert char_display_width("し") == 2
+    assert char_display_width("エ") == 2  # katakana
 
 
 def test_ansi_parser_24bit_and_control_stripping():
@@ -130,14 +143,14 @@ def test_ansi_preview_generation():
     assert "\x1b[38;2;84;196;255mB" in preview
 
 
-def test_drawing_stream_simulation():
-    # Simulate execution on a virtual artboard canvas
-    c1 = Cell("H", (255, 110, 64))
+def test_drawing_stream_simulation_with_wide_characters():
+    # Simulate execution on a virtual artboard canvas with narrow and wide characters
+    c1 = Cell("こ", (255, 110, 64))  # width 2
     c1.palette_idx = 0
-    c2 = Cell("i", (255, 236, 96))
+    c2 = Cell("あ", (255, 236, 96))  # width 2
     c2.palette_idx = 1
     c3 = Cell(" ", None)
-    c4 = Cell("!", (224, 116, 255))
+    c4 = Cell("!", (224, 116, 255))  # width 1
     c4.palette_idx = 12
 
     grid = [
@@ -145,7 +158,7 @@ def test_drawing_stream_simulation():
         [c3, c4],
     ]
 
-    origin_x, origin_y = 12, 18
+    origin_x, origin_y = 10, 10
     stream, stats = optimize_drawing_stream(grid, origin_x=origin_x, origin_y=origin_y)
 
     assert stats["chars_typed"] == 3
@@ -186,8 +199,9 @@ def test_drawing_stream_simulation():
             assert paste_end != -1
             paste_text = b[i:paste_end].decode("utf-8")
             for ch in paste_text:
+                w = char_display_width(ch)
                 canvas[(cx, cy)] = (ch, color)
-                cx += 1
+                cx += w
             i = paste_end + 6
         else:
             first = b[i]
@@ -200,10 +214,21 @@ def test_drawing_stream_simulation():
             else:
                 ch_len = 4
             ch = b[i : i + ch_len].decode("utf-8")
+            w = char_display_width(ch)
             canvas[(cx, cy)] = (ch, color)
-            cx += 1
+            cx += w
             i += ch_len
-    assert canvas[(13, 19)] == ("!", 12)
+
+    # Assert exact visual placement accounting for wide characters:
+    # c1 ("こ", width 2) starts at 10 -> occupies 10, 11
+    # c2 ("あ", width 2) starts at 12 -> occupies 12, 13
+    assert canvas[(10, 10)] == ("こ", 0)
+    assert canvas[(12, 10)] == ("あ", 1)
+    # Row 11:
+    # c3 is space at visual col 10 (width 1)
+    # c4 ("!", width 1) is at visual col 11
+    assert (10, 11) not in canvas
+    assert canvas[(11, 11)] == ("!", 12)
 
 
 def test_production_safety_gate():
