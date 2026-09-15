@@ -86,7 +86,7 @@ class RubiksCubeBot(LiveBotClient):
         self.log("Selecting Rubik's Cube (5j\\r)...")
         # In the Arcade lobby order:
         # 0: 2048, 1: Tetris, 2: Snake, 3: Traffic, 4: Le Word, 5: Rubik's Cube
-        self.send_keys('jjjjj\r')
+        self.send_keys('j\r')
         time.sleep(1)
 
     def is_solved(self, screen_lines) -> bool:

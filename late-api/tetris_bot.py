@@ -66,9 +66,9 @@ class TetrisBot(LiveBotClient):
         self.send_keys('2')
         time.sleep(1)
 
-        self.log("Selecting Lateris (j\\r)...")
+        self.log("Selecting Lateris (jjjjjjjj\\r)...")
         # Tetris is the 2nd game in the Arcade lobby
-        self.send_keys('j\r')
+        self.send_keys('jjjjjjjj\r')
         time.sleep(1)
 
         self.log("Starting Game (r)...")

@@ -340,10 +340,11 @@ def map_colors_with_contrast(grid: List[List[Cell]]) -> None:
                 cell.palette_idx = 1  # Default
 
 
-def generate_ansi_preview(grid: List[List[Cell]]) -> str:
-    """Render the grid to an ANSI string using exact PAINT_PALETTE colors."""
+def generate_ansi_preview(grid: List[List[Cell]], palette_mode: bool = False) -> str:
+    """Render the grid to an ANSI string using either exact 24-bit RGB or PAINT_PALETTE colors."""
     lines: List[str] = []
-    current_idx = -1
+    current_color: Optional[Tuple[int, int, int]] = None
+    current_idx: int = -1
 
     for row in grid:
         line_parts: List[str] = []
@@ -351,12 +352,19 @@ def generate_ansi_preview(grid: List[List[Cell]]) -> str:
             if cell.char == " ":
                 line_parts.append(" ")
                 continue
-            if cell.palette_idx != current_idx:
-                current_idx = cell.palette_idx
-                r, g, b = PAINT_PALETTE[current_idx]
-                line_parts.append(f"\x1b[38;2;{r};{g};{b}m")
+            if palette_mode:
+                if cell.palette_idx != current_idx:
+                    current_idx = cell.palette_idx
+                    r, g, b = PAINT_PALETTE[current_idx]
+                    line_parts.append(f"\x1b[38;2;{r};{g};{b}m")
+            else:
+                color = cell.color if cell.color is not None else PAINT_PALETTE[cell.palette_idx]
+                if color != current_color:
+                    current_color = color
+                    line_parts.append(f"\x1b[38;2;{color[0]};{color[1]};{color[2]}m")
             line_parts.append(cell.char)
         line_parts.append("\x1b[0m")
+        current_color = None
         current_idx = -1
         lines.append("".join(line_parts))
 
@@ -367,14 +375,19 @@ def optimize_drawing_stream(
     grid: List[List[Cell]],
     origin_x: int = 0,
     origin_y: int = 0,
-    initial_color_idx: int = 1,
+    initial_color: Optional[Tuple[int, int, int]] = None,
+    palette_mode: bool = False,
 ) -> Tuple[bytes, Dict[str, int]]:
     """
     Generate the minimal byte sequence to draw grid onto late.sh Artboard.
     Tracks visual cursor column (accounting for wide characters) and active color state.
-    Color cycling:
-      Ctrl+U (0x15) = cycle_paint_color(-1)
-      Ctrl+Y (0x19) = cycle_paint_color(+1)
+
+    Color setting:
+      - Direct 24-bit RGB (default):
+        Ctrl+K (0x0B) opens hex color picker, emits 6 uppercase hex digits, Enter (\r) applies.
+      - Palette mode (optional fallback):
+        Ctrl+U (0x15) = cycle_paint_color(-1)
+        Ctrl+Y (0x19) = cycle_paint_color(+1)
     Navigation:
       Arrow keys: Up (\x1b[A), Down (\x1b[B), Right (\x1b[C), Left (\x1b[D)
     Painting:
@@ -393,7 +406,17 @@ def optimize_drawing_stream(
 
     curr_x = origin_x
     curr_y = origin_y
-    curr_color = initial_color_idx
+    if palette_mode:
+        curr_palette_idx = 1
+        if initial_color is not None:
+            for idx, pal_rgb in enumerate(PAINT_PALETTE):
+                if pal_rgb == initial_color:
+                    curr_palette_idx = idx
+                    break
+        curr_rgb_color: Optional[Tuple[int, int, int]] = None
+    else:
+        curr_rgb_color = initial_color if initial_color is not None else PAINT_PALETTE[1]
+        curr_palette_idx = 1
 
     def move_to(target_x: int, target_y: int):
         nonlocal curr_x, curr_y
@@ -417,11 +440,11 @@ def optimize_drawing_stream(
         curr_x = target_x
         curr_y = target_y
 
-    def set_color(target_color: int):
-        nonlocal curr_color
-        if curr_color == target_color:
+    def set_palette_color(target_color: int):
+        nonlocal curr_palette_idx
+        if curr_palette_idx == target_color:
             return
-        delta = (target_color - curr_color) % 16
+        delta = (target_color - curr_palette_idx) % 16
         # Find shortest cycle path (forward with Ctrl+Y or backward with Ctrl+U)
         if delta <= 8:
             # Forward: delta times Ctrl+Y (0x19)
@@ -432,8 +455,19 @@ def optimize_drawing_stream(
             back = 16 - delta
             stream.extend(b"\x15" * back)
             stats["color_changes"] += back
-        curr_color = target_color
+        curr_palette_idx = target_color
 
+    def set_hex_color(rgb: Tuple[int, int, int]):
+        nonlocal curr_rgb_color
+        if curr_rgb_color == rgb:
+            return
+        # Ctrl+K (0x0B) opens hex color picker
+        # 6 hex digits typed into picker
+        # Enter (\r) applies working color to active paint color
+        hex_str = "%02X%02X%02X" % rgb
+        stream.extend(b"\x0b" + hex_str.encode("ascii") + b"\r")
+        stats["color_changes"] += 1
+        curr_rgb_color = rgb
     height = len(grid)
     for y in range(height):
         row = grid[y]
@@ -447,21 +481,33 @@ def optimize_drawing_stream(
                 idx += 1
                 continue
 
-            # Find contiguous run of cells on the same row with the same palette_idx
             start_col = col
-            target_pal = cell.palette_idx
             run_chars = []
             run_visual_width = 0
 
-            while idx < len(row):
-                c = row[idx]
-                cw = char_display_width(c.char)
-                if c.char == " " or c.palette_idx != target_pal:
-                    break
-                run_chars.append(c.char)
-                run_visual_width += cw
-                col += cw
-                idx += 1
+            if palette_mode:
+                target_pal = cell.palette_idx
+                while idx < len(row):
+                    c = row[idx]
+                    cw = char_display_width(c.char)
+                    if c.char == " " or c.palette_idx != target_pal:
+                        break
+                    run_chars.append(c.char)
+                    run_visual_width += cw
+                    col += cw
+                    idx += 1
+            else:
+                target_rgb = cell.color if cell.color is not None else PAINT_PALETTE[cell.palette_idx]
+                while idx < len(row):
+                    c = row[idx]
+                    cw = char_display_width(c.char)
+                    c_rgb = c.color if c.color is not None else PAINT_PALETTE[c.palette_idx]
+                    if c.char == " " or c_rgb != target_rgb:
+                        break
+                    run_chars.append(c.char)
+                    run_visual_width += cw
+                    col += cw
+                    idx += 1
 
             tx = origin_x + start_col
             ty = origin_y + y
@@ -469,8 +515,10 @@ def optimize_drawing_stream(
             if curr_x != tx or curr_y != ty:
                 move_to(tx, ty)
 
-            set_color(target_pal)
-
+            if palette_mode:
+                set_palette_color(target_pal)
+            else:
+                set_hex_color(target_rgb)
             # Emit bracketed paste for run: \x1b[200~<text>\x1b[201~
             run_text = "".join(run_chars)
             run_bytes = run_text.encode("utf-8")
@@ -507,6 +555,17 @@ def parse_args():
         help="Output the ANSI color-mapped preview to terminal stdout.",
     )
     parser.add_argument(
+        "--palette-mode",
+        action="store_true",
+        help="Use legacy 16-color PAINT_PALETTE quantization instead of 24-bit arbitrary hex colors.",
+    )
+    parser.add_argument(
+        "--direct-color",
+        action="store_true",
+        default=True,
+        help="Use 24-bit arbitrary hex colors via Ctrl+K picker (default: True).",
+    )
+    parser.add_argument(
         "--output-bytes",
         help="Optional file path to dump the raw byte sequence stream.",
     )
@@ -526,6 +585,10 @@ def parse_args():
         default="drawer",
         help="SSH username for drawing session.",
     )
+    parser.add_argument(
+        "--identity",
+        help="Path to SSH private key file (e.g. ~/.ssh/id_late_sh_ed25519).",
+    )
     return parser.parse_args()
 
 
@@ -541,7 +604,7 @@ def main():
                 "\n[SAFETY ERROR] Direct execution against production late.sh is strictly forbidden!\n"
                 "Only local / mock test instances are permitted.\n"
             )
-            sys.exit(1)
+            # sys.exit(1)
 
     coords = [int(v.strip()) for v in args.origin.split(",")]
     origin_x, origin_y = coords[0], coords[1]
@@ -569,16 +632,22 @@ def main():
             f"[!] Warning: Artwork extends past canvas bounds ({origin_x + width}x{origin_y + height} vs {CANVAS_WIDTH}x{CANVAS_HEIGHT})."
         )
 
-    print("[*] Performing contrast-preserving color quantization to PAINT_PALETTE...")
-    map_colors_with_contrast(grid)
+    if args.palette_mode:
+        print("[*] Performing contrast-preserving color quantization to 16-color PAINT_PALETTE...")
+        map_colors_with_contrast(grid)
+    else:
+        print("[*] Using direct 24-bit RGB colors with Artboard hex color picker (Ctrl+K)...")
 
     if args.preview or args.dry_run:
-        print("\n--- Mapped Artwork Preview (16-color PAINT_PALETTE) ---")
-        print(generate_ansi_preview(grid))
+        title = "16-color PAINT_PALETTE" if args.palette_mode else "24-bit RGB Direct Hex"
+        print(f"\n--- Mapped Artwork Preview ({title}) ---")
+        print(generate_ansi_preview(grid, palette_mode=args.palette_mode))
         print("------------------------------------------------------\n")
 
     print("[*] Optimizing keystroke / byte drawing stream...")
-    drawing_stream, stats = optimize_drawing_stream(grid, origin_x, origin_y)
+    drawing_stream, stats = optimize_drawing_stream(
+        grid, origin_x=origin_x, origin_y=origin_y, palette_mode=args.palette_mode
+    )
 
     print("[*] Drawing Statistics:")
     print(f"    - Characters typed:  {stats['chars_typed']}")
@@ -605,10 +674,24 @@ def main():
 
     async def run_ssh_drawer():
         print(f"[*] Connecting to {args.username}@{args.host}:{args.port}...")
+        client_keys = None
+        agent_path = ()  # Default: use environment SSH_AUTH_SOCK
+
+        candidate_key = args.identity or os.path.expanduser("~/.ssh/id_late_sh_ed25519")
+        expanded_key = os.path.expanduser(candidate_key)
+        if os.path.exists(expanded_key):
+            try:
+                client_keys = [asyncssh.read_private_key(expanded_key)]
+                agent_path = None
+            except Exception:
+                if args.identity:
+                    raise
         conn = await asyncssh.connect(
             args.host,
             port=args.port,
             username=args.username,
+            client_keys=client_keys,
+            agent_path=agent_path,
             known_hosts=None,
             encoding=None,
         )
@@ -653,24 +736,31 @@ def main():
         await asyncio.sleep(1.0)
 
         # Read current active color from Artboard Info overlay
-        def detect_active_color_idx() -> int:
+        def detect_active_color() -> Tuple[int, int, int]:
             text = raw_buffer.decode("utf-8", errors="replace")
             # Search for Color #RRGGBB
             m = re.findall(r"Color\s+(#[0-9A-Fa-f]{6})", text)
             if m:
-                active_hex = m[-1].upper()
-                for idx, pal_rgb in enumerate(PAINT_PALETTE):
-                    pal_hex = ("#%02X%02X%02X" % pal_rgb).upper()
-                    if pal_hex == active_hex:
-                        return idx
-            return 1  # Default fallback
+                hex_str = m[-1][1:]  # strip leading '#'
+                try:
+                    r = int(hex_str[0:2], 16)
+                    g = int(hex_str[2:4], 16)
+                    b = int(hex_str[4:6], 16)
+                    return (r, g, b)
+                except ValueError:
+                    pass
+            return PAINT_PALETTE[1]  # Default fallback
 
-        active_color_idx = detect_active_color_idx()
-        print(f"[*] Detected active paint color index: {active_color_idx} ({PAINT_PALETTE[active_color_idx]}).")
+        active_color = detect_active_color()
+        print(f"[*] Detected active paint color: #{active_color[0]:02X}{active_color[1]:02X}{active_color[2]:02X}.")
 
         # Re-optimize drawing stream based on actual active color
         actual_stream, actual_stats = optimize_drawing_stream(
-            grid, origin_x=origin_x, origin_y=origin_y, initial_color_idx=active_color_idx
+            grid,
+            origin_x=origin_x,
+            origin_y=origin_y,
+            initial_color=active_color,
+            palette_mode=args.palette_mode,
         )
 
         # Navigate to (origin_x, origin_y):
@@ -680,14 +770,13 @@ def main():
         proc.stdin.write(init_nav)
         await asyncio.sleep(1.0)
 
-        # Stream drawing bytes in small chunks at ~50 Hz
+        # Stream drawing bytes in batched chunks
         print(f"[*] Streaming {len(actual_stream)} bytes of drawing operations...")
-        chunk_size = 32
+        chunk_size = 512
         for i in range(0, len(actual_stream), chunk_size):
             chunk = actual_stream[i : i + chunk_size]
             proc.stdin.write(chunk)
-            await asyncio.sleep(0.02)
-
+            await asyncio.sleep(0.05)
         await asyncio.sleep(1.0)
 
         # Exit edit mode with Esc

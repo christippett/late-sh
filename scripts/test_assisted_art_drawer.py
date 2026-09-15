@@ -137,11 +137,15 @@ def test_ansi_preview_generation():
     cell_b.palette_idx = 7
     grid = [[cell_a, cell_b]]
 
-    preview = generate_ansi_preview(grid)
-    # Preview should include RGB escapes for palette[0] (255;110;64) and palette[7] (84;196;255)
-    assert "\x1b[38;2;255;110;64mA" in preview
-    assert "\x1b[38;2;84;196;255mB" in preview
+    # Direct 24-bit RGB preview
+    preview_direct = generate_ansi_preview(grid, palette_mode=False)
+    assert "\x1b[38;2;255;110;64mA" in preview_direct
+    assert "\x1b[38;2;84;196;255mB" in preview_direct
 
+    # Legacy palette preview
+    preview_palette = generate_ansi_preview(grid, palette_mode=True)
+    assert "\x1b[38;2;255;110;64mA" in preview_palette
+    assert "\x1b[38;2;84;196;255mB" in preview_palette
 
 def test_drawing_stream_simulation_with_wide_characters():
     # Simulate execution on a virtual artboard canvas with narrow and wide characters
@@ -159,7 +163,7 @@ def test_drawing_stream_simulation_with_wide_characters():
     ]
 
     origin_x, origin_y = 10, 10
-    stream, stats = optimize_drawing_stream(grid, origin_x=origin_x, origin_y=origin_y)
+    stream, stats = optimize_drawing_stream(grid, origin_x=origin_x, origin_y=origin_y, palette_mode=True)
 
     assert stats["chars_typed"] == 3
     assert stats["color_changes"] >= 1
@@ -230,6 +234,106 @@ def test_drawing_stream_simulation_with_wide_characters():
     assert (10, 11) not in canvas
     assert canvas[(11, 11)] == ("!", 12)
 
+
+def test_hex_color_picker_stream():
+    # Test direct 24-bit RGB hex selection sequence generation
+    cell_1 = Cell("A", (0x12, 0x34, 0x56))
+    cell_2 = Cell("B", (0xFE, 0xDC, 0xBA))
+    grid = [[cell_1, cell_2]]
+
+    stream, stats = optimize_drawing_stream(grid, origin_x=0, origin_y=0, palette_mode=False)
+
+    # Initial color defaults to PAINT_PALETTE[1] (255, 236, 96 = #FFEC60).
+    # First cell (0x12, 0x34, 0x56):
+    # \x0b123456\r
+    assert b"\x0b123456\r" in stream
+    # Second cell (0xFE, 0xDC, 0xBA):
+    # \x0bFEDCBA\r
+    assert b"\x0bFEDCBA\r" in stream
+    assert stats["color_changes"] == 2
+
+
+def test_drawing_stream_simulation_with_direct_24bit_hex():
+    # Simulate execution on a virtual artboard canvas using direct 24-bit hex color picking
+    c1 = Cell("こ", (18, 52, 86))   # width 2, #123456
+    c2 = Cell("あ", (254, 220, 186)) # width 2, #FEDCBA
+    c3 = Cell(" ", None)
+    c4 = Cell("!", (42, 42, 42))    # width 1, #2A2A2A
+
+    grid = [
+        [c1, c2],
+        [c3, c4],
+    ]
+
+    origin_x, origin_y = 5, 5
+    stream, stats = optimize_drawing_stream(grid, origin_x=origin_x, origin_y=origin_y, palette_mode=False)
+
+    assert stats["chars_typed"] == 3
+    assert stats["color_changes"] == 3
+
+    # Virtual artboard interpreter supporting 0x0B hex picker
+    canvas = {}
+    cx = origin_x
+    cy = origin_y
+    curr_color = PAINT_PALETTE[1]
+
+    i = 0
+    b = stream
+    while i < len(b):
+        if b[i : i + 3] == b"\x1b[A":  # Up
+            cy -= 1
+            i += 3
+        elif b[i : i + 3] == b"\x1b[B":  # Down
+            cy += 1
+            i += 3
+        elif b[i : i + 3] == b"\x1b[C":  # Right
+            cx += 1
+            i += 3
+        elif b[i : i + 3] == b"\x1b[D":  # Left
+            cx -= 1
+            i += 3
+        elif b[i] == 0x0B:  # Ctrl+K (open hex color picker)
+            # Expect 6 hex digits followed by \r
+            i += 1
+            hex_digits = b[i : i + 6].decode("ascii")
+            r = int(hex_digits[0:2], 16)
+            g = int(hex_digits[2:4], 16)
+            b_val = int(hex_digits[4:6], 16)
+            curr_color = (r, g, b_val)
+            i += 6
+            assert b[i] == 0x0D  # \r (Enter applies color)
+            i += 1
+        elif b[i : i + 6] == b"\x1b[200~":
+            # Bracketed paste start
+            i += 6
+            paste_end = b.find(b"\x1b[201~", i)
+            assert paste_end != -1
+            paste_text = b[i:paste_end].decode("utf-8")
+            for ch in paste_text:
+                w = char_display_width(ch)
+                canvas[(cx, cy)] = (ch, curr_color)
+                cx += w
+            i = paste_end + 6
+        else:
+            first = b[i]
+            if first < 0x80:
+                ch_len = 1
+            elif (first & 0xE0) == 0xC0:
+                ch_len = 2
+            elif (first & 0xF0) == 0xE0:
+                ch_len = 3
+            else:
+                ch_len = 4
+            ch = b[i : i + ch_len].decode("utf-8")
+            w = char_display_width(ch)
+            canvas[(cx, cy)] = (ch, curr_color)
+            cx += w
+            i += ch_len
+
+    assert canvas[(5, 5)] == ("こ", (18, 52, 86))
+    assert canvas[(7, 5)] == ("あ", (254, 220, 186))
+    assert (5, 6) not in canvas
+    assert canvas[(6, 6)] == ("!", (42, 42, 42))
 
 def test_production_safety_gate():
     import subprocess
