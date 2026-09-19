@@ -3,7 +3,7 @@
 ## Metadata
 - Domain: late.sh - Command-Line Clubhouse for Computer People
 - Primary audience: LLM agents working on this codebase, human contributors
-- Last updated: 2026-09-17 (§0 documents the reference shape for per-user state under the multi-replica rule: pure rules in `state.rs`, one locked writer in `svc.rs`, a per-session mirror in `session.rs`, a user-id-only notify. Bonsai is its first tenant and has a row in §7 "Multi-replica readiness". Ideas and roadmap live in `PLAN.md` Backlog; this file describes the present only.)
+- Last updated: 2026-09-20 (Hangover Cure: priced dynamically based on current effective drunk points with jitter; unavailable and rejected when sober.)
 - Status: Active
 - Stability note: Sections marked `[STABLE]` should change rarely. Sections marked `[VOLATILE]` are expected to change often.
 

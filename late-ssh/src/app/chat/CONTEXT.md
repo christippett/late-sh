@@ -3,27 +3,7 @@
 ## Metadata
 - Domain: late.sh SSH chat, synthetic chat entries, and dashboard/room chat surfaces
 - Primary audience: LLM agents working in `late-ssh/src/app/chat`
-- Last updated: 2026-09-05 (stage 2 of the haunting is witnessed by the
-  room: `ChatEvent::NameHit` comes off the `deadchannel_name_hit` Postgres
-  notify on the same listener as the gild markers, now
-  `ChatService::start_message_listener_task`; `push_message` promotes a
-  held beat when its message lands, and `take_witnessed_hit_landed` hands
-  it to the haunting. Before that, 2026-09-04: the `/members` overlay carries `OverlayInk` instead of baked colours, so it stops painting in whichever session last rendered on this thread; every deadchannel log line now carries `username`; first-contact seams: the admin-only `/haunt`
-  command in §8 (parsed only when `is_admin`, so a non-admin's `/haunt`
-  posts as plain text), the `own_message_landed` slot `push_message`
-  records for the stage-2 name flicker, `name_flicker` threaded through
-  the message view structs into the rows-cache key, and
-  `ChatService::send_first_contact_invitation_task` (the stage-4 ghost DM
-  behind a conditional settings claim). Domain contract:
-  `late-ssh/src/app/deadchannel/CONTEXT.md`.) Previously
-  2026-08-30 (round drinks stack: the one-open-credit index is
-  gone (migration 168), replaced by a `MAX_OPEN_CREDITS` (3) cap counted in
-  the grant under an advisory lock, so a patron away for three rounds is owed
-  three drinks and each buyer pays for the one they bought. A pour spends the
-  credit closest to expiring and @bartender appends how many are left in a
-  scripted tail. `ROUND_DRINK_POINTS` 300 -> 400, since 300 sat exactly on the
-  buzzed line and decayed off it in seconds. §9d The Round.) Previously
-  2026-08-27 (the round: telling @bartender "round for everyone" buys a drink for everyone online but you, 100 chips a head, burned whole. The trigger is a literal phrase from `ROUND_PHRASES` (`late-core/src/models/drink_round.rs`), never a model decision, and `slur.rs` is the other half of it: drunk text is stored rather than rendered, so the phrase is passed through unscrambled (and the `*hic*` kept out of it) or the feature would break for exactly the patrons most likely to use it. Only the buyer is poured into; everyone else gets a `drink_credits` row cashed by ordering, one open per patron, 24h, worth a flat 300 points. §9d The Round.) Previously 2026-08-26 (burn milestones: a permanent Shop glyph that renders after the rented badge and flag in the author label and can never be hidden by either, resolved off `ResolvedName.milestone` like the crown; see `hub/CONTEXT.md` for the catalog side.) Previously 2026-08-26 (the crown: one slot, one holder, one 👑 after their name in every chat author header and on the Clubhouse floor. `/crown` prints who wears it and what taking it costs; `/crown take` buys it at `max(500, ceil(paid x 1.5))`, burned whole, with no hold or cooldown and no self-take. It empties at the UTC month rollover, and the month's last holder keeps the `CRWN` profile award. The glyph rides the `name_flair` map (resolved on the same once-a-second edge as titles and effects) off a process-shared holder that the `crown_changed` Postgres notify keeps in step; the domain is `late-ssh/src/app/crown/`. §9c The Crown.)
+- Last updated: 2026-09-20 (Hangover Cure: priced dynamically based on current effective drunk points with jitter; unavailable and rejected when sober.)
 - Status: Active
 - Parent context: `../../../../CONTEXT.md`
 
@@ -1084,6 +1064,7 @@ A patron deep enough into the tavern's drinks types like it. `ChatService::slurr
 - **The hiccup belongs to the top of the ladder.** A single `*hic*` is dropped into an existing gap in 33% of a wasted patron's messages and 10% of a sloshed one's; tipsy and buzzed never hiccup, so the stammer marks the top of the ladder rather than drinking as such. One roll per message at every level: two hiccups in one line is the joke repeating itself. `only_the_top_of_the_ladder_hiccups` pins the bands.
 - **Protected tokens are never touched:** `@mentions` (they drive notifications and the mention wash), `#slugs`, URLs, backtick code spans, `---NEWS---`-family markers, the leading `> ` reply quote line (someone else's words), and anything non-ASCII (so CJK and emoji pass through whole). The `*hic*` only widens an existing gap and respects the same exclusions.
 - `slur(body, level, seed)` is pure with a caller-supplied seed; `svc.rs::slur_seed` supplies a fresh one per message. Tests live in `slur_test.rs`.
+- **Hangover Cure purges it:** buying the Hangover Cure item from the Shop (dynamically priced by current effective drunk points with jitter, unavailable when sober) immediately resets `user_drinks.drunk_points` to 0, returning the user's typing and public-room messages to normal instantly.
 
 ### Translation
 

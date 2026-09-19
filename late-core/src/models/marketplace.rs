@@ -246,6 +246,8 @@ pub enum PurchaseStatus {
     /// A fish or plant the user already owns the cap of
     /// (`TankStockKind::cap`), in the water and parked together.
     OwnedCapReached,
+    /// User is already sober, so Hangover Cure cannot be purchased.
+    AlreadySober,
 }
 
 #[derive(Debug, Clone)]
@@ -375,13 +377,44 @@ async fn purchase_item_by_sku_inner(
             title_rental: None,
         });
     };
-    let item = MarketplaceItem::from(item_row);
+    let mut item = MarketplaceItem::from(item_row);
     if is_listed_only(&item.payload) {
         bail!("{} is shown in the shop but not for sale", item.sku);
     }
+    let is_hangover_cure = item.item_kind == CHAT_CONSUMABLE_ITEM_KIND
+        && item.payload.get("effect_kind").and_then(|v| v.as_str())
+            == Some(HANGOVER_CURE_EFFECT_KIND);
+    if is_hangover_cure {
+        let drinks = UserDrinks::find_in_tx(&tx, user_id).await?;
+        let (effective_points, lifetime_spent) = drinks
+            .as_ref()
+            .map(|d| (d.effective_points(Utc::now()), d.lifetime_spent))
+            .unwrap_or((0, 0));
+        if effective_points <= 0 {
+            let balance = lock_user_chips_in_tx(&tx, user_id).await?;
+            tx.commit().await?;
+            return Ok(PurchaseWithEffectResult {
+                purchase: Some(PurchaseResult {
+                    status: PurchaseStatus::AlreadySober,
+                    item,
+                    balance,
+                    quantity: 0,
+                    active_quantity: 0,
+                }),
+                refresh_all_active_users: false,
+                username_effect: None,
+                bonsai_decay_protection: None,
+                aquarium_shield: None,
+                badge_rental: None,
+                title_rental: None,
+            });
+        }
+        let seed = super::drinks::hangover_cure_seed();
+        item.price_chips =
+            super::drinks::hangover_cure_price(effective_points, lifetime_spent, seed);
+    }
     let is_repeatable = is_repeatable_purchase_item(&item);
     let balance = lock_user_chips_in_tx(&tx, user_id).await?;
-
     let existing = tx
         .query_opt(
             "SELECT quantity, active_quantity

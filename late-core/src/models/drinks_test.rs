@@ -2,8 +2,9 @@ use crate::{
     models::{
         chips::{CHIP_FLOOR, ChipMove, UserChips},
         drinks::{
-            DRUNK_DECAY_PER_HOUR, DRUNK_SOBER_UP_HOURS, MAX_DRUNK_POINTS, UserDrinks,
-            WELCOME_DRINK_POINTS, decayed_points, drunk_label_word, drunk_level,
+            DRUNK_DECAY_PER_HOUR, DRUNK_SOBER_UP_HOURS, HANGOVER_CURE_MIN_PRICE, MAX_DRUNK_POINTS,
+            UserDrinks, WELCOME_DRINK_POINTS, decayed_points, drunk_label_word, drunk_level,
+            hangover_cure_price,
         },
     },
     test_utils::{create_test_user, test_db},
@@ -91,6 +92,33 @@ fn effective_points_uses_last_drink_at() {
     };
     assert_eq!(drinks.effective_points(now), 600 - DRUNK_DECAY_PER_HOUR);
     assert_eq!(drinks.level(now), 1);
+}
+
+#[test]
+fn hangover_cure_price_calculation() {
+    // Sober has price 0
+    assert_eq!(hangover_cure_price(0, 0, 0), 0);
+    assert_eq!(hangover_cure_price(-100, 1000, 123), 0);
+
+    // Minimum price floor applies when points * jitter < min price (250)
+    assert_eq!(hangover_cure_price(100, 0, 0), HANGOVER_CURE_MIN_PRICE);
+
+    // 0 lifetime spent (1.0x multiplier):
+    // seed % 31 = 0 => 85% jitter
+    let price_85 = hangover_cure_price(1000, 0, 0);
+    assert_eq!(price_85, 850);
+
+    // seed % 31 = 30 => 115% jitter
+    let price_115 = hangover_cure_price(1000, 0, 30);
+    assert_eq!(price_115, 1150);
+
+    // Heavy drinker with high lifetime spent pays more (log-scaled multiplier):
+    // 10,000 chips lifetime spent => 1.0 + ln(1 + 10) * 0.25 ≈ 1.60x base
+    let heavy_drinker_price = hangover_cure_price(1000, 10_000, 15); // jitter ~100%
+    assert!(
+        heavy_drinker_price > price_115,
+        "heavy drinker price ({heavy_drinker_price}) should exceed basic 1.15x jitter ({price_115})"
+    );
 }
 
 #[tokio::test]

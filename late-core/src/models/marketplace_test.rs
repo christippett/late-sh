@@ -2119,17 +2119,37 @@ async fn bonsai_decay_shield_expired_rows_are_excluded_from_active_queries() {
 }
 
 #[tokio::test]
-async fn hangover_cure_purchase_purges_drunk_points() {
+async fn hangover_cure_refused_when_sober_without_charging() {
+    let test_db = test_db().await;
+    let user = create_test_user(&test_db.db, "hangover-sober-test").await;
+    let mut client = test_db.db.get().await.expect("db client");
+    let starting_balance = UserChips::admin_grant(&**client, user.id, 5_000)
+        .await
+        .expect("fund chips")
+        .balance;
+
+    // User is sober (no user_drinks row, or points = 0)
+    let result = purchase_durable_item_by_sku(&mut client, user.id, "hangover_cure")
+        .await
+        .expect("purchase result")
+        .expect("item available");
+    assert_eq!(result.status, PurchaseStatus::AlreadySober);
+    assert_eq!(result.balance, starting_balance, "no chips deducted when sober");
+}
+
+#[tokio::test]
+async fn hangover_cure_purchase_purges_drunk_points_and_deducts_dynamic_price() {
     use crate::models::drinks::UserDrinks;
 
     let test_db = test_db().await;
     let user = create_test_user(&test_db.db, "hangover-cure-test").await;
     let mut client = test_db.db.get().await.expect("db client");
-    UserChips::admin_grant(&**client, user.id, 5_000)
+    let starting_balance = UserChips::admin_grant(&**client, user.id, 5_000)
         .await
-        .expect("fund chips");
+        .expect("fund chips")
+        .balance;
 
-    // Get drunk first
+    // Get drunk first (2000 points)
     UserDrinks::record_purchase(&client, user.id, 2_000)
         .await
         .expect("record drink");
@@ -2137,7 +2157,7 @@ async fn hangover_cure_purchase_purges_drunk_points() {
         .await
         .expect("find")
         .expect("drinks row exists");
-    assert!(drinks_before.drunk_points > 0);
+    assert_eq!(drinks_before.drunk_points, 2_000);
 
     // Buy Hangover Cure
     let result = purchase_durable_item_by_sku(&mut client, user.id, "hangover_cure")
@@ -2145,6 +2165,12 @@ async fn hangover_cure_purchase_purges_drunk_points() {
         .expect("purchase result")
         .expect("item available");
     assert_eq!(result.status, PurchaseStatus::Purchased);
+    // 2000 points * (1.0 + 0.18 * ln(1 + 2000/1000)^2.15 ≈ 1.222) * 0.85..=1.15 => ~2078..=2811 chips
+    let price_paid = starting_balance - result.balance;
+    assert!(
+        (2000..=2900).contains(&price_paid),
+        "price paid ({price_paid}) should reflect points and lifetime_spent multiplier with jitter"
+    );
 
     // Verify drunk points purged
     let drinks_after = UserDrinks::find(&client, user.id)

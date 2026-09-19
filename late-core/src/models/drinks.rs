@@ -80,7 +80,33 @@ pub fn drunk_level(effective_points: i64) -> u8 {
         .filter(|threshold| effective_points >= **threshold)
         .count() as u8
 }
+/// Minimum price in chips for the Hangover Cure item.
+pub const HANGOVER_CURE_MIN_PRICE: i64 = 250;
 
+/// Calculate the dynamic price for Hangover Cure from current effective drunk points,
+/// lifetime drink spend (log-scaled multiplier for heavy drinkers), and random jitter (0.85 to 1.15).
+/// If sober (0 points), returns 0.
+pub fn hangover_cure_price(effective_points: i64, lifetime_spent: i64, seed: u64) -> i64 {
+    if effective_points <= 0 {
+        return 0;
+    }
+    // Lifetime tolerance/habituation multiplier: 1.0 + 0.18 * ln(1 + lifetime_spent / 1000)^2.15
+    // e.g. 0 spent -> 1.0x, 1000 spent -> ~1.08x, 5000 spent -> ~1.63x, 20000 spent -> ~2.97x, 50000 spent -> ~4.42x, 100000 spent -> ~5.82x
+    let ln_val = (1.0 + (lifetime_spent.max(0) as f64) / 1000.0).ln();
+    let lifetime_mult = 1.0 + 0.18 * ln_val.powf(2.15);
+    // Jitter: 85% to 115% (85..=115 / 100)
+    let jitter_pct = 85 + (seed % 31) as i64;
+    let base_with_lifetime = (effective_points as f64 * lifetime_mult).round() as i64;
+    let raw_price = (base_with_lifetime * jitter_pct + 50) / 100;
+    raw_price.max(HANGOVER_CURE_MIN_PRICE)
+}
+
+/// Generate a pseudo-random seed for pricing jitter using system entropy.
+pub fn hangover_cure_seed() -> u64 {
+    let mut bytes = [0u8; 8];
+    let _ = getrandom::fill(&mut bytes);
+    u64::from_le_bytes(bytes)
+}
 #[derive(Debug, Clone)]
 pub struct UserDrinks {
     pub user_id: Uuid,
@@ -224,6 +250,13 @@ impl UserDrinks {
             .await?;
         Ok(row.map(Self::from))
     }
+    pub async fn find_in_tx(client: &impl TokioGenericClient, user_id: Uuid) -> Result<Option<Self>> {
+        let row = client
+            .query_opt("SELECT * FROM user_drinks WHERE user_id = $1", &[&user_id])
+            .await?;
+        Ok(row.map(Self::from))
+    }
+
 
     /// Rows that can still be drunk right now: anything that drank recently
     /// enough that the cap hasn't fully decayed (the window sits above
