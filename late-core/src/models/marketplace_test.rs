@@ -197,12 +197,12 @@ async fn hack_room_is_retired_and_room_bump_leads_the_chat_consumables() {
         chat_consumables,
         vec![
             "chat_room_bump",
+            "hangover_cure",
             "chat_room_spark",
             "chat_room_glow",
             "chat_room_pulse"
         ]
     );
-
     // Retired, not deleted: the row stays for purchase history, inactive.
     let active: bool = client
         .query_one(
@@ -2116,4 +2116,43 @@ async fn bonsai_decay_shield_expired_rows_are_excluded_from_active_queries() {
             .len(),
         0
     );
+}
+
+#[tokio::test]
+async fn hangover_cure_purchase_purges_drunk_points() {
+    use crate::models::drinks::UserDrinks;
+
+    let test_db = test_db().await;
+    let user = create_test_user(&test_db.db, "hangover-cure-test").await;
+    let mut client = test_db.db.get().await.expect("db client");
+    UserChips::admin_grant(&**client, user.id, 5_000)
+        .await
+        .expect("fund chips");
+
+    // Get drunk first
+    UserDrinks::record_purchase(&client, user.id, 2_000)
+        .await
+        .expect("record drink");
+    let drinks_before = UserDrinks::find(&client, user.id)
+        .await
+        .expect("find")
+        .expect("drinks row exists");
+    assert!(drinks_before.drunk_points > 0);
+
+    // Buy Hangover Cure
+    let result = purchase_durable_item_by_sku(&mut client, user.id, "hangover_cure")
+        .await
+        .expect("purchase result")
+        .expect("item available");
+    assert_eq!(result.status, PurchaseStatus::Purchased);
+
+    // Verify drunk points purged
+    let drinks_after = UserDrinks::find(&client, user.id)
+        .await
+        .expect("find")
+        .expect("drinks row exists");
+    assert_eq!(drinks_after.drunk_points, 0);
+    assert_eq!(drinks_after.level(chrono::Utc::now()), 0);
+    assert_eq!(drinks_after.lifetime_spent, 2_000);
+    assert_eq!(drinks_after.drink_count, 1);
 }

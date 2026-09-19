@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::GenericClient;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, GenericClient as TokioGenericClient};
 use uuid::Uuid;
 
 /// Bounds on what the bartender may charge for a single pour.
@@ -200,6 +200,22 @@ impl UserDrinks {
             )
             .await?;
         Ok(row.map(Self::from))
+    }
+    /// Purge all drunk points for the user immediately (Hangover Cure).
+    /// Resets `drunk_points` to 0 and updates `last_drink_at` to current_timestamp
+    /// while preserving lifetime stats (`lifetime_spent` and `drink_count`).
+    pub async fn purge_in_tx(client: &impl TokioGenericClient, user_id: Uuid) -> Result<()> {
+        client
+            .execute(
+                "UPDATE user_drinks
+                 SET drunk_points = 0,
+                     last_drink_at = current_timestamp,
+                     updated = current_timestamp
+                 WHERE user_id = $1",
+                &[&user_id],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn find(client: &Client, user_id: Uuid) -> Result<Option<Self>> {
