@@ -19,6 +19,8 @@ import re
 import shutil
 import subprocess
 import sys
+import json
+import urllib.request
 import unicodedata
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -132,9 +134,10 @@ def parse_chafa_ansi(text: str) -> List[List[Cell]]:
     sgr_regex = re.compile(r"^\x1b\[([0-9;]*)m$")
 
     for raw_line in lines:
-        if not raw_line and len(grid) > 0 and raw_line == lines[-1]:
-            continue  # trailing blank line
-
+        # Ignore terminal control lines (e.g. cursor hide/show) that contain no content
+        clean_text = escape_regex.sub("", raw_line)
+        if not clean_text:
+            continue
         row: List[Cell] = []
         pos = 0
         current_color: Optional[Tuple[int, int, int]] = None
@@ -209,8 +212,55 @@ def parse_chafa_ansi(text: str) -> List[List[Cell]]:
             pos += 1
         grid.append(row)
 
+    # Trim trailing all-space rows if any
+    while grid and all(c.char == " " for c in grid[-1]):
+        grid.pop()
     return grid
 
+def extract_owner_from_tui_text(text: str) -> Optional[str]:
+    """
+    Extract the current Owner value from the Artboard Info overlay TUI screen.
+    Returns the username if populated, or None if unpopulated ('?') or missing.
+    """
+    # Strip ANSI escape sequences
+    clean = re.sub(r"\x1b(\[[0-9;?]*[a-zA-Z]|\([B0-9]|\)[B0-9]|.)", "", text)
+    matches = re.findall(r"Owner\s+([^\s│\r\n]+)", clean)
+    if matches:
+        val = matches[-1].strip()
+        if val and val != "?":
+            return val
+    return None
+
+
+def fetch_artboard_occupied_cells(host: str) -> Set[Tuple[int, int]]:
+    """
+    Fetch occupied canvas coordinates (x, y) from the artboard web gallery endpoint.
+    Returns a set of (x, y) tuples corresponding to cells already populated by users.
+    """
+    urls = [
+        f"https://{host}/gallery" if "late.sh" in host else f"http://{host}:3000/gallery",
+        f"http://{host}/gallery",
+        "https://late.sh/gallery",
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "late-art-drawer"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+            m = re.search(r'<script id="snapshot-data"[^>]*>(.*?)</script>', html, re.DOTALL)
+            if m:
+                data = json.loads(m.group(1))
+                cells = data.get("cells", [])
+                occupied = set()
+                for c in cells:
+                    x, y, ch, w = c[0], c[1], c[2], c[3]
+                    for dx in range(w):
+                        occupied.add((x + dx, y))
+                if occupied:
+                    return occupied
+        except Exception:
+            continue
+    return set()
 
 def run_chafa(image_path: str, chafa_flags: List[str]) -> str:
     """Execute chafa on image_path with provided flags, ensuring --fg-only and symbol format."""
@@ -219,20 +269,22 @@ def run_chafa(image_path: str, chafa_flags: List[str]) -> str:
 
     flags = list(chafa_flags)
     # Check if format flag was passed (-f or --format)
-    has_format = False
-    i = 0
-    while i < len(flags):
-        f = flags[i]
-        if f == "-f" or f.startswith("--format"):
-            has_format = True
-            break
-        i += 1
+    has_format = any(f == "-f" or f.startswith("--format") for f in flags)
     if not has_format:
         flags.append("--format=symbols")
 
     if not any(f.startswith("--fg-only") for f in flags):
         flags.append("--fg-only")
 
+    # Decouple from calling terminal dimensions: use full canvas dimensions
+    if not any(f.startswith("--view-size") for f in flags):
+        flags.append(f"--view-size={CANVAS_WIDTH}x{CANVAS_HEIGHT}")
+    if not any(f.startswith("--margin-bottom") for f in flags):
+        flags.append("--margin-bottom=0")
+    if not any(f.startswith("--margin-right") for f in flags):
+        flags.append("--margin-right=0")
+    if not any(f == "-s" or f.startswith("--size") for f in flags):
+        flags.append(f"--size={CANVAS_WIDTH}x{CANVAS_HEIGHT}")
     cmd = ["chafa"] + flags + [image_path]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
@@ -370,20 +422,18 @@ def generate_ansi_preview(grid: List[List[Cell]], palette_mode: bool = False) ->
 
     return "\n".join(lines)
 
-
 def optimize_drawing_stream(
     grid: List[List[Cell]],
     origin_x: int = 0,
     origin_y: int = 0,
     initial_color: Optional[Tuple[int, int, int]] = None,
     palette_mode: bool = False,
+    occupied_cells: Optional[Set[Tuple[int, int]]] = None,
 ) -> Tuple[bytes, Dict[str, int]]:
     """
     Generate the minimal byte sequence to draw grid onto late.sh Artboard.
     Tracks visual cursor column (accounting for wide characters) and active color state.
-
     Color setting:
-      - Direct 24-bit RGB (default):
         Ctrl+K (0x0B) opens hex color picker, emits 6 uppercase hex digits, Enter (\r) applies.
       - Palette mode (optional fallback):
         Ctrl+U (0x15) = cycle_paint_color(-1)
@@ -471,12 +521,22 @@ def optimize_drawing_stream(
     height = len(grid)
     for y in range(height):
         row = grid[y]
+        if not row:
+            continue
         col = 0
         idx = 0
         while idx < len(row):
             cell = row[idx]
             w = char_display_width(cell.char)
-            if cell.char == " ":
+            tx = origin_x + col
+            ty = origin_y + y
+
+            # In overlay mode, skip writing to cells that are already populated on the canvas
+            is_occupied = False
+            if occupied_cells is not None:
+                is_occupied = any((tx + dx, ty) in occupied_cells for dx in range(w))
+
+            if cell.char == " " or is_occupied:
                 col += w
                 idx += 1
                 continue
@@ -490,7 +550,9 @@ def optimize_drawing_stream(
                 while idx < len(row):
                     c = row[idx]
                     cw = char_display_width(c.char)
-                    if c.char == " " or c.palette_idx != target_pal:
+                    ctx = origin_x + col
+                    c_occ = occupied_cells is not None and any((ctx + dx, ty) in occupied_cells for dx in range(cw))
+                    if c.char == " " or c_occ or c.palette_idx != target_pal:
                         break
                     run_chars.append(c.char)
                     run_visual_width += cw
@@ -501,14 +563,15 @@ def optimize_drawing_stream(
                 while idx < len(row):
                     c = row[idx]
                     cw = char_display_width(c.char)
+                    ctx = origin_x + col
+                    c_occ = occupied_cells is not None and any((ctx + dx, ty) in occupied_cells for dx in range(cw))
                     c_rgb = c.color if c.color is not None else PAINT_PALETTE[c.palette_idx]
-                    if c.char == " " or c_rgb != target_rgb:
+                    if c.char == " " or c_occ or c_rgb != target_rgb:
                         break
                     run_chars.append(c.char)
                     run_visual_width += cw
                     col += cw
                     idx += 1
-
             tx = origin_x + start_col
             ty = origin_y + y
 
@@ -566,6 +629,16 @@ def parse_args():
         help="Use 24-bit arbitrary hex colors via Ctrl+K picker (default: True).",
     )
     parser.add_argument(
+        "--danger-mode",
+        action="store_true",
+        help="Bypass production safety gate and allow running against live late.sh instance.",
+    )
+    parser.add_argument(
+        "--overlay",
+        action="store_true",
+        help="Only draw into blank/unused cells without overwriting existing populated cells.",
+    )
+    parser.add_argument(
         "--output-bytes",
         help="Optional file path to dump the raw byte sequence stream.",
     )
@@ -596,16 +669,15 @@ def main():
     args = parse_args()
 
     # STRICT PROD SAFETY RULE:
-    # Reject connections to live production late.sh
-    if not args.dry_run:
+    # Reject connections to live production late.sh unless explicitly bypassed with --danger-mode
+    if not args.dry_run and not args.danger_mode:
         lowered_host = args.host.lower()
         if "late.sh" in lowered_host or lowered_host == "159.203.111.45":
             sys.stderr.write(
                 "\n[SAFETY ERROR] Direct execution against production late.sh is strictly forbidden!\n"
-                "Only local / mock test instances are permitted.\n"
+                "Only local / mock test instances are permitted (pass --danger-mode to override).\n"
             )
-            # sys.exit(1)
-
+            sys.exit(1)
     coords = [int(v.strip()) for v in args.origin.split(",")]
     origin_x, origin_y = coords[0], coords[1]
     if origin_x < 0 or origin_x >= CANVAS_WIDTH or origin_y < 0 or origin_y >= CANVAS_HEIGHT:
@@ -632,6 +704,12 @@ def main():
             f"[!] Warning: Artwork extends past canvas bounds ({origin_x + width}x{origin_y + height} vs {CANVAS_WIDTH}x{CANVAS_HEIGHT})."
         )
 
+    occupied_cells: Optional[Set[Tuple[int, int]]] = None
+    if args.overlay:
+        print(f"[*] Overlay mode active: fetching existing artboard snapshot from {args.host}...")
+        occupied_cells = fetch_artboard_occupied_cells(args.host)
+        print(f"[*] Found {len(occupied_cells)} occupied cells to preserve on artboard.")
+
     if args.palette_mode:
         print("[*] Performing contrast-preserving color quantization to 16-color PAINT_PALETTE...")
         map_colors_with_contrast(grid)
@@ -646,7 +724,11 @@ def main():
 
     print("[*] Optimizing keystroke / byte drawing stream...")
     drawing_stream, stats = optimize_drawing_stream(
-        grid, origin_x=origin_x, origin_y=origin_y, palette_mode=args.palette_mode
+        grid,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        palette_mode=args.palette_mode,
+        occupied_cells=occupied_cells,
     )
 
     print("[*] Drawing Statistics:")
@@ -723,22 +805,23 @@ def main():
         # Dismiss splash screen with Esc
         print("[*] Dismissing splash screen (Esc)...")
         proc.stdin.write(b"\x1b")
+        await proc.stdin.drain()
         await asyncio.sleep(1.0)
 
         # Navigate to Screen::Artboard (Tab 4)
         print("[*] Navigating to Screen::Artboard (Tab 4)...")
         proc.stdin.write(b"4")
+        await proc.stdin.drain()
         await asyncio.sleep(1.5)
 
         # Enter interactive edit mode ('i')
         print("[*] Entering interactive edit mode ('i')...")
         proc.stdin.write(b"i")
+        await proc.stdin.drain()
         await asyncio.sleep(1.0)
-
         # Read current active color from Artboard Info overlay
         def detect_active_color() -> Tuple[int, int, int]:
             text = raw_buffer.decode("utf-8", errors="replace")
-            # Search for Color #RRGGBB
             m = re.findall(r"Color\s+(#[0-9A-Fa-f]{6})", text)
             if m:
                 hex_str = m[-1][1:]  # strip leading '#'
@@ -754,30 +837,97 @@ def main():
         active_color = detect_active_color()
         print(f"[*] Detected active paint color: #{active_color[0]:02X}{active_color[1]:02X}{active_color[2]:02X}.")
 
-        # Re-optimize drawing stream based on actual active color
+        # If overlay mode is active but web lookup returned no occupied cells (e.g. web server not exposed),
+        # probe the canvas via the TUI Info box Owner field
+        final_occupied_cells = occupied_cells
+        if args.overlay and not occupied_cells:
+            print("[*] Web snapshot empty or unavailable. Probing canvas cells via TUI Owner field...")
+            tui_occupied = set()
+            probe_curr_x, probe_curr_y = 0, 0
+            # Reset cursor to (0,0)
+            proc.stdin.write(b"\x1b[A" * 200 + b"\x1b[D" * 400)
+            await proc.stdin.drain()
+            await asyncio.sleep(0.2)
+
+            for gy in range(height):
+                row = grid[gy]
+                for gx in range(len(row)):
+                    cell = row[gx]
+                    if cell.char == " ":
+                        continue
+                    tx = origin_x + gx
+                    ty = origin_y + gy
+                    dx = tx - probe_curr_x
+                    dy = ty - probe_curr_y
+                    nav = bytearray()
+                    if dy > 0: nav.extend(b"\x1b[B" * dy)
+                    elif dy < 0: nav.extend(b"\x1b[A" * (-dy))
+                    if dx > 0: nav.extend(b"\x1b[C" * dx)
+                    elif dx < 0: nav.extend(b"\x1b[D" * (-dx))
+                    proc.stdin.write(bytes(nav))
+                    await proc.stdin.drain()
+                    probe_curr_x, probe_curr_y = tx, ty
+                    await asyncio.sleep(0.04)
+                    owner = extract_owner_from_tui_text(raw_buffer.decode("utf-8", errors="replace"))
+                    if owner is not None:
+                        tui_occupied.add((tx, ty))
+
+            print(f"[*] TUI probe detected {len(tui_occupied)} occupied cells.")
+            final_occupied_cells = tui_occupied
+
+        # Re-optimize drawing stream based on actual active color and final occupied cells
         actual_stream, actual_stats = optimize_drawing_stream(
             grid,
             origin_x=origin_x,
             origin_y=origin_y,
             initial_color=active_color,
             palette_mode=args.palette_mode,
+            occupied_cells=final_occupied_cells,
         )
-
-        # Navigate to (origin_x, origin_y):
         # First clamp cursor to (0, 0) using 200 Up + 400 Left arrows
         print(f"[*] Resetting cursor to (0, 0) and navigating to ({origin_x}, {origin_y})...")
         init_nav = (b"\x1b[A" * 200) + (b"\x1b[D" * 400) + (b"\x1b[B" * origin_y) + (b"\x1b[C" * origin_x)
         proc.stdin.write(init_nav)
         await asyncio.sleep(1.0)
 
-        # Stream drawing bytes in batched chunks
+        # Stream drawing bytes in atomic command batches (never splitting escape sequences across chunks)
         print(f"[*] Streaming {len(actual_stream)} bytes of drawing operations...")
-        chunk_size = 512
-        for i in range(0, len(actual_stream), chunk_size):
-            chunk = actual_stream[i : i + chunk_size]
-            proc.stdin.write(chunk)
-            await asyncio.sleep(0.05)
-        await asyncio.sleep(1.0)
+        tokens: List[bytes] = []
+        idx_stream = 0
+        while idx_stream < len(actual_stream):
+            if actual_stream[idx_stream : idx_stream + 6] == b"\x1b[200~":
+                end_marker = actual_stream.find(b"\x1b[201~", idx_stream + 6)
+                if end_marker != -1:
+                    tokens.append(bytes(actual_stream[idx_stream : end_marker + 6]))
+                    idx_stream = end_marker + 6
+                    continue
+            if actual_stream[idx_stream : idx_stream + 6] == b"\x1b[1;2C":
+                tokens.append(bytes(actual_stream[idx_stream : idx_stream + 6]))
+                idx_stream += 6
+            elif actual_stream[idx_stream : idx_stream + 3] in (b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D"):
+                tokens.append(bytes(actual_stream[idx_stream : idx_stream + 3]))
+                idx_stream += 3
+            elif actual_stream[idx_stream] == 0x0B and idx_stream + 8 <= len(actual_stream) and actual_stream[idx_stream + 7] == 0x0D:
+                # Complete Ctrl+K + 6 hex digits + \r sequence
+                tokens.append(bytes(actual_stream[idx_stream : idx_stream + 8]))
+                idx_stream += 8
+            else:
+                tokens.append(bytes(actual_stream[idx_stream : idx_stream + 1]))
+                idx_stream += 1
+
+        current_chunk = bytearray()
+        for tok in tokens:
+            if len(current_chunk) + len(tok) > 1024:
+                proc.stdin.write(bytes(current_chunk))
+                await proc.stdin.drain()
+                await asyncio.sleep(0.02)
+                current_chunk = bytearray()
+            current_chunk.extend(tok)
+        if current_chunk:
+            proc.stdin.write(bytes(current_chunk))
+            await proc.stdin.drain()
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.5)
 
         # Exit edit mode with Esc
         print("[*] Drawing finished! Exiting edit mode (Esc)...")

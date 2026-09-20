@@ -177,19 +177,41 @@ def test_drawing_stream_simulation_with_wide_characters():
 
     i = 0
     b = stream
+    selection_anchor = None
     while i < len(b):
-        if b[i : i + 3] == b"\x1b[A":  # Up
+        if b[i : i + 6] == b"\x1b[1;2C":  # Shift+Right
+            if selection_anchor is None:
+                selection_anchor = (cx, cy)
+            cx += 1
+            i += 6
+        elif b[i : i + 3] == b"\x1b[A":  # Up
             cy -= 1
+            selection_anchor = None
             i += 3
         elif b[i : i + 3] == b"\x1b[B":  # Down
             cy += 1
+            selection_anchor = None
             i += 3
         elif b[i : i + 3] == b"\x1b[C":  # Right
             cx += 1
+            selection_anchor = None
             i += 3
         elif b[i : i + 3] == b"\x1b[D":  # Left
             cx -= 1
+            selection_anchor = None
             i += 3
+        elif b[i] == 0x7F:  # Backspace
+            if selection_anchor is not None:
+                # Clear selected cells and reset cursor to anchor
+                ax, ay = selection_anchor
+                min_x, max_x = min(ax, cx), max(ax, cx)
+                min_y, max_y = min(ay, cy), max(ay, cy)
+                for sy in range(min_y, max_y + 1):
+                    for sx in range(min_x, max_x + 1):
+                        canvas.pop((sx, sy), None)
+                cx, cy = ax, ay
+                selection_anchor = None
+            i += 1
         elif b[i] == 0x19:  # Ctrl+Y (next color)
             color = (color + 1) % 16
             i += 1
@@ -233,6 +255,20 @@ def test_drawing_stream_simulation_with_wide_characters():
     # c4 ("!", width 1) is at visual col 11
     assert (10, 11) not in canvas
     assert canvas[(11, 11)] == ("!", 12)
+
+def test_chafa_view_size_and_full_output_parsing():
+    # Test parsing ANSI output with trailing cursor controls and blank lines
+    raw_ansi = (
+        "\x1b[?25l\x1b[39m\x1b[38;2;255;0;0m█\x1b[39m\n"
+        "\x1b[38;2;0;255;0m█\x1b[39m\n"
+        "\x1b[?25h\n"
+    )
+    grid = parse_chafa_ansi(raw_ansi)
+    assert len(grid) == 2
+    assert grid[0][0].char == "█"
+    assert grid[0][0].color == (255, 0, 0)
+    assert grid[1][0].char == "█"
+    assert grid[1][0].color == (0, 255, 0)
 
 
 def test_hex_color_picker_stream():
@@ -279,19 +315,41 @@ def test_drawing_stream_simulation_with_direct_24bit_hex():
 
     i = 0
     b = stream
+    selection_anchor = None
     while i < len(b):
-        if b[i : i + 3] == b"\x1b[A":  # Up
+        if b[i : i + 6] == b"\x1b[1;2C":  # Shift+Right
+            if selection_anchor is None:
+                selection_anchor = (cx, cy)
+            cx += 1
+            i += 6
+        elif b[i : i + 3] == b"\x1b[A":  # Up
             cy -= 1
+            selection_anchor = None
             i += 3
         elif b[i : i + 3] == b"\x1b[B":  # Down
             cy += 1
+            selection_anchor = None
             i += 3
         elif b[i : i + 3] == b"\x1b[C":  # Right
             cx += 1
+            selection_anchor = None
             i += 3
         elif b[i : i + 3] == b"\x1b[D":  # Left
             cx -= 1
+            selection_anchor = None
             i += 3
+        elif b[i] == 0x7F:  # Backspace
+            if selection_anchor is not None:
+                # Clear selected cells and reset cursor to anchor
+                ax, ay = selection_anchor
+                min_x, max_x = min(ax, cx), max(ax, cx)
+                min_y, max_y = min(ay, cy), max(ay, cy)
+                for sy in range(min_y, max_y + 1):
+                    for sx in range(min_x, max_x + 1):
+                        canvas.pop((sx, sy), None)
+                cx, cy = ax, ay
+                selection_anchor = None
+            i += 1
         elif b[i] == 0x0B:  # Ctrl+K (open hex color picker)
             # Expect 6 hex digits followed by \r
             i += 1
@@ -346,3 +404,60 @@ def test_production_safety_gate():
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     assert res.returncode == 1
     assert "SAFETY ERROR" in res.stderr
+
+    # With --danger-mode and --dry-run, it should not fail on host check
+    cmd_danger = [
+        sys.executable,
+        "scripts/assisted_art_drawer.py",
+        "--image", "late-web/static/og-image.png",
+        "--host", "late.sh",
+        "--danger-mode",
+        "--dry-run",
+    ]
+    res_danger = subprocess.run(cmd_danger, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert res_danger.returncode == 0
+    assert "SAFETY ERROR" not in res_danger.stderr
+
+def test_overlay_mode_skips_occupied_cells():
+    # 2x2 grid:
+    # (0,0): "X"  (1,0): "Y"
+    # (0,1): "Z"  (1,1): "W"
+    c1 = Cell("X", (255, 110, 64))
+    c2 = Cell("Y", (255, 110, 64))
+    c3 = Cell("Z", (255, 110, 64))
+    c4 = Cell("W", (255, 110, 64))
+    grid = [[c1, c2], [c3, c4]]
+
+    # Suppose (10,10) and (11,11) are occupied by other users
+    occupied = {(10, 10), (11, 11)}
+    stream, stats = optimize_drawing_stream(
+        grid,
+        origin_x=10,
+        origin_y=10,
+        palette_mode=True,
+        occupied_cells=occupied,
+    )
+
+    # Only "Y" at (11,10) and "Z" at (10,11) should be typed!
+    assert stats["chars_typed"] == 2
+    assert b"\x1b[200~Y\x1b[201~" in stream
+    assert b"\x1b[200~Z\x1b[201~" in stream
+    assert b"X" not in stream
+    assert b"W" not in stream
+
+def test_extract_owner_from_tui_text():
+    from scripts.assisted_art_drawer import extract_owner_from_tui_text
+
+    # Unpopulated cell: '?'
+    tui_unpopulated = "Mode       active\nCursor     10,10\nMouse      10,10\nOwner      ?\n"
+    assert extract_owner_from_tui_text(tui_unpopulated) is None
+
+    # Populated cell with ANSI escapes
+    tui_populated = "Mode       active\x1b[38;2;164;176;193;49mOwner      \x1b[1m\x1b[38;2;255;255;255;49mchris\x1b[10;99H\x1b[22m"
+    assert extract_owner_from_tui_text(tui_populated) == "chris"
+
+    # Empty or missing
+    assert extract_owner_from_tui_text("") is None
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
