@@ -46,7 +46,8 @@ class LiveBotClient:
     that continuously reads from the PTY, enabling real-time VT100 parsing 
     and optional live-streaming of the ANSI output to the user's terminal.
     """
-    def __init__(self, watch=False, width=120, height=40):
+    def __init__(self, watch=False, width=120, height=40, host='late'):
+        self.host = host
         self.master, self.slave = pty.openpty()
         self.watch = watch
         self.width = width
@@ -79,7 +80,7 @@ class LiveBotClient:
     def connect(self):
         # We rely on the user's ~/.ssh/config containing the `late` host, 
         # so it inherently inherits their identity and bypasses onboarding!
-        cmd = ['ssh', 'late']
+        cmd = ['ssh', self.host]
         self.log(f"Executing: {' '.join(cmd)}")
         self.proc = subprocess.Popen(cmd, stdin=self.slave, stdout=self.slave, stderr=self.slave)
         self.running = True

@@ -50,8 +50,8 @@ PIECE_OFFSETS = {
 }
 
 class TetrisBot(LiveBotClient):
-    def __init__(self, watch=False, target=None):
-        super().__init__(watch=watch, width=120, height=40)
+    def __init__(self, watch=False, target=None, host='late'):
+        super().__init__(watch=watch, width=120, height=40, host=host)
         self.target = target
 
     def navigate_to_game(self):
@@ -111,8 +111,8 @@ class TetrisBot(LiveBotClient):
         detection time. Scanning every row (not just the spawn rows) survives
         the piece having already fallen several rows when the screen is read.
         """
-        # ponytail: limit scan to top rows so floor clusters never match as active pieces
-        for spawn_row in range(4):
+        # ponytail: scan all rows but verify piece isn't just a settled shape by checking for blocks directly above
+        for spawn_row in range(20):
             for kind, rot_offsets in PIECE_OFFSETS.items():
                 offsets = rot_offsets[0] # Spawn rotation is always 0
                 cells = [(spawn_row + dr, 3 + dc) for dr, dc in offsets]
@@ -120,8 +120,11 @@ class TetrisBot(LiveBotClient):
                     # ponytail: verify piece isn't just a settled shape by checking for blocks directly above
                     is_stuck = False
                     for r, c in cells:
-                        if r > 0 and grid[r-1][c] and (r-1, c) not in cells:
-                            is_stuck = True
+                        for above_r in range(r):
+                            if (above_r, c) not in cells and grid[above_r][c]:
+                                is_stuck = True
+                                break
+                        if is_stuck:
                             break
                     if not is_stuck:
                         return kind, cells
@@ -188,32 +191,30 @@ class TetrisBot(LiveBotClient):
             - 3.3855972247263626 * well_sums
         )
 
-    def plan_move(self, board, piece_kind):
+    def _get_placements(self, board, piece_kind):
         """
-        Simulates all valid rotations and horizontal shifts in memory,
-        evaluating each landing state in <1 millisecond.
+        Simulates all valid rotations and horizontal shifts in memory for piece_kind,
+        returning a list of (rot, col_shift, new_board, score).
         """
-        best_score = -float('inf')
-        best_rot = 0
-        best_col_shift = 0
-        
-        for rot in range(4):
+        placements = []
+        num_rots = {'O': 1, 'I': 2, 'S': 2, 'Z': 2, 'T': 4, 'J': 4, 'L': 4}.get(piece_kind, 4)
+        for rot in range(num_rots):
             offsets = PIECE_OFFSETS[piece_kind][rot]
             min_c = min(c for r, c in offsets)
             max_c = max(c for r, c in offsets)
-            
+
             # Initial spawn anchor column is 3
             min_shift = -min_c - 3
             max_shift = 9 - max_c - 3
-            
+
             for col_shift in range(min_shift, max_shift + 1):
                 anchor_col = 3 + col_shift
                 shifted = [(r, anchor_col + c) for r, c in offsets]
-                
+
                 # Verify valid placement within board boundaries
                 if any(r >= 20 or c < 0 or c >= 10 or board[r][c] for r, c in shifted):
                     continue
-                    
+
                 # Simulate gravity drop
                 drop = 0
                 while True:
@@ -221,33 +222,62 @@ class TetrisBot(LiveBotClient):
                     if any(r >= 20 or board[r][c] for r, c in next_pos):
                         break
                     drop += 1
-                    
+
                 landed = [(r + drop, c) for r, c in shifted]
                 max_landed_r = max(r for r, c in landed)
                 landing_height = 20 - max_landed_r
-                
+
                 # Clone board and place piece
                 new_board = [row[:] for row in board]
                 for r, c in landed:
                     new_board[r][c] = True
-                    
+
                 # Simulate full line clearing and row dropping
                 cleared_rows = [r for r in range(20) if all(new_board[r])]
                 lines_cleared = len(cleared_rows)
-                
+
                 if lines_cleared > 0:
                     cleared_board = [[False]*10 for _ in range(lines_cleared)]
                     for r in range(20):
                         if r not in cleared_rows:
                             cleared_board.append(new_board[r])
                     new_board = cleared_board
-                    
+
                 score = self.evaluate_board(new_board, landing_height, lines_cleared)
-                if score > best_score:
-                    best_score = score
-                    best_rot = rot
-                    best_col_shift = col_shift
-                    
+                placements.append((rot, col_shift, new_board, score))
+
+        return placements
+
+    def plan_move(self, board, piece_kind, next_piece=None):
+        """
+        Simulates all valid rotations and horizontal shifts in memory,
+        evaluating each landing state. When next_piece is provided,
+        evaluates 2-ply lookahead (best_score = base_score + max_next_score).
+        """
+        best_score = -float('inf')
+        best_rot = 0
+        best_col_shift = 0
+
+        placements_ply1 = self._get_placements(board, piece_kind)
+        if not placements_ply1:
+            return 0, 0
+
+        for rot, col_shift, board_after_1, base_score in placements_ply1:
+            if next_piece and next_piece in PIECE_OFFSETS:
+                placements_ply2 = self._get_placements(board_after_1, next_piece)
+                if placements_ply2:
+                    max_next_score = max(score for _, _, _, score in placements_ply2)
+                else:
+                    max_next_score = -100000
+                total_score = base_score + max_next_score
+            else:
+                total_score = base_score
+
+            if total_score > best_score:
+                best_score = total_score
+                best_rot = rot
+                best_col_shift = col_shift
+
         return best_rot, best_col_shift
 
     def play(self):
@@ -292,13 +322,16 @@ class TetrisBot(LiveBotClient):
                     time.sleep(0.02)
                     continue
 
+                next_match = re.search(r'next\s+([A-Z])', flat_screen)
+                next_kind = next_match.group(1) if next_match else None
+
                 # Build the settled board by clearing the active piece's cells
                 settled_board = [row[:] for row in grid]
                 for r, c in piece_cells:
                     settled_board[r][c] = False
 
-                # Plan the optimal placement instantaneously
-                best_rot, best_shift = self.plan_move(settled_board, piece_kind)
+                # Plan the optimal placement instantaneously (with 2-ply lookahead)
+                best_rot, best_shift = self.plan_move(settled_board, piece_kind, next_kind)
 
                 # Assemble the keystrokes
                 keys = ""
@@ -327,7 +360,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autonomous Lateris (Tetris) Bot")
     parser.add_argument("--watch", action="store_true", help="Mirror the VT100 output to stdout for live viewing")
     parser.add_argument("--target", type=int, default=None, help="Stop making moves once this score is reached; the game then ends naturally")
+    parser.add_argument("--host", type=str, default="late", help="SSH host")
     args = parser.parse_args()
 
-    bot = TetrisBot(watch=args.watch, target=args.target)
+    bot = TetrisBot(watch=args.watch, target=args.target, host=args.host)
     bot.play()
