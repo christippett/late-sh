@@ -4,10 +4,11 @@
 # dependencies = [
 #     "pytest>=7.0.0",
 #     "asyncssh>=2.14.0",
+#     "typer>=0.9.0",
 # ]
 # ///
 """
-Tests for scripts/assisted_art_drawer.py:
+Tests for scripts/artboard_painter.py:
 1. CIELAB color conversion and CIE76 Delta-E distance metrics.
 2. Chafa ANSI parser (24-bit SGR, 16-color ANSI, extended 256-color cube, control stripping).
 3. Contrast-preserving color mapping to PAINT_PALETTE.
@@ -24,7 +25,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from scripts.assisted_art_drawer import (
+from scripts.artboard_painter import (
     Cell,
     PAINT_PALETTE,
     CANVAS_WIDTH,
@@ -397,7 +398,7 @@ def test_production_safety_gate():
     import subprocess
     cmd = [
         sys.executable,
-        "scripts/assisted_art_drawer.py",
+        "scripts/artboard_painter.py",
         "--image", "test.ppm",
         "--host", "late.sh",
     ]
@@ -408,7 +409,7 @@ def test_production_safety_gate():
     # With --danger-mode and --dry-run, it should not fail on host check
     cmd_danger = [
         sys.executable,
-        "scripts/assisted_art_drawer.py",
+        "scripts/artboard_painter.py",
         "--image", "late-web/static/og-image.png",
         "--host", "late.sh",
         "--danger-mode",
@@ -446,8 +447,7 @@ def test_overlay_mode_skips_occupied_cells():
     assert b"W" not in stream
 
 def test_extract_owner_from_tui_text():
-    from scripts.assisted_art_drawer import extract_owner_from_tui_text
-
+    from scripts.artboard_painter import extract_owner_from_tui_text
     # Unpopulated cell: '?'
     tui_unpopulated = "Mode       active\nCursor     10,10\nMouse      10,10\nOwner      ?\n"
     assert extract_owner_from_tui_text(tui_unpopulated) is None
@@ -458,6 +458,59 @@ def test_extract_owner_from_tui_text():
 
     # Empty or missing
     assert extract_owner_from_tui_text("") is None
+def test_decoupled_core_logic_import():
+    from scripts.artboard_painter import (
+        parse_origin,
+        render_image_to_grid,
+        prepare_drawing_stream,
+        draw_art,
+        app,
+    )
+    x, y = parse_origin("15,20")
+    assert (x, y) == (15, 20)
+
+    grid, stream, stats = prepare_drawing_stream(
+        "late-web/static/og-image.png",
+        origin_x=5,
+        origin_y=5,
+        chafa_args="--symbols=block --size=20x10",
+        palette_mode=True,
+    )
+    assert len(grid) > 0
+    assert stats["chars_typed"] > 0
+    assert len(stream) > 0
+    assert app is not None
+
+def test_scheduled_artboard_painter():
+    from scripts.scheduled_artboard_painter import (
+        choose_next_image,
+        run_scheduler,
+        POOL_A,
+        POOL_B,
+        PAINT_CONFIG,
+        INTERVAL_SECONDS,
+    )
+
+    assert INTERVAL_SECONDS == 90 * 60
+    assert len(POOL_A) > 0 and len(POOL_B) > 0
+
+    # Repetition prevention test
+    pool = ["img1.png", "img2.png"]
+    assert choose_next_image(pool, "img1.png") == "img2.png"
+    assert choose_next_image(pool, "img2.png") == "img1.png"
+    assert choose_next_image(["img1.png"], "img1.png") == "img1.png"
+
+    # Dry run 2 runs alternating between Pool A and Pool B
+    cfg = dict(PAINT_CONFIG)
+    cfg["dry_run"] = True
+    run_scheduler(
+        pool_a=["late-web/static/og-image.png"],
+        pool_b=["late-web/static/apple-touch-icon.png"],
+        interval_seconds=1,
+        config=cfg,
+        max_runs=2,
+    )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
