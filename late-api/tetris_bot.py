@@ -95,6 +95,7 @@ class TetrisBot(LiveBotClient):
             for c in range(10):
                 # Cells are 2 characters wide ('██' or '  ')
                 idx = top_c + 1 + c*2
+                # ponytail: ghost blocks are rendered with light shading. skip them
                 if idx < len(line) and line[idx] == '█':
                     grid[r][c] = True
 
@@ -110,12 +111,20 @@ class TetrisBot(LiveBotClient):
         detection time. Scanning every row (not just the spawn rows) survives
         the piece having already fallen several rows when the screen is read.
         """
-        for spawn_row in range(20):
+        # ponytail: limit scan to top rows so floor clusters never match as active pieces
+        for spawn_row in range(4):
             for kind, rot_offsets in PIECE_OFFSETS.items():
                 offsets = rot_offsets[0] # Spawn rotation is always 0
                 cells = [(spawn_row + dr, 3 + dc) for dr, dc in offsets]
                 if all(0 <= r < 20 and 0 <= c < 10 and grid[r][c] for r, c in cells):
-                    return kind, cells
+                    # ponytail: verify piece isn't just a settled shape by checking for blocks directly above
+                    is_stuck = False
+                    for r, c in cells:
+                        if r > 0 and grid[r-1][c] and (r-1, c) not in cells:
+                            is_stuck = True
+                            break
+                    if not is_stuck:
+                        return kind, cells
         return None, None
 
     def evaluate_board(self, board, landing_height, lines_cleared):
