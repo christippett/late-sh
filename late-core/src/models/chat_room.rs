@@ -63,6 +63,43 @@ impl ChatRoom {
         Ok(Self::from(row))
     }
 
+    /// The small bar out back of the Clubhouse (migration 189): its own
+    /// kind, auto-joined and permanent like #lounge so every session holds
+    /// the room without a membership write per visit, and excluded from
+    /// every listing by kind so it is only ever seen from its own screen.
+    ///
+    /// Also seats every existing account. Auto-join runs only when an
+    /// account is created, so accounts from before the bar opened would
+    /// otherwise never hold the room, and their owners would sit down with
+    /// nothing to speak into. Idempotent: a conflict is a member already.
+    pub async fn ensure_nightcap(client: &Client) -> Result<Self> {
+        let row = client
+            .query_one(
+                "INSERT INTO chat_rooms (kind, visibility, auto_join, permanent, slug)
+                 VALUES ('nightcap', 'public', true, true, $1)
+                 ON CONFLICT (slug) WHERE kind = 'nightcap'
+                 DO UPDATE
+                    SET visibility = 'public',
+                        auto_join = true,
+                        permanent = true,
+                        updated = current_timestamp
+                 RETURNING *",
+                &[&NIGHTCAP_SLUG],
+            )
+            .await?;
+        let room = Self::from(row);
+        client
+            .execute(
+                "INSERT INTO chat_room_members (room_id, user_id, last_read_at)
+                 SELECT $1, u.id, current_timestamp
+                 FROM users u
+                 ON CONFLICT (room_id, user_id) DO NOTHING",
+                &[&room.id],
+            )
+            .await?;
+        Ok(room)
+    }
+
     pub async fn find_lounge(client: &Client) -> Result<Option<Self>> {
         let row = client
             .query_opt(
@@ -301,13 +338,18 @@ impl ChatRoom {
         Ok(Self::from(row))
     }
 
-    /// Private two-player chat room for a claimed daily match, plus both
-    /// memberships, in one statement. `kind = 'game'` (hidden from the Home
-    /// rail, no Mentions, no IRC) but `visibility = 'private'`: only the two
-    /// players are ever members, and the public game-room join path rejects
-    /// private rooms. `game_kind` is the daily roster kind string; the slug
-    /// is `daily-{match_id}`, unique per match. No ON CONFLICT: a duplicate
+    /// Chat room for a claimed daily match, plus both players' memberships,
+    /// in one statement. `kind = 'game'` (hidden from the Home rail, no
+    /// Mentions, no IRC) and `visibility = 'public'`, the same shape as the
+    /// house-table and stream rooms: a spectator who opens the board joins
+    /// through the public game-room path and talks there. The two players
+    /// are seeded as members so the room is theirs before anyone walks in.
+    /// `game_kind` is the daily roster kind string; the slug is
+    /// `daily-{match_id}`, unique per match. No ON CONFLICT: a duplicate
     /// slug means a bug, not a race to absorb.
+    ///
+    /// Rooms created while match chat was players-only stay `private`, and
+    /// `ChatService::join_game_room` keeps spectators out of those.
     pub async fn create_daily_match_room(
         client: &impl GenericClient,
         game_kind: &str,
@@ -320,7 +362,7 @@ impl ChatRoom {
             .query_one(
                 "WITH room AS (
                      INSERT INTO chat_rooms (kind, visibility, auto_join, slug, game_kind)
-                     VALUES ('game', 'private', false, $1, $2)
+                     VALUES ('game', 'public', false, $1, $2)
                      RETURNING *
                  ),
                  members AS (
@@ -1033,6 +1075,17 @@ pub const DEADCHANNEL_SLUG: &str = "deadchannel";
 /// so every kind whitelist (browse, IRC, the rail's sections) excludes or
 /// places it by construction rather than by slug.
 pub const DEADCHANNEL_KIND: &str = "deadchannel";
+/// The small bar's slug and `chat_rooms.kind` (migration 189), owned by
+/// `ensure_nightcap`. Its own kind so every listing skips it by
+/// construction; see `late-ssh/src/app/clubhouse/nightcap/CONTEXT.md`.
+pub const NIGHTCAP_SLUG: &str = "nightcap";
+pub const NIGHTCAP_KIND: &str = "nightcap";
+/// Kinds no cross-room reader may surface, whatever membership or
+/// visibility would allow: message search, history paging, and mention
+/// resolution all bind this as `kind <> ALL($n::text[])`. A hidden room is
+/// only ever seen from its own screen; membership alone is no gate, since
+/// the nightcap room seats every account.
+pub const HIDDEN_ROOM_KINDS: &[&str] = &[NIGHTCAP_KIND];
 
 pub fn canonical_dm_pair(user_a: Uuid, user_b: Uuid) -> (Uuid, Uuid) {
     if user_a.as_u128() < user_b.as_u128() {
@@ -1046,6 +1099,9 @@ fn normalize_topic_slug(slug: &str) -> Result<String> {
     let slug = normalize_room_slug(slug)?;
     if slug == "lounge" {
         bail!("cannot create room with reserved name 'lounge'");
+    }
+    if slug == NIGHTCAP_SLUG {
+        bail!("cannot create room with reserved name 'nightcap'");
     }
     if slug == DEADCHANNEL_SLUG {
         // The game's home channel (GAME.md, First contact): the invitation

@@ -624,6 +624,150 @@ async fn tab_cycles_screens_forward_through_all_including_profiles() {
 }
 
 #[tokio::test]
+async fn zero_twice_goes_under_the_clubhouse_for_runners_only() {
+    use crate::app::deadchannel::runner::state::Look;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let test_db = new_test_db().await;
+    let user = create_test_user(&test_db.db, "undercity-it").await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, user.id)
+        .await
+        .expect("join lounge room");
+    let mut app = make_app(test_db.db.clone(), user.id, "undercity-flow-it");
+
+    // Not a runner: `0` lands on the clubhouse and stays there.
+    app.handle_input(b"1");
+    wait_for_render_contains(&mut app, " Home ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    assert_render_not_contains_for(&mut app, " Undercity ", Duration::from_millis(200)).await;
+
+    // A runner: the second `0` goes under, the next one comes back up.
+    let mut rng = StdRng::seed_from_u64(7);
+    app.runner_looks = Arc::new(HashMap::from([(user.id, Look::random(&mut rng))]));
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Undercity ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+}
+
+/// `/leave #deadchannel` on one session closes the street under every
+/// session the runner has open, on this replica and every other: the looks
+/// directory drops them, and the tick edge that copies it walks them back
+/// up. The gate on `0` only guards the descent.
+#[tokio::test]
+async fn leaving_the_deadchannel_walks_a_standing_runner_back_up() {
+    use crate::app::deadchannel::runner::state::Look;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let test_db = new_test_db().await;
+    let user = create_test_user(&test_db.db, "undercity-leave-it").await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, user.id)
+        .await
+        .expect("join lounge room");
+    let mut app = make_app(test_db.db.clone(), user.id, "undercity-leave-flow-it");
+
+    // A live directory, the shape the replica's listener feeds.
+    let mut rng = StdRng::seed_from_u64(7);
+    let (looks_tx, looks_rx) =
+        tokio::sync::watch::channel(Arc::new(HashMap::from([(user.id, Look::random(&mut rng))])));
+    app.runner_looks = looks_rx.borrow().clone();
+    app.runner_looks_rx = looks_rx;
+
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Undercity ").await;
+
+    // The leave lands (on any session, on any replica): the directory drops
+    // the runner, and this session cannot stay down there.
+    looks_tx.send_replace(Arc::new(HashMap::new()));
+    wait_for_render_not_contains(&mut app, " Undercity ").await;
+    assert!(!app.is_runner());
+    let frame = render_plain(&mut app);
+    assert!(
+        frame.contains(" Clubhouse "),
+        "expected the leave to walk the runner up to the clubhouse; frame={frame:?}"
+    );
+}
+
+/// A runner's session parked on the Undercity, one row north of the wire
+/// stairs: at the railing, where the popover offers the ledge.
+async fn runner_at_the_railing(
+    name: &str,
+) -> (late_core::test_utils::TestDb, crate::app::state::App) {
+    use crate::app::deadchannel::runner::state::Look;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let test_db = new_test_db().await;
+    let user = create_test_user(&test_db.db, name).await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, user.id)
+        .await
+        .expect("join lounge room");
+    let mut app = make_app(test_db.db.clone(), user.id, &format!("{name}-flow"));
+    let mut rng = StdRng::seed_from_u64(7);
+    app.runner_looks = Arc::new(HashMap::from([(user.id, Look::random(&mut rng))]));
+
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Undercity ").await;
+    app.handle_input(b"k");
+    wait_for_render_contains(&mut app, "look over").await;
+    (test_db, app)
+}
+
+#[tokio::test]
+async fn esc_steps_back_from_the_ledge() {
+    let (_test_db, mut app) = runner_at_the_railing("undercity-esc-it").await;
+
+    app.handle_input(b"\r");
+    wait_for_render_contains(&mut app, "step back").await;
+    // A lone Esc lands on a later tick; the render wait ticks it in.
+    app.handle_input(b"\x1b");
+    wait_for_render_not_contains(&mut app, "step back").await;
+    wait_for_render_contains(&mut app, "look over").await;
+}
+
+#[tokio::test]
+async fn leaving_the_city_mid_look_closes_it_for_the_next_descent() {
+    let (_test_db, mut app) = runner_at_the_railing("undercity-leave-it").await;
+
+    app.handle_input(b"\r");
+    wait_for_render_contains(&mut app, "step back").await;
+    // Up with the page key while looking over, then back down: the street,
+    // not the old view.
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Undercity ").await;
+    assert_render_not_contains_for(&mut app, "step back", Duration::from_millis(200)).await;
+    wait_for_render_contains(&mut app, "look over").await;
+}
+
+#[tokio::test]
 async fn global_ctrl_o_opens_settings_on_dashboard() {
     let test_db = new_test_db().await;
     let user = create_test_user(&test_db.db, "ctrl-o-it").await;
@@ -3647,6 +3791,18 @@ async fn f_favorites_the_bugs_room_from_the_rail() {
     ChatRoomMember::join(&client, bugs.id, viewer.id)
         .await
         .expect("join bugs");
+    // Seeded before the app starts: a raw insert mid-test is never broadcast,
+    // so it would only render if an unrelated refresh happened to land after it.
+    ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: bugs.id,
+            user_id: viewer.id,
+            body: "---BUG--- a report to read".to_string(),
+        },
+    )
+    .await
+    .expect("create message");
 
     let mut app = make_app(test_db.db.clone(), viewer.id, "f-fav-bugs-flow-it");
     app.resize(160, 32).expect("resize test terminal");
@@ -3655,6 +3811,7 @@ async fn f_favorites_the_bugs_room_from_the_rail() {
     // Core order is lounge, then bugs: one step right lands on it.
     app.handle_input(b"l");
     assert_eq!(app.chat.selected_room_id, Some(bugs.id));
+    wait_for_render_contains(&mut app, "a report to read").await;
 
     app.handle_input(b"f");
     wait_for_render_contains(&mut app, "Added to favorites").await;
@@ -3667,17 +3824,6 @@ async fn f_favorites_the_bugs_room_from_the_rail() {
 
     // With a message selected, `f` belongs to the reaction leader and never
     // reaches the favorite toggle: the favorite stays exactly as it was.
-    ChatMessage::create(
-        &client,
-        ChatMessageParams {
-            room_id: bugs.id,
-            user_id: viewer.id,
-            body: "---BUG--- a report to read".to_string(),
-        },
-    )
-    .await
-    .expect("create message");
-    wait_for_render_contains(&mut app, "a report to read").await;
     app.handle_input(b"j");
     assert!(app.chat.selected_message_id.is_some());
     app.handle_input(b"f");

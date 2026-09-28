@@ -433,7 +433,7 @@ fn key_line(board: &DailyBoardState, detail: &DailyMatchDetail) -> Line<'static>
         hint(&mut spans, "Space/Enter", "place");
         hint(&mut spans, "r", "resign");
     }
-    if !board.spectating && detail.row.chat_room_id.is_some() {
+    if board.shows_chat(detail) {
         hint(&mut spans, "i", "chat");
     }
     hint(&mut spans, "Esc", "back to lobby");

@@ -1974,6 +1974,33 @@ fn what_this_room_offers_leads_the_panel_and_the_standing_keys_stay_short() {
     // The waypoint pair is a standing key: mark a spot, warp back to it later.
     assert!(footer_text.contains(": waypoint"), "got {footer_text}");
     assert!(footer_text.contains("/ warp"), "got {footer_text}");
+    // `f follow` gave its place up to the waypoint and lives in the `?` guide.
+    assert!(!footer_text.contains("f follow"), "got {footer_text}");
+
+    // Once a waypoint is fixed, the warp chip names the zone it lands in - the
+    // room panel no longer spends a standing line saying one is set. The zone
+    // is world data of any length, so it is trimmed to the rail it is painted
+    // into rather than chopped at the edge.
+    let mut marked = town.clone();
+    marked.waypoint = Some("The Verdant Highlands".to_string());
+    assert!(
+        footer_hints(&marked, SIDE_MAX as usize).iter().any(|l| l
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+            .contains("/ warp The Verdant Highlands")),
+        "a wide rail should name the waypoint's zone in full"
+    );
+    for width in [SIDE_NARROW as usize, SIDE_WIDE as usize, SIDE_MAX as usize] {
+        for line in footer_hints(&marked, width) {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                UnicodeWidthStr::width(text.as_str()) <= width,
+                "at width {width} the waypoint chip is clipped: {text:?}"
+            );
+        }
+    }
     // Chat, ranks and leaving live in the `?` guide, not the standing block.
     for gone in ["' say", "! ranks", "Esc leave"] {
         assert!(
@@ -2142,4 +2169,361 @@ fn quest_place_note_names_the_floor_of_a_target_in_the_same_land() {
     // The Frontier's first zone sits in its own reserved block.
     let note = super::quest_place_note(Some(2000), &view).expect("the frontier has a region");
     assert!(note.ends_with(" - beyond this land"), "{note}");
+}
+
+// ---- the tracked walk's stair on the world map ----------------------------
+
+#[test]
+fn the_tracked_stair_swaps_its_double_arrow_for_the_walks_single_arrow() {
+    use crate::app::door::lateania::worldmap::{Climb, Coord, TrackAim};
+    use ratatui::style::{Modifier, Style};
+    use std::collections::HashMap;
+
+    // Two rooms on one floor, each with a way down: the tracked walk leaves
+    // by room 2's stair, room 3's is just another stair on the map. Every
+    // stair is already drawn in the map's green, so the tracked one has to
+    // read differently by glyph, not only by colour.
+    let (cols, height) = (11, 7);
+    let center = Coord { x: 0, y: 0, z: 0 };
+    let coords: HashMap<_, _> = [
+        (1, center),
+        (2, Coord { x: 0, y: -1, z: 0 }),
+        (3, Coord { x: -2, y: 0, z: 0 }),
+    ]
+    .into_iter()
+    .collect();
+    let stair = Style::default().fg(Color::Green);
+    let tracked = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let mut cells = vec![vec![(" ".to_string(), Style::default()); cols as usize]; height as usize];
+    // The corner cell up and to the right of each stair room, as the canvas
+    // places it: room 2 sits at (col 5, row 1), room 3 at (col 1, row 3).
+    cells[0][6] = ("\u{21d3}".to_string(), stair);
+    cells[2][2] = ("\u{21d3}".to_string(), stair);
+
+    super::paint_track_aim(
+        &mut cells,
+        &coords,
+        center,
+        cols,
+        height,
+        Some(TrackAim::Stair {
+            room: 2,
+            climb: Climb::Down,
+        }),
+        1,
+        tracked,
+    );
+
+    assert_eq!(
+        cells[0][6],
+        ("\u{2193}".to_string(), tracked),
+        "the stair the walk takes shows the walk's own arrow in the tracked style"
+    );
+    assert_eq!(
+        cells[2][2],
+        ("\u{21d3}".to_string(), stair),
+        "a stair not on the walk keeps its double arrow"
+    );
+
+    // The way up gets the up arrow.
+    super::paint_track_aim(
+        &mut cells,
+        &coords,
+        center,
+        cols,
+        height,
+        Some(TrackAim::Stair {
+            room: 3,
+            climb: Climb::Up,
+        }),
+        1,
+        tracked,
+    );
+    assert_eq!(cells[2][2], ("\u{2191}".to_string(), tracked));
+}
+
+// ---- The craft screen, and the map on a phone ---------------------------
+
+fn craft_entry(
+    name: &str,
+    stats: &str,
+    pct: Option<i32>,
+    ingredients: Vec<(&str, u32, u32)>,
+    skill_level: i32,
+    level_req: i32,
+) -> super::super::svc::CraftEntryView {
+    use super::super::svc::{CraftEntryView, CraftIngredientView};
+    let ingredients: Vec<CraftIngredientView> = ingredients
+        .into_iter()
+        .map(|(name, need, have)| CraftIngredientView {
+            name: name.to_string(),
+            need,
+            have,
+        })
+        .collect();
+    let short = ingredients.iter().any(|i| i.have < i.need);
+    CraftEntryView {
+        recipe: 0,
+        item_id: 1,
+        name: name.to_string(),
+        rarity: "rare".to_string(),
+        qty: 1,
+        skill: "Smithing".to_string(),
+        skill_level,
+        level_req,
+        xp: 70,
+        inputs: ingredients
+            .iter()
+            .map(|i| format!("{}x {}", i.need, i.name))
+            .collect::<Vec<_>>()
+            .join(", "),
+        ingredients,
+        stats: stats.to_string(),
+        compare: "vs worn: +8 atk".to_string(),
+        compare_pct: pct,
+        slot: Some("weapon".to_string()),
+        worn_name: Some("Iron Longsword".to_string()),
+        worn_stats: Some("+8 atk".to_string()),
+        desc: "A blade folded from good steel.",
+        category: "Weapons",
+        craftable: skill_level >= level_req && !short,
+        reason: String::new(),
+    }
+}
+
+fn draw_craft(
+    width: u16,
+    height: u16,
+    entries: Vec<super::super::svc::CraftEntryView>,
+    cursor: usize,
+) -> Vec<String> {
+    use super::super::svc::CraftView;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let rows: Vec<SectionRow> = std::iter::once(SectionRow::Header {
+        key: "craft:Smithing".to_string(),
+        label: "Smithing".to_string(),
+        count: entries.len(),
+        collapsed: false,
+    })
+    .chain((0..entries.len()).map(|index| SectionRow::Item { index }))
+    .collect();
+    let craft = CraftView {
+        stations: "forge".to_string(),
+        entries,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            super::draw_craft_screen(frame, frame.area(), &rows, &craft, cursor);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+#[test]
+fn the_craft_screen_gives_each_recipe_one_line_and_says_what_it_makes() {
+    let text = draw_craft(
+        110,
+        24,
+        vec![
+            craft_entry(
+                "Steel Greatsword",
+                "+16 atk",
+                Some(6),
+                vec![("Iron Ingot", 3, 5), ("Oak Plank", 1, 2)],
+                12,
+                8,
+            ),
+            craft_entry(
+                "Mithril Greatsword",
+                "+44 atk",
+                Some(77),
+                vec![("Mithril Ingot", 3, 1), ("Yew Plank", 1, 4)],
+                12,
+                8,
+            ),
+        ],
+        // Row 0 is the Smithing header, so row 2 is the second recipe.
+        2,
+    );
+
+    // Every recipe is one row in the list column, not a name-plus-wrapped-
+    // ingredients stanza: the header and both names each sit on one line.
+    let list: Vec<String> = text
+        .iter()
+        .map(|line| line.chars().take(57).collect())
+        .collect();
+    for name in ["Smithing (2)", "Steel Greatsword", "Mithril Greatsword"] {
+        assert_eq!(
+            list.iter().filter(|l| l.contains(name)).count(),
+            1,
+            "{name} should own exactly one list row in\n{}",
+            list.join("\n")
+        );
+    }
+
+    // The row says whether it can be made, and whether it beats what is worn -
+    // the two things the sidebar panel never showed.
+    let ready = list
+        .iter()
+        .find(|l| l.contains("Steel Greatsword"))
+        .expect("steel row");
+    assert!(ready.contains("ready"), "craftable row says so: {ready}");
+    assert!(
+        ready.contains("+6%"),
+        "craftable row carries its tag: {ready}"
+    );
+    let short = list
+        .iter()
+        .find(|l| l.contains("Mithril Greatsword"))
+        .expect("mithril row");
+    assert!(
+        short.contains("1/2"),
+        "a row short of materials counts the lines it has covered: {short}"
+    );
+
+    // The detail pane names the material that is actually missing, with the
+    // shortfall, instead of a bare "need materials".
+    let detail: String = text
+        .iter()
+        .map(|line| line.chars().skip(57).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        detail.contains("Mithril Greatsword"),
+        "detail names the highlighted recipe:\n{detail}"
+    );
+    assert!(
+        detail.contains("+44 atk"),
+        "detail says what it makes:\n{detail}"
+    );
+    assert!(
+        detail.contains("Iron Longsword"),
+        "detail stands it against what is worn:\n{detail}"
+    );
+    assert!(
+        detail.contains("3x Mithril Ingot") && detail.contains("you have 1"),
+        "detail names the short material and the shortfall:\n{detail}"
+    );
+    assert!(
+        detail.contains("gather the missing materials"),
+        "detail says what stands in the way:\n{detail}"
+    );
+}
+
+#[test]
+fn a_craft_gated_by_the_trade_says_the_level_not_the_materials() {
+    let text = draw_craft(
+        110,
+        24,
+        vec![craft_entry(
+            "Mithril Greatsword",
+            "+44 atk",
+            Some(77),
+            vec![("Mithril Ingot", 3, 9)],
+            12,
+            26,
+        )],
+        1,
+    );
+    let all = text.join("\n");
+    assert!(
+        all.contains("lvl 26"),
+        "the list row names the gate:\n{all}"
+    );
+    assert!(
+        all.contains("Smithing 26 first - you are 12"),
+        "the prompt names the gate and where you stand:\n{all}"
+    );
+    assert!(
+        !all.contains("gather the missing materials"),
+        "materials are held, so that is not what blocks it:\n{all}"
+    );
+}
+
+#[test]
+fn the_map_sheds_its_legends_before_its_body_on_a_phone() {
+    use super::{MapChrome, map_controls_line};
+    use ratatui::layout::Rect;
+
+    let rect = |w, h| Rect {
+        x: 0,
+        y: 0,
+        width: w,
+        height: h,
+    };
+    let chrome_rows = |c: &MapChrome| -> u16 {
+        c.inspector
+            + u16::from(c.controls)
+            + u16::from(c.symbols)
+            + u16::from(c.markers)
+            + u16::from(c.terrain)
+    };
+
+    // A desktop terminal keeps everything it always had.
+    let desktop = MapChrome::for_area(rect(120, 40));
+    assert_eq!(chrome_rows(&desktop), 6, "full chrome on a big terminal");
+
+    // A phone gets the crosshair and the controls and nothing else, so the map
+    // body keeps the rows rather than spending them on legends that would be
+    // clipped mid-word at this width anyway.
+    let phone = MapChrome::for_area(rect(36, 18));
+    assert_eq!(
+        phone,
+        MapChrome {
+            inspector: 2,
+            controls: true,
+            symbols: false,
+            markers: false,
+            terrain: false,
+        }
+    );
+
+    // The body never drops below a usable handful of rows: at the very floor,
+    // header + chrome still leave more rows to the map than to the frame.
+    let floor = rect(super::MAP_MIN_W, super::MAP_MIN_H);
+    assert!(super::map_fits(floor), "the floor fits by definition");
+    let body = floor.height - 1 - chrome_rows(&MapChrome::for_area(floor));
+    assert!(
+        body >= floor.height / 2,
+        "the map keeps at least half the rows at the floor, got {body} of {}",
+        floor.height
+    );
+
+    // And the control line shrinks to fit rather than being clipped: the keys
+    // that close the map and mark a destination survive every width.
+    for w in [32u16, 46, 64, 92, 140] {
+        let line = map_controls_line(w);
+        assert!(
+            line.chars().count() <= w as usize,
+            "controls fit {w} columns: {line:?}"
+        );
+        assert!(line.contains("m close") && line.contains("x mark"));
+    }
+}
+
+#[test]
+fn a_short_terminal_gives_the_field_its_rows_and_puts_the_events_in_the_rail() {
+    // A phone held sideways is twenty rows; the full-width strip would take a
+    // third of them off the one thing that cannot be scrolled back to.
+    assert!(super::events_in_rail(20), "a short terminal uses the rail");
+    assert!(
+        !super::events_in_rail(40),
+        "a tall terminal keeps the full-width strip"
+    );
+    // The rail's events block never eats the room summary above it.
+    for h in [10u16, 16, 23] {
+        let log = super::rail_log_height(h);
+        assert!(log < h - log, "room summary keeps the larger share at {h}");
+    }
 }
