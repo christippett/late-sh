@@ -102,6 +102,12 @@ class Vt100Screen:
                             c = int(params[1]) if len(params) > 1 and params[1] else 1
                             row = min(height - 1, max(0, r - 1))
                             col = min(width - 1, max(0, c - 1))
+                        elif cmd == 'G':
+                            c = int(params[0]) if len(params) > 0 and params[0] else 1
+                            col = min(width - 1, max(0, c - 1))
+                        elif cmd == 'd':
+                            r = int(params[0]) if len(params) > 0 and params[0] else 1
+                            row = min(height - 1, max(0, r - 1))
                         elif cmd == 'C':
                             c = int(params[0]) if len(params) > 0 and params[0] else 1
                             col = min(width - 1, col + c)
@@ -114,6 +120,27 @@ class Vt100Screen:
                         elif cmd == 'A':
                             r = int(params[0]) if len(params) > 0 and params[0] else 1
                             row = max(0, row - r)
+                        elif cmd == 'K':
+                            mode = int(params[0]) if len(params) > 0 and params[0] else 0
+                            if mode == 0:
+                                for c_idx in range(col, width):
+                                    screen[row][c_idx] = ' '
+                            elif mode == 1:
+                                for c_idx in range(0, col + 1):
+                                    screen[row][c_idx] = ' '
+                            elif mode == 2:
+                                for c_idx in range(0, width):
+                                    screen[row][c_idx] = ' '
+                        elif cmd == 'J':
+                            mode = int(params[0]) if len(params) > 0 and params[0] else 0
+                            if mode == 2 or mode == 3:
+                                for r_idx in range(height):
+                                    for c_idx in range(width):
+                                        screen[r_idx][c_idx] = ' '
+                        elif cmd == 'X':
+                            count = int(params[0]) if len(params) > 0 and params[0] else 1
+                            for c_idx in range(col, min(width, col + count)):
+                                screen[row][c_idx] = ' '
 
                         i += 1 + match.end()
                         continue

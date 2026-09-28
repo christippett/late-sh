@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import re
 import time
@@ -286,6 +287,7 @@ class TetrisBot(LiveBotClient):
         self.log("Bot is playing Lateris (Tetris)...")
         summary = None
         target_reached = False
+        last_logged_score = 0
         try:
             while self.is_alive():
                 screen = self.get_screen()
@@ -306,11 +308,18 @@ class TetrisBot(LiveBotClient):
                     time.sleep(0.05)
                     continue
 
-                if self.target is not None:
-                    target_match = re.search(r'score\s+(\d+)', flat_screen)
-                    if target_match and int(target_match.group(1)) >= self.target:
+                score_match = re.search(r'score\s+(\d+)', flat_screen)
+                if score_match:
+                    current_score = int(score_match.group(1))
+                    if current_score >= last_logged_score + 10000:
+                        lines_match = re.search(r'lines\s+(\d+)', flat_screen)
+                        lines_str = lines_match.group(1) if lines_match else "?"
+                        self.log(f"Progress: Score = {current_score} | Lines = {lines_str}")
+                        last_logged_score = (current_score // 10000) * 10000
+
+                    if self.target is not None and current_score >= self.target:
                         target_reached = True
-                        self.log(f"Target score {self.target} reached — no longer making moves")
+                        self.log(f"Target score {self.target} reached (score: {current_score}) — no longer making moves")
                         continue
                 grid = self.get_screen_grid(screen)
                 if not grid:

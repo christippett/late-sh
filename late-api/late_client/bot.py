@@ -80,7 +80,7 @@ class LiveBotClient:
     def connect(self):
         # We rely on the user's ~/.ssh/config containing the `late` host, 
         # so it inherently inherits their identity and bypasses onboarding!
-        cmd = ['ssh', self.host]
+        cmd = ['ssh', '-o', 'IdentityAgent=none', self.host]
         self.log(f"Executing: {' '.join(cmd)}")
         self.proc = subprocess.Popen(cmd, stdin=self.slave, stdout=self.slave, stderr=self.slave)
         self.running = True
