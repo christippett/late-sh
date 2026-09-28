@@ -68,8 +68,8 @@ def compute_daily_solution() -> str:
 
 
 class RubiksCubeBot(LiveBotClient):
-    def __init__(self, watch=False):
-        super().__init__(watch=watch, width=120, height=40)
+    def __init__(self, watch=False, **kwargs):
+        super().__init__(watch=watch, width=120, height=40, **kwargs)
 
     def navigate_to_game(self):
         self.log("Waiting for login...")
@@ -198,5 +198,5 @@ if __name__ == "__main__":
     parser.add_argument("--watch", action="store_true", help="Mirror the VT100 output to stdout for live viewing")
     args = parser.parse_args()
 
-    bot = RubiksCubeBot(watch=args.watch)
+    bot = RubiksCubeBot(watch=args.watch, host="late")
     bot.play()
