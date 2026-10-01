@@ -1,27 +1,26 @@
 import argparse
-import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from late_client.bot import LiveBotClient
 
 # Palette matching late-ssh/src/app/arcade/rubiks_cube/ui.rs
 PALETTE = {
-    'W': (232, 236, 239),
-    'Y': (246, 202, 68),
-    'O': (236, 126, 42),
-    'R': (212, 63, 56),
-    'G': (63, 160, 92),
-    'B': (65, 115, 204),
+    "W": (232, 236, 239),
+    "Y": (246, 202, 68),
+    "O": (236, 126, 42),
+    "R": (212, 63, 56),
+    "G": (63, 160, 92),
+    "B": (65, 115, 204),
 }
 
 
 def _identify_sticker(bg) -> str | None:
-    if not bg or len(bg) < 5 or bg[0] != '48' or bg[1] != '2':
+    if not bg or len(bg) < 5 or bg[0] != "48" or bg[1] != "2":
         return None
     r, g, b = int(bg[2]), int(bg[3]), int(bg[4])
     best = None
-    min_dist = float('inf')
+    min_dist = float("inf")
     for name, (pr, pg, pb) in PALETTE.items():
         dist = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2
         if dist < min_dist:
@@ -34,17 +33,17 @@ def compute_daily_solution() -> str:
     """
     Computes the exact inverse of today's deterministic daily scramble.
     """
-    today = datetime.now(timezone.utc).date()
-    seed = 0xcbf29ce484222325
+    today = datetime.now(UTC).date()
+    seed = 0xCBF29CE484222325
     for b in b"late-sh-rubiks-cube-daily-v1":
         seed ^= b
-        seed = (seed * 0x00000100000001b3) & 0xFFFFFFFFFFFFFFFF
-    date_str = today.strftime("%Y-%m-%d").encode('utf-8')
+        seed = (seed * 0x00000100000001B3) & 0xFFFFFFFFFFFFFFFF
+    date_str = today.strftime("%Y-%m-%d").encode("utf-8")
     for b in date_str:
         seed ^= b
-        seed = (seed * 0x00000100000001b3) & 0xFFFFFFFFFFFFFFFF
+        seed = (seed * 0x00000100000001B3) & 0xFFFFFFFFFFFFFFFF
 
-    faces = ['U', 'D', 'L', 'R', 'F', 'B']
+    faces = ["U", "D", "L", "R", "F", "B"]
     previous = None
     moves = []
     for _ in range(24):
@@ -54,7 +53,7 @@ def compute_daily_solution() -> str:
             seed = (seed * 6364136223846793005 + 1) & 0xFFFFFFFFFFFFFFFF
             face = faces[seed % len(faces)]
         seed = (seed * 6364136223846793005 + 1) & 0xFFFFFFFFFFFFFFFF
-        inverse = (seed % 2 == 0)
+        inverse = seed % 2 == 0
         moves.append((face, inverse))
         previous = face
 
@@ -76,17 +75,17 @@ class RubiksCubeBot(LiveBotClient):
         time.sleep(2)
 
         self.log("Clearing splash screen...")
-        self.send_keys('\x1b\x1b')
+        self.send_keys("\x1b\x1b")
         time.sleep(1)
 
         self.log("Entering Arcade (2)...")
-        self.send_keys('2')
+        self.send_keys("2")
         time.sleep(1)
 
         self.log("Selecting Rubik's Cube (5j\\r)...")
         # In the Arcade lobby order:
         # 0: 2048, 1: Tetris, 2: Snake, 3: Traffic, 4: Le Word, 5: Rubik's Cube
-        self.send_keys('j\r')
+        self.send_keys("j\r")
         time.sleep(1)
 
     def is_solved(self, screen_lines) -> bool:
@@ -142,7 +141,7 @@ class RubiksCubeBot(LiveBotClient):
                             if stk:
                                 row_stickers.append(stk)
                             else:
-                                row_stickers.append('?')
+                                row_stickers.append("?")
                         grid.append(row_stickers)
                     net[slot] = grid
                     found = True
@@ -166,13 +165,15 @@ class RubiksCubeBot(LiveBotClient):
 
             # Reset cube to clean daily scramble: 's' then 's' confirms reset
             self.log("Resetting cube to today's canonical scramble (ss)...")
-            self.send_keys('ss')
+            self.send_keys("ss")
             time.sleep(0.5)
 
             # Compute and execute the exact 24-move inverse sequence
             solution = compute_daily_solution()
-            self.log(f"Applying inverse daily solution ({len(solution)} moves): {solution}")
-            
+            self.log(
+                f"Applying inverse daily solution ({len(solution)} moves): {solution}"
+            )
+
             for idx, move in enumerate(solution):
                 self.send_keys(move)
                 time.sleep(0.04)
@@ -180,7 +181,9 @@ class RubiksCubeBot(LiveBotClient):
             time.sleep(0.5)
             screen = self.get_screen()
             if self.is_solved(screen):
-                self.log(f"\n🎉 Daily Rubik's Cube solved successfully in {len(solution)} moves!")
+                self.log(
+                    f"\n🎉 Daily Rubik's Cube solved successfully in {len(solution)} moves!"
+                )
             else:
                 self.log("Checking final board state...")
                 net = self.extract_net(screen)
@@ -195,7 +198,11 @@ class RubiksCubeBot(LiveBotClient):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autonomous Rubik's Cube Bot")
-    parser.add_argument("--watch", action="store_true", help="Mirror the VT100 output to stdout for live viewing")
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Mirror the VT100 output to stdout for live viewing",
+    )
     args = parser.parse_args()
 
     bot = RubiksCubeBot(watch=args.watch, host="late")

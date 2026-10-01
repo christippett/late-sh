@@ -6,43 +6,43 @@ import time
 from late_client.bot import LiveBotClient
 
 PIECE_OFFSETS = {
-    'I': [
+    "I": [
         [(0, 0), (0, 1), (0, 2), (0, 3)],
         [(0, 1), (1, 1), (2, 1), (3, 1)],
         [(0, 0), (0, 1), (0, 2), (0, 3)],
         [(0, 1), (1, 1), (2, 1), (3, 1)],
     ],
-    'O': [
+    "O": [
         [(0, 1), (0, 2), (1, 1), (1, 2)],
         [(0, 1), (0, 2), (1, 1), (1, 2)],
         [(0, 1), (0, 2), (1, 1), (1, 2)],
         [(0, 1), (0, 2), (1, 1), (1, 2)],
     ],
-    'T': [
+    "T": [
         [(0, 1), (1, 0), (1, 1), (1, 2)],
         [(0, 1), (1, 1), (1, 2), (2, 1)],
         [(1, 0), (1, 1), (1, 2), (2, 1)],
         [(0, 1), (1, 0), (1, 1), (2, 1)],
     ],
-    'S': [
+    "S": [
         [(0, 1), (0, 2), (1, 0), (1, 1)],
         [(0, 1), (1, 1), (1, 2), (2, 2)],
         [(0, 1), (0, 2), (1, 0), (1, 1)],
         [(0, 1), (1, 1), (1, 2), (2, 2)],
     ],
-    'Z': [
+    "Z": [
         [(0, 0), (0, 1), (1, 1), (1, 2)],
         [(0, 2), (1, 1), (1, 2), (2, 1)],
         [(0, 0), (0, 1), (1, 1), (1, 2)],
         [(0, 2), (1, 1), (1, 2), (2, 1)],
     ],
-    'J': [
+    "J": [
         [(0, 0), (1, 0), (1, 1), (1, 2)],
         [(0, 1), (0, 2), (1, 1), (2, 1)],
         [(1, 0), (1, 1), (1, 2), (2, 2)],
         [(0, 1), (1, 1), (2, 0), (2, 1)],
     ],
-    'L': [
+    "L": [
         [(0, 2), (1, 0), (1, 1), (1, 2)],
         [(0, 1), (1, 1), (2, 1), (2, 2)],
         [(1, 0), (1, 1), (1, 2), (2, 0)],
@@ -50,54 +50,55 @@ PIECE_OFFSETS = {
     ],
 }
 
+
 class TetrisBot(LiveBotClient):
-    def __init__(self, watch=False, target=None, host='late'):
+    def __init__(self, watch=False, target=None, host="late"):
         super().__init__(watch=watch, width=120, height=40, host=host)
         self.target = target
 
     def navigate_to_game(self):
         self.log("Waiting for login...")
         time.sleep(2)
-        
+
         self.log("Sending ESC (to clear splash if any)...")
-        self.send_keys('\x1b\x1b')
+        self.send_keys("\x1b\x1b")
         time.sleep(1)
 
         self.log("Entering Arcade (2)...")
-        self.send_keys('2')
+        self.send_keys("2")
         time.sleep(1)
 
         self.log("Selecting Lateris (jjjjjjjj\\r)...")
         # Tetris is the 2nd game in the Arcade lobby
-        self.send_keys('jjjjjjjj\r')
+        self.send_keys("jjjjjjjj\r")
         time.sleep(1)
 
         self.log("Starting Game (r)...")
-        self.send_keys('r')
+        self.send_keys("r")
         time.sleep(1)
 
     def get_screen_grid(self, screen):
         top_r, top_c = -1, -1
         for r, line in enumerate(screen):
-            c = line.find('┌────────────────────┐')
+            c = line.find("┌────────────────────┐")
             if c != -1:
                 top_r, top_c = r, c
                 break
-                
-        if top_r == -1: 
+
+        if top_r == -1:
             return None
 
         # Extract 20x10 boolean grid of blocks
-        grid = [[False]*10 for _ in range(20)]
+        grid = [[False] * 10 for _ in range(20)]
         for r in range(20):
             if top_r + 1 + r >= len(screen):
                 break
             line = screen[top_r + 1 + r]
             for c in range(10):
                 # Cells are 2 characters wide ('██' or '  ')
-                idx = top_c + 1 + c*2
+                idx = top_c + 1 + c * 2
                 # ponytail: ghost blocks are rendered with light shading. skip them
-                if idx < len(line) and line[idx] == '█':
+                if idx < len(line) and line[idx] == "█":
                     grid[r][c] = True
 
         return grid
@@ -115,7 +116,7 @@ class TetrisBot(LiveBotClient):
         # ponytail: scan all rows but verify piece isn't just a settled shape by checking for blocks directly above
         for spawn_row in range(20):
             for kind, rot_offsets in PIECE_OFFSETS.items():
-                offsets = rot_offsets[0] # Spawn rotation is always 0
+                offsets = rot_offsets[0]  # Spawn rotation is always 0
                 cells = [(spawn_row + dr, 3 + dc) for dr, dc in offsets]
                 if all(0 <= r < 20 and 0 <= c < 10 and grid[r][c] for r, c in cells):
                     # ponytail: verify piece isn't just a settled shape by checking for blocks directly above
@@ -139,27 +140,27 @@ class TetrisBot(LiveBotClient):
         # 1. Row Transitions
         row_transitions = 0
         for r in range(20):
-            prev = True # Board left wall is filled
+            prev = True  # Board left wall is filled
             for c in range(10):
                 curr = board[r][c]
                 if curr != prev:
                     row_transitions += 1
                 prev = curr
-            if not prev: # Board right wall is filled
+            if not prev:  # Board right wall is filled
                 row_transitions += 1
-                
+
         # 2. Column Transitions
         col_transitions = 0
         for c in range(10):
-            prev = False # Top of board is empty
+            prev = False  # Top of board is empty
             for r in range(20):
                 curr = board[r][c]
                 if curr != prev:
                     col_transitions += 1
                 prev = curr
-            if not prev: # Bottom floor is filled
+            if not prev:  # Bottom floor is filled
                 col_transitions += 1
-                
+
         # 3. Number of Holes
         holes = 0
         for c in range(10):
@@ -169,7 +170,7 @@ class TetrisBot(LiveBotClient):
                     block_above = True
                 elif block_above:
                     holes += 1
-                    
+
         # 4. Cumulative Well Sums
         well_sums = 0
         for c in range(10):
@@ -182,7 +183,7 @@ class TetrisBot(LiveBotClient):
                     well_sums += d
                 else:
                     d = 0
-                    
+
         return (
             -4.500158825082766 * landing_height
             + 3.4181268101392694 * lines_cleared
@@ -198,7 +199,9 @@ class TetrisBot(LiveBotClient):
         returning a list of (rot, col_shift, new_board, score).
         """
         placements = []
-        num_rots = {'O': 1, 'I': 2, 'S': 2, 'Z': 2, 'T': 4, 'J': 4, 'L': 4}.get(piece_kind, 4)
+        num_rots = {"O": 1, "I": 2, "S": 2, "Z": 2, "T": 4, "J": 4, "L": 4}.get(
+            piece_kind, 4
+        )
         for rot in range(num_rots):
             offsets = PIECE_OFFSETS[piece_kind][rot]
             min_c = min(c for r, c in offsets)
@@ -238,7 +241,7 @@ class TetrisBot(LiveBotClient):
                 lines_cleared = len(cleared_rows)
 
                 if lines_cleared > 0:
-                    cleared_board = [[False]*10 for _ in range(lines_cleared)]
+                    cleared_board = [[False] * 10 for _ in range(lines_cleared)]
                     for r in range(20):
                         if r not in cleared_rows:
                             cleared_board.append(new_board[r])
@@ -255,7 +258,7 @@ class TetrisBot(LiveBotClient):
         evaluating each landing state. When next_piece is provided,
         evaluates 2-ply lookahead (best_score = base_score + max_next_score).
         """
-        best_score = -float('inf')
+        best_score = -float("inf")
         best_rot = 0
         best_col_shift = 0
 
@@ -292,11 +295,11 @@ class TetrisBot(LiveBotClient):
             while self.is_alive():
                 screen = self.get_screen()
                 flat_screen = "".join(screen)
-                
+
                 # Detect Game Over
                 if "GAME OVER" in flat_screen:
-                    score_match = re.search(r'score\s+(\d+)', flat_screen)
-                    lines_match = re.search(r'lines\s+(\d+)', flat_screen)
+                    score_match = re.search(r"score\s+(\d+)", flat_screen)
+                    lines_match = re.search(r"lines\s+(\d+)", flat_screen)
                     score = score_match.group(1) if score_match else "0"
                     lines = lines_match.group(1) if lines_match else "0"
                     summary = f"\n💀 Game Over! Lateris run finished.\nFinal Score:   {score}\nLines Cleared: {lines}\n"
@@ -308,18 +311,22 @@ class TetrisBot(LiveBotClient):
                     time.sleep(0.05)
                     continue
 
-                score_match = re.search(r'score\s+(\d+)', flat_screen)
+                score_match = re.search(r"score\s+(\d+)", flat_screen)
                 if score_match:
                     current_score = int(score_match.group(1))
                     if current_score >= last_logged_score + 10000:
-                        lines_match = re.search(r'lines\s+(\d+)', flat_screen)
+                        lines_match = re.search(r"lines\s+(\d+)", flat_screen)
                         lines_str = lines_match.group(1) if lines_match else "?"
-                        self.log(f"Progress: Score = {current_score} | Lines = {lines_str}")
+                        self.log(
+                            f"Progress: Score = {current_score} | Lines = {lines_str}"
+                        )
                         last_logged_score = (current_score // 10000) * 10000
 
                     if self.target is not None and current_score >= self.target:
                         target_reached = True
-                        self.log(f"Target score {self.target} reached (score: {current_score}) — no longer making moves")
+                        self.log(
+                            f"Target score {self.target} reached (score: {current_score}) — no longer making moves"
+                        )
                         continue
                 grid = self.get_screen_grid(screen)
                 if not grid:
@@ -327,11 +334,11 @@ class TetrisBot(LiveBotClient):
                     continue
 
                 piece_kind, piece_cells = self.detect_active_piece(grid)
-                if not piece_kind:
+                if not piece_kind or not piece_cells:
                     time.sleep(0.02)
                     continue
 
-                next_match = re.search(r'next\s+([A-Z])', flat_screen)
+                next_match = re.search(r"next\s+([A-Z])", flat_screen)
                 next_kind = next_match.group(1) if next_match else None
 
                 # Build the settled board by clearing the active piece's cells
@@ -340,17 +347,19 @@ class TetrisBot(LiveBotClient):
                     settled_board[r][c] = False
 
                 # Plan the optimal placement instantaneously (with 2-ply lookahead)
-                best_rot, best_shift = self.plan_move(settled_board, piece_kind, next_kind)
+                best_rot, best_shift = self.plan_move(
+                    settled_board, piece_kind, next_kind
+                )
 
                 # Assemble the keystrokes
                 keys = ""
                 if best_rot > 0:
-                    keys += 'k' * best_rot
+                    keys += "k" * best_rot
                 if best_shift < 0:
-                    keys += 'h' * (-best_shift)
+                    keys += "h" * (-best_shift)
                 elif best_shift > 0:
-                    keys += 'l' * best_shift
-                keys += ' ' # Hard drop!
+                    keys += "l" * best_shift
+                keys += " "  # Hard drop!
 
                 # Send the entire sequence in one atomic burst
                 self.send_keys(keys)
@@ -365,10 +374,20 @@ class TetrisBot(LiveBotClient):
             if summary:
                 print(summary)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autonomous Lateris (Tetris) Bot")
-    parser.add_argument("--watch", action="store_true", help="Mirror the VT100 output to stdout for live viewing")
-    parser.add_argument("--target", type=int, default=None, help="Stop making moves once this score is reached; the game then ends naturally")
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Mirror the VT100 output to stdout for live viewing",
+    )
+    parser.add_argument(
+        "--target",
+        type=int,
+        default=None,
+        help="Stop making moves once this score is reached; the game then ends naturally",
+    )
     parser.add_argument("--host", type=str, default="late", help="SSH host")
     args = parser.parse_args()
 

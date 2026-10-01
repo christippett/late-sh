@@ -30,7 +30,9 @@ def _build_row_lookup_tables():
                 i += 1
         while len(merged) < 4:
             merged.append(0)
-        row_left[r] = (merged[0] << 12) | (merged[1] << 8) | (merged[2] << 4) | merged[3]
+        row_left[r] = (
+            (merged[0] << 12) | (merged[1] << 8) | (merged[2] << 4) | merged[3]
+        )
 
         # Right shift & merge
         tiles = [x for x in (n3, n2, n1, n0) if x != 0]
@@ -45,7 +47,9 @@ def _build_row_lookup_tables():
                 i += 1
         while len(merged) < 4:
             merged.append(0)
-        row_right[r] = (merged[3] << 12) | (merged[2] << 8) | (merged[1] << 4) | merged[0]
+        row_right[r] = (
+            (merged[3] << 12) | (merged[2] << 8) | (merged[1] << 4) | merged[0]
+        )
 
     return row_left, row_right
 
@@ -55,9 +59,9 @@ ROW_LEFT, ROW_RIGHT = _build_row_lookup_tables()
 # Generate all 8 orientations of the monotonic snake heuristic matrix
 WEIGHTS_BASE = [
     [15, 14, 13, 12],
-    [ 8,  9, 10, 11],
-    [ 7,  6,  5,  4],
-    [ 0,  1,  2,  3],
+    [8, 9, 10, 11],
+    [7, 6, 5, 4],
+    [0, 1, 2, 3],
 ]
 
 
@@ -77,7 +81,7 @@ for _ in range(4):
     _curr = _rotate_matrix(_curr)
 
 # 3.5 base factor produces strong monotonic ordering without float overflow
-SNAKE_WEIGHTS = [[3.5 ** rank for row in p for rank in row] for p in _PATTERNS]
+SNAKE_WEIGHTS = [[3.5**rank for row in p for rank in row] for p in _PATTERNS]
 
 
 def _transpose(b: int) -> int:
@@ -85,10 +89,30 @@ def _transpose(b: int) -> int:
     r1 = (b >> 32) & 0xFFFF
     r2 = (b >> 16) & 0xFFFF
     r3 = b & 0xFFFF
-    c0 = ((r0 & 0xF000) | ((r1 & 0xF000) >> 4) | ((r2 & 0xF000) >> 8) | ((r3 & 0xF000) >> 12))
-    c1 = (((r0 & 0x0F00) << 4) | (r1 & 0x0F00) | ((r2 & 0x0F00) >> 4) | ((r3 & 0x0F00) >> 8))
-    c2 = (((r0 & 0x00F0) << 8) | ((r1 & 0x00F0) << 4) | (r2 & 0x00F0) | ((r3 & 0x00F0) >> 4))
-    c3 = (((r0 & 0x000F) << 12) | ((r1 & 0x000F) << 8) | ((r2 & 0x000F) << 4) | (r3 & 0x000F))
+    c0 = (
+        (r0 & 0xF000)
+        | ((r1 & 0xF000) >> 4)
+        | ((r2 & 0xF000) >> 8)
+        | ((r3 & 0xF000) >> 12)
+    )
+    c1 = (
+        ((r0 & 0x0F00) << 4)
+        | (r1 & 0x0F00)
+        | ((r2 & 0x0F00) >> 4)
+        | ((r3 & 0x0F00) >> 8)
+    )
+    c2 = (
+        ((r0 & 0x00F0) << 8)
+        | ((r1 & 0x00F0) << 4)
+        | (r2 & 0x00F0)
+        | ((r3 & 0x00F0) >> 4)
+    )
+    c3 = (
+        ((r0 & 0x000F) << 12)
+        | ((r1 & 0x000F) << 8)
+        | ((r2 & 0x000F) << 4)
+        | (r3 & 0x000F)
+    )
     return (c0 << 48) | (c1 << 32) | (c2 << 16) | c3
 
 
@@ -135,7 +159,7 @@ def _evaluate_board(b: int) -> float:
 
     # 2. Empty cell bonus
     empties = nibbles.count(0)
-    empty_score = (empties ** 1.5) * 500000.0 if empties > 0 else 0.0
+    empty_score = (empties**1.5) * 500000.0 if empties > 0 else 0.0
 
     # 3. Smoothness penalty
     smoothness = 0.0
@@ -171,7 +195,7 @@ def _expectimax(b: int, depth: int, max_samples: int = 3) -> float:
     if depth == 0:
         return _evaluate_board(b)
 
-    best = -float('inf')
+    best = -float("inf")
     moved = False
 
     for m in (0, 1, 2, 3):
@@ -183,7 +207,11 @@ def _expectimax(b: int, depth: int, max_samples: int = 3) -> float:
             if num_empty == 0:
                 s = _evaluate_board(nb)
             else:
-                chosen = empty_shifts if num_empty <= max_samples else random.sample(empty_shifts, max_samples)
+                chosen = (
+                    empty_shifts
+                    if num_empty <= max_samples
+                    else random.sample(empty_shifts, max_samples)
+                )
                 s = 0.0
                 for shift in chosen:
                     s += 0.9 * _expectimax(nb | (1 << shift), depth - 1, max_samples)
@@ -206,19 +234,19 @@ class TwentyFortyEightBot(LiveBotClient):
         time.sleep(2)
 
         self.log("Clearing splash screen...")
-        self.send_keys('\x1b\x1b')
+        self.send_keys("\x1b\x1b")
         time.sleep(1)
 
         self.log("Entering Arcade (2)...")
-        self.send_keys('2')
+        self.send_keys("2")
         time.sleep(1)
 
         self.log("Selecting 2048 (\\r)...")
-        self.send_keys('\r')
+        self.send_keys("\r")
         time.sleep(1)
 
         self.log("Starting/Restarting Game (r)...")
-        self.send_keys('r')
+        self.send_keys("r")
         time.sleep(1)
 
     def extract_bitboard(self, screen) -> int | None:
@@ -228,9 +256,9 @@ class TwentyFortyEightBot(LiveBotClient):
         """
         top_left = None
         for r, line in enumerate(screen):
-            c = line.find('┌')
-            if c != -1 and '┌──────┐' in line:
-                top_left = (r, line.index('┌──────┐'))
+            c = line.find("┌")
+            if c != -1 and "┌──────┐" in line:
+                top_left = (r, line.index("┌──────┐"))
                 break
 
         if not top_left:
@@ -247,8 +275,8 @@ class TwentyFortyEightBot(LiveBotClient):
 
             for col in range(4):
                 col_c = base_c + col * 8
-                cell_text = line[col_c:col_c + 8]
-                cell_clean = re.sub(r'[│┌┐└┘─\s]', '', cell_text)
+                cell_text = line[col_c : col_c + 8]
+                cell_clean = re.sub(r"[│┌┐└┘─\s]", "", cell_text)
                 if cell_clean.isdigit():
                     val = int(cell_clean)
                     nibble = val.bit_length() - 1 if val > 0 else 0
@@ -256,7 +284,7 @@ class TwentyFortyEightBot(LiveBotClient):
                     nibble = 0
 
                 idx = row * 4 + col
-                bitboard |= (nibble << ((15 - idx) * 4))
+                bitboard |= nibble << ((15 - idx) * 4)
 
         return bitboard
 
@@ -280,23 +308,33 @@ class TwentyFortyEightBot(LiveBotClient):
             max_samples = 3
 
         best_move = None
-        best_score = -float('inf')
+        best_score = -float("inf")
 
-        move_keys = ['k', 'j', 'h', 'l']  # 0: Up, 1: Down, 2: Left, 3: Right
+        move_keys = ["k", "j", "h", "l"]  # 0: Up, 1: Down, 2: Left, 3: Right
 
         for m in (0, 1, 2, 3):
             nb = _move_board(bitboard, m)
             if nb != bitboard:
-                empty_shifts = [i * 4 for i in range(16) if ((nb >> (i * 4)) & 0xF) == 0]
+                empty_shifts = [
+                    i * 4 for i in range(16) if ((nb >> (i * 4)) & 0xF) == 0
+                ]
                 num_empty = len(empty_shifts)
                 if num_empty == 0:
                     s = _evaluate_board(nb)
                 else:
-                    chosen = empty_shifts if num_empty <= 4 else random.sample(empty_shifts, 4)
+                    chosen = (
+                        empty_shifts
+                        if num_empty <= 4
+                        else random.sample(empty_shifts, 4)
+                    )
                     s = 0.0
                     for shift in chosen:
-                        s += 0.9 * _expectimax(nb | (1 << shift), depth - 1, max_samples)
-                        s += 0.1 * _expectimax(nb | (2 << shift), depth - 1, max_samples)
+                        s += 0.9 * _expectimax(
+                            nb | (1 << shift), depth - 1, max_samples
+                        )
+                        s += 0.1 * _expectimax(
+                            nb | (2 << shift), depth - 1, max_samples
+                        )
                     s /= len(chosen)
 
                 if s > best_score:
@@ -319,13 +357,13 @@ class TwentyFortyEightBot(LiveBotClient):
                 flat_screen = "".join(screen)
 
                 if "GAME OVER" in flat_screen:
-                    score_match = re.search(r'score\s+(\d+)', flat_screen)
+                    score_match = re.search(r"score\s+(\d+)", flat_screen)
                     score = score_match.group(1) if score_match else "0"
                     print(f"\n💀 Game Over! 2048 run finished.\nFinal Score: {score}\n")
                     break
 
                 if self.target is not None:
-                    target_match = re.search(r'score\s+(\d+)', flat_screen)
+                    target_match = re.search(r"score\s+(\d+)", flat_screen)
                     if target_match and int(target_match.group(1)) >= self.target:
                         self.log(f"Target score {self.target} reached!")
                         break
@@ -342,14 +380,14 @@ class TwentyFortyEightBot(LiveBotClient):
                         # Unstick by trying any valid movement
                         for m_idx in (2, 1, 3, 0):  # Left, Down, Right, Up
                             if _move_board(bitboard, m_idx) != bitboard:
-                                self.send_keys(['k', 'j', 'h', 'l'][m_idx])
+                                self.send_keys(["k", "j", "h", "l"][m_idx])
                                 break
                     else:
                         move = self.plan_move(bitboard)
                         if move:
                             self.send_keys(move)
                 else:
-                    self.send_keys(random.choice(['h', 'j', 'l']))
+                    self.send_keys(random.choice(["h", "j", "l"]))
 
                 time.sleep(0.08)
 
@@ -361,8 +399,17 @@ class TwentyFortyEightBot(LiveBotClient):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autonomous 2048 Bot")
-    parser.add_argument("--watch", action="store_true", help="Mirror the VT100 output to stdout for live viewing")
-    parser.add_argument("--target", type=int, default=None, help="Stop making moves once this score is reached")
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Mirror the VT100 output to stdout for live viewing",
+    )
+    parser.add_argument(
+        "--target",
+        type=int,
+        default=None,
+        help="Stop making moves once this score is reached",
+    )
     args = parser.parse_args()
 
     bot = TwentyFortyEightBot(watch=args.watch, target=args.target)
