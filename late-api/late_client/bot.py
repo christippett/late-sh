@@ -119,6 +119,8 @@ class LiveBotClient:
             os.write(self.master, data)
 
     def _reader(self):
+        if not self.proc:
+            return
         while self.running and self.proc.poll() is None:
             try:
                 r, _, _ = select.select([self.master], [], [], 0.05)
