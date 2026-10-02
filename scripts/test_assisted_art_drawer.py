@@ -17,27 +17,23 @@ Tests for scripts/artboard_painter.py:
 6. Chafa flags preservation (-c 16, -f symbols, etc.).
 """
 
-import math
-import os
 import pathlib
 import sys
+
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from scripts.artboard_painter import (
-    Cell,
     PAINT_PALETTE,
-    CANVAS_WIDTH,
-    CANVAS_HEIGHT,
+    Cell,
     char_display_width,
-    rgb_to_cielab,
     delta_e_cielab,
-    parse_chafa_ansi,
-    map_colors_with_contrast,
     generate_ansi_preview,
+    map_colors_with_contrast,
     optimize_drawing_stream,
-    run_chafa,
+    parse_chafa_ansi,
+    rgb_to_cielab,
 )
 
 
@@ -148,6 +144,7 @@ def test_ansi_preview_generation():
     assert "\x1b[38;2;255;110;64mA" in preview_palette
     assert "\x1b[38;2;84;196;255mB" in preview_palette
 
+
 def test_drawing_stream_simulation_with_wide_characters():
     # Simulate execution on a virtual artboard canvas with narrow and wide characters
     c1 = Cell("こ", (255, 110, 64))  # width 2
@@ -164,7 +161,9 @@ def test_drawing_stream_simulation_with_wide_characters():
     ]
 
     origin_x, origin_y = 10, 10
-    stream, stats = optimize_drawing_stream(grid, origin_x=origin_x, origin_y=origin_y, palette_mode=True)
+    stream, stats = optimize_drawing_stream(
+        grid, origin_x=origin_x, origin_y=origin_y, palette_mode=True
+    )
 
     assert stats["chars_typed"] == 3
     assert stats["color_changes"] >= 1
@@ -257,6 +256,7 @@ def test_drawing_stream_simulation_with_wide_characters():
     assert (10, 11) not in canvas
     assert canvas[(11, 11)] == ("!", 12)
 
+
 def test_chafa_view_size_and_full_output_parsing():
     # Test parsing ANSI output with trailing cursor controls and blank lines
     raw_ansi = (
@@ -278,7 +278,9 @@ def test_hex_color_picker_stream():
     cell_2 = Cell("B", (0xFE, 0xDC, 0xBA))
     grid = [[cell_1, cell_2]]
 
-    stream, stats = optimize_drawing_stream(grid, origin_x=0, origin_y=0, palette_mode=False)
+    stream, stats = optimize_drawing_stream(
+        grid, origin_x=0, origin_y=0, palette_mode=False
+    )
 
     # Initial color defaults to PAINT_PALETTE[1] (255, 236, 96 = #FFEC60).
     # First cell (0x12, 0x34, 0x56):
@@ -292,10 +294,10 @@ def test_hex_color_picker_stream():
 
 def test_drawing_stream_simulation_with_direct_24bit_hex():
     # Simulate execution on a virtual artboard canvas using direct 24-bit hex color picking
-    c1 = Cell("こ", (18, 52, 86))   # width 2, #123456
-    c2 = Cell("あ", (254, 220, 186)) # width 2, #FEDCBA
+    c1 = Cell("こ", (18, 52, 86))  # width 2, #123456
+    c2 = Cell("あ", (254, 220, 186))  # width 2, #FEDCBA
     c3 = Cell(" ", None)
-    c4 = Cell("!", (42, 42, 42))    # width 1, #2A2A2A
+    c4 = Cell("!", (42, 42, 42))  # width 1, #2A2A2A
 
     grid = [
         [c1, c2],
@@ -303,7 +305,9 @@ def test_drawing_stream_simulation_with_direct_24bit_hex():
     ]
 
     origin_x, origin_y = 5, 5
-    stream, stats = optimize_drawing_stream(grid, origin_x=origin_x, origin_y=origin_y, palette_mode=False)
+    stream, stats = optimize_drawing_stream(
+        grid, origin_x=origin_x, origin_y=origin_y, palette_mode=False
+    )
 
     assert stats["chars_typed"] == 3
     assert stats["color_changes"] == 3
@@ -394,15 +398,19 @@ def test_drawing_stream_simulation_with_direct_24bit_hex():
     assert (5, 6) not in canvas
     assert canvas[(6, 6)] == ("!", (42, 42, 42))
 
+
 def test_production_safety_gate():
     import subprocess
+
     cmd = [
         sys.executable,
         "scripts/artboard_painter.py",
-        "--image", "test.ppm",
-        "--host", "late.sh",
+        "--image",
+        "test.ppm",
+        "--host",
+        "late.sh",
     ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    res = subprocess.run(cmd, check=False, capture_output=True, text=True)
     assert res.returncode == 1
     assert "SAFETY ERROR" in res.stderr
 
@@ -410,14 +418,17 @@ def test_production_safety_gate():
     cmd_danger = [
         sys.executable,
         "scripts/artboard_painter.py",
-        "--image", "late-web/static/og-image.png",
-        "--host", "late.sh",
+        "--image",
+        "late-web/static/og-image.png",
+        "--host",
+        "late.sh",
         "--danger-mode",
         "--dry-run",
     ]
-    res_danger = subprocess.run(cmd_danger, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    res_danger = subprocess.run(cmd_danger, check=False, capture_output=True, text=True)
     assert res_danger.returncode == 0
     assert "SAFETY ERROR" not in res_danger.stderr
+
 
 def test_overlay_mode_skips_occupied_cells():
     # 2x2 grid:
@@ -446,10 +457,14 @@ def test_overlay_mode_skips_occupied_cells():
     assert b"X" not in stream
     assert b"W" not in stream
 
+
 def test_extract_owner_from_tui_text():
     from scripts.artboard_painter import extract_owner_from_tui_text
+
     # Unpopulated cell: '?'
-    tui_unpopulated = "Mode       active\nCursor     10,10\nMouse      10,10\nOwner      ?\n"
+    tui_unpopulated = (
+        "Mode       active\nCursor     10,10\nMouse      10,10\nOwner      ?\n"
+    )
     assert extract_owner_from_tui_text(tui_unpopulated) is None
 
     # Populated cell with ANSI escapes
@@ -458,14 +473,15 @@ def test_extract_owner_from_tui_text():
 
     # Empty or missing
     assert extract_owner_from_tui_text("") is None
+
+
 def test_decoupled_core_logic_import():
     from scripts.artboard_painter import (
-        parse_origin,
-        render_image_to_grid,
-        prepare_drawing_stream,
-        draw_art,
         app,
+        parse_origin,
+        prepare_drawing_stream,
     )
+
     x, y = parse_origin("15,20")
     assert (x, y) == (15, 20)
 
@@ -473,7 +489,6 @@ def test_decoupled_core_logic_import():
         "late-web/static/og-image.png",
         origin_x=5,
         origin_y=5,
-        chafa_args="--symbols=block --size=20x10",
         palette_mode=True,
     )
     assert len(grid) > 0
@@ -481,17 +496,18 @@ def test_decoupled_core_logic_import():
     assert len(stream) > 0
     assert app is not None
 
+
 def test_scheduled_artboard_painter():
     from scripts.scheduled_artboard_painter import (
-        choose_next_image,
-        run_scheduler,
+        INTERVAL_SECONDS,
+        PAINT_CONFIG,
         POOL_A,
         POOL_B,
-        PAINT_CONFIG,
-        INTERVAL_SECONDS,
+        choose_next_image,
+        run_scheduler,
     )
 
-    assert INTERVAL_SECONDS == 90 * 60
+    assert INTERVAL_SECONDS == 30 * 60
     assert len(POOL_A) > 0 and len(POOL_B) > 0
 
     # Repetition prevention test

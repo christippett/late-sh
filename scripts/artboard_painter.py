@@ -5,6 +5,8 @@
 #     "asyncssh>=2.14.0",
 #     "typer>=0.9.0",
 #     "shellingham",
+#     "chafa.py>=1.2.0",
+#     "pillow>=10.0.0",
 # ]
 # ///
 """
@@ -13,18 +15,37 @@ artboard_painter.py - Automated / assisted drawing tool for late.sh communal art
 Takes an input image, renders via chafa, maps colors to late.sh's PAINT_PALETTE
 with contrast preservation, and generates optimized keystroke streams or connects via SSH.
 """
+
+import asyncio
 import json
+import logging
 import math
-import os
 import re
-import shlex
-import shutil
-import subprocess
 import sys
 import unicodedata
 import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated
 
+import chafa
 import typer
+from chafa import SymbolMap
+from chafa.loader import Loader
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LateHost:
+    host: str
+    port: int = 2222
+    username: str = "drawer"
+    identity_file: Path | None = None
+
+    def __str__(self):
+        return f"{self.username}@{self.host}:{self.port}"
+
 
 def char_display_width(ch: str) -> int:
     """Return display column width of a character on the terminal canvas (1 or 2)."""
@@ -276,144 +297,10 @@ def fetch_artboard_occupied_cells(host: str) -> set[tuple[int, int]]:
                         occupied.add((x + dx, y))
                 if occupied:
                     return occupied
-        except Exception:
+        except ValueError:
+            logger.warning(f"Failed to fetch occupied cells from {url}, trying next...")
             continue
     return set()
-
-
-def run_chafa(image_path: str, chafa_flags: list[str]) -> str:
-    """Execute chafa on image_path with provided flags, ensuring --fg-only and symbol format."""
-    if not shutil.which("chafa"):
-        raise RuntimeError(
-            "chafa binary not found in PATH. Install via `brew install chafa`."
-        )
-
-    flags = list(chafa_flags)
-    # Check if format flag was passed (-f or --format)
-    has_format = any(f == "-f" or f.startswith("--format") for f in flags)
-    if not has_format:
-        flags.append("--format=symbols")
-
-    if not any(f.startswith("--fg-only") for f in flags):
-        flags.append("--fg-only")
-
-    # Decouple from calling terminal dimensions: use full canvas dimensions
-    if not any(f.startswith("--view-size") for f in flags):
-        flags.append(f"--view-size={CANVAS_WIDTH}x{CANVAS_HEIGHT}")
-    if not any(f.startswith("--margin-bottom") for f in flags):
-        flags.append("--margin-bottom=0")
-    if not any(f.startswith("--margin-right") for f in flags):
-        flags.append("--margin-right=0")
-    if not any(f == "-s" or f.startswith("--size") for f in flags):
-        flags.append(f"--size={CANVAS_WIDTH}x{CANVAS_HEIGHT}")
-    cmd = ["chafa"] + flags + [image_path]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(
-            f"chafa execution failed (code {res.returncode}): {res.stderr.strip()}"
-        )
-    return res.stdout
-
-
-def map_colors_with_contrast(grid: list[list[Cell]]) -> None:
-    """
-    Contrast-preserving color mapping:
-    1. Collects unique colors and builds an adjacency graph between distinct adjacent colors.
-    2. Maps colors to PAINT_PALETTE indices (0-15) such that:
-       - Visual similarity to source color is high (low CIELAB delta).
-       - Adjacent distinct colors avoid collapsing to the same or indistinguishable palette colors.
-    """
-    height = len(grid)
-    if height == 0:
-        return
-    width = max(len(row) for row in grid)
-
-    # Gather unique non-empty colors
-    color_map: dict[tuple[int, int, int], int] = {}  # source_rgb -> palette_idx
-    unique_colors: list[tuple[int, int, int]] = []
-    color_counts: dict[tuple[int, int, int], int] = {}
-
-    for y in range(height):
-        for x in range(len(grid[y])):
-            cell = grid[y][x]
-            if cell.char != " " and cell.color is not None:
-                c = cell.color
-                color_counts[c] = color_counts.get(c, 0) + 1
-                if c not in color_map:
-                    color_map[c] = -1
-                    unique_colors.append(c)
-
-    if not unique_colors:
-        return
-
-    # Build adjacency graph between colors that share adjacent cells
-    adjacency: dict[tuple[int, int, int], set[tuple[int, int, int]]] = {
-        c: set() for c in unique_colors
-    }
-
-    for y in range(height):
-        row = grid[y]
-        for x in range(len(row)):
-            c1 = row[x].color
-            if c1 is None or row[x].char == " ":
-                continue
-            # Check neighbors: right and down
-            for dx, dy in ((1, 0), (0, 1)):
-                nx, ny = x + dx, y + dy
-                if ny < height and nx < len(grid[ny]):
-                    c2 = grid[ny][nx].color
-                    if c2 is not None and grid[ny][nx].char != " " and c1 != c2:
-                        adjacency[c1].add(c2)
-                        adjacency[c2].add(c1)
-
-    # Sort colors by frequency descending so prominent colors get primary placement
-    unique_colors.sort(key=lambda c: color_counts[c], reverse=True)
-
-    # Optimization / Assignment
-    # If number of unique colors <= 16, we can assign distinct palette indices
-    # Otherwise, we cluster or assign with contrast penalty
-    assigned: dict[tuple[int, int, int], int] = {}
-
-    for c in unique_colors:
-        c_lab = rgb_to_cielab(c)
-        neighbors = adjacency[c]
-        neighbor_pal_indices = {assigned[n] for n in neighbors if n in assigned}
-
-        best_idx = 1
-        best_score = float("inf")
-
-        for pal_idx in range(len(PAINT_PALETTE)):
-            pal_lab = PALETTE_LAB[pal_idx]
-            dist_to_src = delta_e_cielab(c_lab, pal_lab)
-
-            # Contrast penalty for adjacent colors
-            conflict_penalty = 0.0
-            if pal_idx in neighbor_pal_indices:
-                # Big penalty for identical color assignment to adjacent distinct region
-                conflict_penalty += 200.0
-            else:
-                for n_idx in neighbor_pal_indices:
-                    n_lab = PALETTE_LAB[n_idx]
-                    pal_dist = delta_e_cielab(pal_lab, n_lab)
-                    if pal_dist < 20.0:  # Perceptually too close
-                        conflict_penalty += (20.0 - pal_dist) * 5.0
-
-            # Favor index 1 if close to neutral
-            total_score = dist_to_src + conflict_penalty
-            if total_score < best_score:
-                best_score = total_score
-                best_idx = pal_idx
-
-        assigned[c] = best_idx
-
-    # Apply assigned palette indices back to the grid
-    for y in range(height):
-        for x in range(len(grid[y])):
-            cell = grid[y][x]
-            if cell.color is not None and cell.color in assigned:
-                cell.palette_idx = assigned[cell.color]
-            else:
-                cell.palette_idx = 1  # Default
 
 
 def generate_ansi_preview(grid: list[list[Cell]], palette_mode: bool = False) -> str:
@@ -456,7 +343,6 @@ def optimize_drawing_stream(
     origin_x: int = 0,
     origin_y: int = 0,
     initial_color: tuple[int, int, int] | None = None,
-    palette_mode: bool = False,
     occupied_cells: set[tuple[int, int]] | None = None,
 ) -> tuple[bytes, dict[str, int]]:
     """
@@ -485,19 +371,8 @@ def optimize_drawing_stream(
 
     curr_x = origin_x
     curr_y = origin_y
-    if palette_mode:
-        curr_palette_idx = 1
-        if initial_color is not None:
-            for idx, pal_rgb in enumerate(PAINT_PALETTE):
-                if pal_rgb == initial_color:
-                    curr_palette_idx = idx
-                    break
-        curr_rgb_color: tuple[int, int, int] | None = None
-    else:
-        curr_rgb_color = (
-            initial_color if initial_color is not None else PAINT_PALETTE[1]
-        )
-        curr_palette_idx = 1
+    curr_rgb_color = initial_color if initial_color is not None else PAINT_PALETTE[1]
+    curr_palette_idx = 1
 
     def move_to(target_x: int, target_y: int):
         nonlocal curr_x, curr_y
@@ -545,7 +420,7 @@ def optimize_drawing_stream(
         # Ctrl+K (0x0B) opens hex color picker
         # 6 hex digits typed into picker
         # Enter (\r) applies working color to active paint color
-        hex_str = "%02X%02X%02X" % rgb
+        hex_str = "{:02X}{:02X}{:02X}".format(*rgb)
         stream.extend(b"\x0b" + hex_str.encode("ascii") + b"\r")
         stats["color_changes"] += 1
         curr_rgb_color = rgb
@@ -577,62 +452,46 @@ def optimize_drawing_stream(
             run_chars = []
             run_visual_width = 0
 
-            if palette_mode:
-                target_pal = cell.palette_idx
-                while idx < len(row):
-                    c = row[idx]
-                    cw = char_display_width(c.char)
-                    ctx = origin_x + col
-                    c_occ = occupied_cells is not None and any(
-                        (ctx + dx, ty) in occupied_cells for dx in range(cw)
-                    )
-                    if c.char == " " or c_occ or c.palette_idx != target_pal:
-                        break
-                    run_chars.append(c.char)
-                    run_visual_width += cw
-                    col += cw
-                    idx += 1
-            else:
-                target_rgb = (
-                    cell.color
-                    if cell.color is not None
-                    else PAINT_PALETTE[cell.palette_idx]
+            target_rgb = (
+                cell.color
+                if cell.color is not None
+                else PAINT_PALETTE[cell.palette_idx]
+            )
+            while idx < len(row):
+                c = row[idx]
+                cw = char_display_width(c.char)
+                ctx = origin_x + col
+                c_occ = occupied_cells is not None and any(
+                    (ctx + dx, ty) in occupied_cells for dx in range(cw)
                 )
-                while idx < len(row):
-                    c = row[idx]
-                    cw = char_display_width(c.char)
-                    ctx = origin_x + col
-                    c_occ = occupied_cells is not None and any(
-                        (ctx + dx, ty) in occupied_cells for dx in range(cw)
-                    )
-                    c_rgb = (
-                        c.color if c.color is not None else PAINT_PALETTE[c.palette_idx]
-                    )
-                    if c.char == " " or c_occ or c_rgb != target_rgb:
-                        break
-                    run_chars.append(c.char)
-                    run_visual_width += cw
-                    col += cw
-                    idx += 1
+                c_rgb = c.color if c.color is not None else PAINT_PALETTE[c.palette_idx]
+                if c.char == " " or c_occ or c_rgb != target_rgb:
+                    break
+                run_chars.append(c.char)
+                run_visual_width += cw
+                col += cw
+                idx += 1
+            set_hex_color(target_rgb)
             tx = origin_x + start_col
             ty = origin_y + y
 
             if curr_x != tx or curr_y != ty:
                 move_to(tx, ty)
 
-            if palette_mode:
-                set_palette_color(target_pal)
-            else:
-                set_hex_color(target_rgb)
             # Emit bracketed paste for run: \x1b[200~<text>\x1b[201~
             run_text = "".join(run_chars)
             run_bytes = run_text.encode("utf-8")
             stream.extend(b"\x1b[200~" + run_bytes + b"\x1b[201~")
             stats["chars_typed"] += len(run_chars)
             curr_x += run_visual_width
+            # Simulate the server's clamp logic in paste_cursor_end:
+            # x: cursor.x.min(width.saturating_sub(1))
+            if curr_x >= CANVAS_WIDTH:
+                curr_x = CANVAS_WIDTH - 1
 
     stats["total_bytes"] = len(stream)
     return bytes(stream), stats
+
 
 def parse_origin(origin: str) -> tuple[int, int]:
     """Parse and validate comma-separated 'x,y' canvas coordinates."""
@@ -648,22 +507,52 @@ def parse_origin(origin: str) -> tuple[int, int]:
 
 
 def render_image_to_grid(
-    image_path: str,
-    chafa_args: str | list[str] = "--symbols=block+border --size=40x20",
-    palette_mode: bool = False,
-) -> list[list[Cell]]:
+    image_path: str, size: str | None = None, symbol_map: SymbolMap | None = None
+):
     """
-    Render an image file via chafa into an ANSI cell grid, mapping colors as requested.
+    Render an image file via chafa into an ANSI cell grid using chafa.py, mapping colors as requested.
     """
-    if isinstance(chafa_args, str):
-        chafa_flags = shlex.split(chafa_args)
-    else:
-        chafa_flags = list(chafa_args)
 
-    chafa_output = run_chafa(image_path, chafa_flags)
-    grid = parse_chafa_ansi(chafa_output)
-    if palette_mode:
-        map_colors_with_contrast(grid)
+    # Simple parse of expected flags we passed in main (this ignores complex manual flags,
+    # but we only ever pass size and symbols from the CLI anyway)
+    # The ladder rule: we don't need a full argparse, we just need to set the config up.
+    config = chafa.CanvasConfig()
+    # config.cell_width = 16
+    # config.cell_height = 30
+    config.width = CANVAS_WIDTH
+    config.height = CANVAS_HEIGHT
+    config.pixel_mode = chafa.PixelMode.CHAFA_PIXEL_MODE_SYMBOLS
+    config.canvas_mode = chafa.CanvasMode.CHAFA_CANVAS_MODE_TRUECOLOR
+    config.fg_only = True
+    if symbol_map is not None:
+        config.set_symbol_map(symbol_map)
+
+    # Override width/height if --size was passed
+    if size:
+        w, h = re.split(r"[,xX]", size)
+        config.width = int(w)
+        config.height = int(h)
+
+    image = Loader(image_path)
+    config.calc_canvas_geometry(image.width, image.height, 16 / 30)
+    canvas = chafa.Canvas(config)
+    canvas.draw_all_pixels(
+        image.pixel_type,
+        image.get_pixels(),
+        image.width,
+        image.height,
+        image.rowstride,
+    )
+
+    # Generating ANSI output and parsing it with parse_chafa_ansi
+    ansi_output = canvas.print().decode("utf-8")
+    ansi_output = ansi_output.replace("x1b", "\x1b")
+    grid = parse_chafa_ansi(ansi_output)
+
+    # Trim trailing all-space rows if any
+    while grid and all(c.char == " " for c in grid[-1]):
+        grid.pop()
+
     return grid
 
 
@@ -671,8 +560,6 @@ def prepare_drawing_stream(
     image_path: str,
     origin_x: int = 10,
     origin_y: int = 10,
-    chafa_args: str | list[str] = "--symbols=block+border --size=40x20",
-    palette_mode: bool = False,
     occupied_cells: set[tuple[int, int]] | None = None,
     initial_color: tuple[int, int, int] | None = None,
 ) -> tuple[list[list[Cell]], bytes, dict[str, int]]:
@@ -680,13 +567,12 @@ def prepare_drawing_stream(
     Process image and generate optimized drawing stream with stats.
     Returns (grid, drawing_stream, stats).
     """
-    grid = render_image_to_grid(image_path, chafa_args=chafa_args, palette_mode=palette_mode)
+    grid = render_image_to_grid(image_path)
     drawing_stream, stats = optimize_drawing_stream(
         grid,
         origin_x=origin_x,
         origin_y=origin_y,
         initial_color=initial_color,
-        palette_mode=palette_mode,
         occupied_cells=occupied_cells,
     )
     return grid, drawing_stream, stats
@@ -696,16 +582,11 @@ async def execute_ssh_drawing(
     grid: list[list[Cell]],
     origin_x: int,
     origin_y: int,
-    host: str = "127.0.0.1",
-    port: int = 2222,
-    username: str = "drawer",
-    identity: str | None = None,
-    palette_mode: bool = False,
+    remote: LateHost,
     overlay: bool = False,
     occupied_cells: set[tuple[int, int]] | None = None,
 ) -> None:
     """Connect to late.sh via SSH and stream the drawing commands."""
-    import asyncio
 
     try:
         import asyncssh
@@ -714,35 +595,32 @@ async def execute_ssh_drawing(
         sys.exit(1)
 
     height = len(grid)
-    print(f"[*] Connecting to {username}@{host}:{port}...")
+    print(f"[*] Connecting to {remote}...")
     client_keys = None
-    agent_path = ()  # Default: use environment SSH_AUTH_SOCK
 
-    candidate_key = identity or os.path.expanduser("~/.ssh/id_late_sh_ed25519")
-    expanded_key = os.path.expanduser(candidate_key)
-    if os.path.exists(expanded_key):
-        try:
-            client_keys = [asyncssh.read_private_key(expanded_key)]
-            agent_path = None
-        except Exception:
-            if identity:
-                raise
+    if remote.identity_file and remote.identity_file.exists(follow_symlinks=True):
+        client_keys = [asyncssh.read_private_key(remote.identity_file)]
+
     conn = await asyncssh.connect(
-        host,
-        port=port,
-        username=username,
+        remote.host,
+        port=remote.port,
+        username=remote.username,
         client_keys=client_keys,
-        agent_path=agent_path,
+        agent_path=None,
         known_hosts=None,
         encoding=None,
     )
     proc = await conn.create_process(
         term_type="xterm-256color",
-        term_size=(100, 30),
+        # The artboard canvas is 384x192. A small terminal forces the artboard
+        # viewport (~cols-26 x rows-2) to scroll constantly as the cursor moves,
+        # and every scroll re-emits most of the viewport as SSH output. That
+        # output backlog is what exceeds the server's 32MB budget and drops
+        # input (the row-misalignment bug). Size the terminal to the server's
+        # 500x200 clamp so the viewport covers the whole canvas and never scrolls.
+        term_size=(500, 200),
         encoding=None,
     )
-    print("[*] SSH connection established.")
-
     raw_buffer = bytearray()
 
     async def reader():
@@ -751,32 +629,36 @@ async def execute_ssh_drawing(
                 chunk = await proc.stdout.read(4096)
                 if not chunk:
                     break
-                raw_buffer.extend(chunk)
+                # Prevent infinite memory growth while keeping enough history for sync
+                if len(raw_buffer) < 100_000:
+                    await asyncio.sleep(0.05)
+                    raw_buffer.extend(chunk)
+                else:
+                    del raw_buffer[:-10_000]
+                    raw_buffer.extend(chunk)
+
         except Exception:
             pass
 
     reader_task = asyncio.create_task(reader())
 
-    # Wait for splash screen to initialize
-    await asyncio.sleep(2.0)
-
+    # Wait briefly for splash screen to initialize
+    await asyncio.sleep(0.5)
     # Dismiss splash screen with Esc
     print("[*] Dismissing splash screen (Esc)...")
     proc.stdin.write(b"\x1b")
     await proc.stdin.drain()
-    await asyncio.sleep(1.0)
-
+    await asyncio.sleep(0.2)
     # Navigate to Screen::Artboard (Tab 4)
     print("[*] Navigating to Screen::Artboard (Tab 4)...")
     proc.stdin.write(b"4")
     await proc.stdin.drain()
-    await asyncio.sleep(1.5)
-
+    await asyncio.sleep(0.3)
     # Enter interactive edit mode ('i')
     print("[*] Entering interactive edit mode ('i')...")
     proc.stdin.write(b"i")
     await proc.stdin.drain()
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(0.2)
 
     def detect_active_color() -> tuple[int, int, int]:
         text = raw_buffer.decode("utf-8", errors="replace")
@@ -840,18 +722,18 @@ async def execute_ssh_drawing(
         print(f"[*] TUI probe detected {len(tui_occupied)} occupied cells.")
         final_occupied_cells = tui_occupied
 
-    actual_stream, actual_stats = optimize_drawing_stream(
+    actual_stream, _actual_stats = optimize_drawing_stream(
         grid,
         origin_x=origin_x,
         origin_y=origin_y,
         initial_color=active_color,
-        palette_mode=palette_mode,
         occupied_cells=final_occupied_cells,
     )
 
     print(
         f"[*] Resetting cursor to (0, 0) and navigating to ({origin_x}, {origin_y})..."
     )
+
     init_nav = (
         (b"\x1b[A" * 200)
         + (b"\x1b[D" * 400)
@@ -859,8 +741,8 @@ async def execute_ssh_drawing(
         + (b"\x1b[C" * origin_x)
     )
     proc.stdin.write(init_nav)
-    await asyncio.sleep(1.0)
-
+    await proc.stdin.drain()
+    await asyncio.sleep(0.1)
     print(f"[*] Streaming {len(actual_stream)} bytes of drawing operations...")
     tokens: list[bytes] = []
     idx_stream = 0
@@ -898,14 +780,14 @@ async def execute_ssh_drawing(
         if len(current_chunk) + len(tok) > 1024:
             proc.stdin.write(bytes(current_chunk))
             await proc.stdin.drain()
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.005)
             current_chunk = bytearray()
         current_chunk.extend(tok)
     if current_chunk:
         proc.stdin.write(bytes(current_chunk))
         await proc.stdin.drain()
-        await asyncio.sleep(0.02)
-    await asyncio.sleep(0.5)
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.2)
 
     print("[*] Drawing finished! Exiting edit mode (Esc)...")
     proc.stdin.write(b"\x1b")
@@ -919,44 +801,27 @@ async def execute_ssh_drawing(
 
 def draw_art(
     image: str,
-    chafa_args: str = "--symbols=block+border --size=40x20",
+    remote: LateHost,
     origin: str = "10,10",
     dry_run: bool = False,
+    symbol_map: SymbolMap | None = None,
+    size: str | None = None,
     preview: bool = False,
-    palette_mode: bool = False,
     direct_color: bool = True,
-    danger_mode: bool = False,
     overlay: bool = False,
+    debug: bool = False,
     output_bytes: str | None = None,
-    host: str = "127.0.0.1",
-    port: int = 2222,
-    username: str = "drawer",
-    identity: str | None = None,
 ) -> None:
     """Core drawing workflow decoupled from CLI presentation."""
-    # STRICT PROD SAFETY RULE:
-    # Reject connections to live production late.sh unless explicitly bypassed with --danger-mode
-    if not dry_run and not danger_mode:
-        lowered_host = host.lower()
-        if "late.sh" in lowered_host or lowered_host == "159.203.111.45":
-            sys.stderr.write(
-                "\n[SAFETY ERROR] Direct execution against production late.sh is strictly forbidden!\n"
-                "Only local / mock test instances are permitted (pass --danger-mode to override).\n"
-            )
-            sys.exit(1)
 
     try:
         origin_x, origin_y = parse_origin(origin)
     except ValueError as e:
-        sys.stderr.write(f"Error: {e}\n")
-        sys.exit(1)
+        print(f"Error: {e}\n")
+        raise typer.Exit(code=1)
 
-    parsed_chafa_flags = shlex.split(chafa_args)
-    print(f"[*] Running chafa on {image} with flags: {parsed_chafa_flags}...")
-    chafa_output = run_chafa(image, parsed_chafa_flags)
-
-    print("[*] Parsing ANSI grid...")
-    grid = parse_chafa_ansi(chafa_output)
+    print("[*] Rendering image to grid...")
+    grid = render_image_to_grid(image, size, symbol_map)
     height = len(grid)
     width = max(len(row) for row in grid) if height > 0 else 0
     print(f"[*] Parsed grid dimensions: {width} columns x {height} rows.")
@@ -969,27 +834,27 @@ def draw_art(
     occupied_cells: set[tuple[int, int]] | None = None
     if overlay:
         print(
-            f"[*] Overlay mode active: fetching existing artboard snapshot from {host}..."
+            f"[*] Overlay mode active: fetching existing artboard snapshot from {remote.host}..."
         )
-        occupied_cells = fetch_artboard_occupied_cells(host)
+        occupied_cells = fetch_artboard_occupied_cells(remote.host)
         print(
             f"[*] Found {len(occupied_cells)} occupied cells to preserve on artboard."
         )
 
-    if palette_mode:
-        print(
-            "[*] Performing contrast-preserving color quantization to 16-color PAINT_PALETTE..."
-        )
-        map_colors_with_contrast(grid)
-    else:
-        print(
-            "[*] Using direct 24-bit RGB colors with Artboard hex color picker (Ctrl+K)..."
-        )
+    if debug:
+        for y in range(height):
+            row_str = f"{y:03d}"
+            for i, ch in enumerate(row_str):
+                if i < len(grid[y]):
+                    grid[y][i].char = ch
+                    grid[y][i].color = (255, 255, 255)
+                    if hasattr(grid[y][i], "palette_idx"):
+                        grid[y][i].palette_idx = 15  # Off-White
 
-    if preview or dry_run:
-        title = "16-color PAINT_PALETTE" if palette_mode else "24-bit RGB Direct Hex"
+    if dry_run:
+        title = "24-bit RGB Direct Hex"
         print(f"\n--- Mapped Artwork Preview ({title}) ---")
-        print(generate_ansi_preview(grid, palette_mode=palette_mode))
+        print(generate_ansi_preview(grid))
         print("------------------------------------------------------\n")
 
     print("[*] Optimizing keystroke / byte drawing stream...")
@@ -997,7 +862,6 @@ def draw_art(
         grid,
         origin_x=origin_x,
         origin_y=origin_y,
-        palette_mode=palette_mode,
         occupied_cells=occupied_cells,
     )
 
@@ -1016,18 +880,12 @@ def draw_art(
         print("[*] Dry run complete. No SSH connection attempted.")
         return
 
-    import asyncio
-
     asyncio.run(
         execute_ssh_drawing(
             grid=grid,
             origin_x=origin_x,
             origin_y=origin_y,
-            host=host,
-            port=port,
-            username=username,
-            identity=identity,
-            palette_mode=palette_mode,
+            remote=remote,
             overlay=overlay,
             occupied_cells=occupied_cells,
         )
@@ -1043,89 +901,95 @@ app = typer.Typer(
 
 @app.command()
 def main(
-    image: str = typer.Option(..., "--image", help="Path to input image file."),
-    chafa_args: str = typer.Option(
-        "--symbols=block+border --size=40x20",
-        "--chafa-args",
-        help="Extra flags to pass to chafa (e.g. '--symbols=ascii --size=60x30').",
-    ),
+    image: str = typer.Argument(..., help="Path to input image file."),
     origin: str = typer.Option(
         "10,10",
-        "--origin",
         help="Target (x,y) starting coordinates on the 384x192 canvas (e.g. '10,10').",
+    ),
+    size: str | None = typer.Option(
+        None, help="Set maximum image dimensions in columns and rows."
+    ),
+    symbols: str = typer.Option(
+        "block,border",
+        help="Specify character symbols to employ in final output.",
     ),
     dry_run: bool = typer.Option(
         False,
-        "--dry-run",
         help="Perform offline preview and keystroke generation without connecting to SSH.",
     ),
     preview: bool = typer.Option(
         False,
-        "--preview",
         help="Output the ANSI color-mapped preview to terminal stdout.",
     ),
     palette_mode: bool = typer.Option(
         False,
-        "--palette-mode",
         help="Use legacy 16-color PAINT_PALETTE quantization instead of 24-bit arbitrary hex colors.",
     ),
     direct_color: bool = typer.Option(
         True,
-        "--direct-color/--no-direct-color",
         help="Use 24-bit arbitrary hex colors via Ctrl+K picker (default: True).",
     ),
     danger_mode: bool = typer.Option(
         False,
-        "--danger-mode",
         help="Bypass production safety gate and allow running against live late.sh instance.",
     ),
     overlay: bool = typer.Option(
         False,
-        "--overlay",
         help="Only draw into blank/unused cells without overwriting existing populated cells.",
     ),
     output_bytes: str | None = typer.Option(
         None,
-        "--output-bytes",
         help="Optional file path to dump the raw byte sequence stream.",
+    ),
+    debug: bool = typer.Option(
+        False,
+        help="Render row numbers (e.g. 000, 001) in white at columns 0-2 for alignment tracking.",
     ),
     host: str = typer.Option(
         "127.0.0.1",
-        "--host",
         help="SSH host of late.sh instance (test server only!).",
     ),
     port: int = typer.Option(
         2222,
-        "--port",
         help="SSH port (default: 2222).",
     ),
     username: str = typer.Option(
         "drawer",
-        "--username",
         help="SSH username for drawing session.",
     ),
-    identity: str | None = typer.Option(
-        None,
-        "--identity",
-        help="Path to SSH private key file (e.g. ~/.ssh/id_late_sh_ed25519).",
-    ),
+    identity: Annotated[
+        Path | None,
+        typer.Option(envvar="LATE_SSH_IDENTITY", help="Path to SSH private key file."),
+    ] = None,
 ) -> None:
     """Draw artwork onto late.sh artboard."""
+
+    # STRICT PROD SAFETY RULE:
+    # Reject connections to live production late.sh unless explicitly bypassed with --danger-mode
+    remote = LateHost(host=host, port=port, username=username, identity_file=identity)
+    if not dry_run and not danger_mode:
+        lowered_host = remote.host.lower()
+        if "late.sh" in lowered_host or lowered_host == "159.203.111.45":
+            print(
+                "[SAFETY ERROR] Direct execution against production late.sh is strictly forbidden!"
+                "Only local / mock test instances are permitted (pass --danger-mode to override)."
+            )
+            raise typer.Exit(code=1)
+
+    symbol_map = chafa.SymbolMap()
+    symbol_map.apply_selectors(symbols)
     draw_art(
         image=image,
-        chafa_args=chafa_args,
+        remote=remote,
         origin=origin,
         dry_run=dry_run,
+        size=size,
+        symbol_map=symbol_map,
         preview=preview,
-        palette_mode=palette_mode,
         direct_color=direct_color,
-        danger_mode=danger_mode,
         overlay=overlay,
+        debug=debug,
         output_bytes=output_bytes,
-        host=host,
-        port=port,
-        username=username,
-        identity=identity,
     )
 
 
