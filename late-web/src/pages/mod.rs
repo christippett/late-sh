@@ -9,12 +9,14 @@ pub(crate) mod live;
 pub(crate) mod profiles;
 pub(crate) mod shared;
 pub(crate) mod stream;
+pub(crate) mod activity_rss;
 
 #[cfg(test)]
 mod stream_test;
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
+        .merge(activity_rss::router())
         .merge(home::router())
         .merge(listen::router())
         .merge(live::router())
