@@ -1,6 +1,7 @@
 use crate::AppState;
 use axum::Router;
 
+pub(crate) mod activity_rss;
 pub(crate) mod gallery;
 pub(crate) mod home;
 pub(crate) mod legal;
@@ -9,7 +10,6 @@ pub(crate) mod live;
 pub(crate) mod profiles;
 pub(crate) mod shared;
 pub(crate) mod stream;
-pub(crate) mod activity_rss;
 
 #[cfg(test)]
 mod stream_test;
