@@ -83,9 +83,14 @@ pub enum Panel {
     /// a dedicated binding - every letter and the sensible symbols are
     /// already taken).
     Board,
+    /// The room rail (the wide layout's side panel) drawn full screen.
+    /// Toggled with `=`, or a tap on the narrow layout's `= more` chip: the
+    /// phone layout has no rail, and this is how it gets the rail's whole
+    /// story (exits, wildlife, pet, standing keys) without a second layout.
+    Rail,
 }
 
-/// A combat action a player can trigger by clicking its on-screen chip, mapping
+/// An action a player can trigger by clicking its on-screen chip, mapping
 /// one-to-one to a key: [`ClickAction::Attack`] is space/x, [`ClickAction::Quaff`]
 /// is Q, [`ClickAction::Flee`] is z, and [`ClickAction::Ability`] is the digit of
 /// that action-bar slot. The mouse handler resolves a click to one of these and
@@ -94,6 +99,8 @@ pub enum Panel {
 pub enum ClickAction {
     Attack,
     Quaff,
+    /// Coat the weapon with the best-matched coat in the bag.
+    Coat,
     Flee,
     Ability(u8),
     /// Lock onto the foe with this spawn id (a click on its roster row).
@@ -101,6 +108,9 @@ pub enum ClickAction {
     /// Lock onto a hostile adventurer (a click on their roster row in a
     /// `pvp` room's "Adventurers here" list).
     AttackPlayer(Uuid),
+    /// Open or close the full-screen room rail (`=`), from the narrow
+    /// layout's `= more` chip.
+    ToggleRail,
 }
 
 /// The first recorded chip whose rect contains cell `(x, y)`. Pure so the click
@@ -166,6 +176,10 @@ pub struct State {
     join_requested_at: Instant,
     reset_version: u64,
     reset_elsewhere: bool,
+    /// In the Abilities panel: the 1-based slot armed for swapping (`x`), if
+    /// the player pressed `x` once and is now picking the target row. Local to
+    /// this session only; the persisted result is the reordered ability list.
+    ability_swap_source: Option<u8>,
     /// The chat line being composed, if the player is typing (Some = compose
     /// mode captures keys). Chat is world-local via the service's `say`, so it
     /// never leaks into late.sh's global feed.
@@ -234,6 +248,7 @@ impl State {
             join_requested_at,
             reset_version,
             reset_elsewhere: false,
+            ability_swap_source: None,
             chat_buffer: None,
             leave_confirm_until: None,
             map_camera: MapCamera::default(),
@@ -316,12 +331,19 @@ impl State {
         self.cursor
     }
 
+    /// The 1-based ability slot currently armed for swapping in the Abilities
+    /// panel, if any.
+    pub fn ability_swap_source(&self) -> Option<u8> {
+        self.ability_swap_source
+    }
+
     pub fn set_panel(&mut self, panel: Panel) {
         if self.panel != panel {
             self.panel = panel;
             self.cursor = 0;
             self.list_scroll.set(0);
             self.map_camera.recenter();
+            self.ability_swap_source = None;
         }
     }
 
@@ -334,6 +356,7 @@ impl State {
         self.cursor = 0;
         self.list_scroll.set(0);
         self.map_camera.recenter();
+        self.ability_swap_source = None;
     }
 
     /// True when the graphical overhead world map is the active panel.
@@ -877,6 +900,45 @@ impl State {
         }
     }
 
+    /// `x` inside the Abilities panel: the first press arms the highlighted row
+    /// as the swap source, the second press (on another row) swaps the two. A
+    /// second press on the same row cancels the swap.
+    pub fn ability_swap_selection(&mut self) {
+        if self.panel != Panel::Abilities {
+            return;
+        }
+        if !self.ensure_player_present() {
+            return;
+        }
+        let slot = match self.view().abilities.get(self.cursor) {
+            Some(a) => a.slot,
+            None => return,
+        };
+        match self.ability_swap_source {
+            None => self.ability_swap_source = Some(slot),
+            Some(source) => {
+                self.ability_swap_source = None;
+                if source != slot {
+                    self.svc.swap_ability_task(self.user_id, source, slot);
+                }
+            }
+        }
+    }
+
+    /// `r` while a swap source is armed in the Abilities panel: drop the saved
+    /// custom order and return the bar to its natural unlock order. Only offered
+    /// in swap mode so `r` keeps its recall meaning everywhere else.
+    pub fn ability_reset_order(&mut self) {
+        if self.panel != Panel::Abilities || self.ability_swap_source.is_none() {
+            return;
+        }
+        if !self.ensure_player_present() {
+            return;
+        }
+        self.ability_swap_source = None;
+        self.svc.reset_ability_order_task(self.user_id);
+    }
+
     pub fn flee(&mut self) {
         if self.ensure_player_present() {
             self.svc.flee_task(self.user_id);
@@ -888,6 +950,15 @@ impl State {
     pub fn quaff(&mut self) {
         if self.ensure_player_present() {
             self.svc.quaff_task(self.user_id);
+        }
+    }
+
+    /// Coat the weapon without leaving the combat view, picking the coat the
+    /// foe in front of you likes least. The inventory panel still works; this
+    /// is so a coat doesn't cost a panel and a scroll every forty strikes.
+    pub fn coat(&mut self) {
+        if self.ensure_player_present() {
+            self.svc.coat_task(self.user_id);
         }
     }
 
@@ -916,10 +987,12 @@ impl State {
         match action {
             ClickAction::Attack => self.attack(),
             ClickAction::Quaff => self.quaff(),
+            ClickAction::Coat => self.coat(),
             ClickAction::Flee => self.flee(),
             ClickAction::Ability(slot) => self.use_ability(slot),
             ClickAction::AttackMob(mob_id) => self.attack_mob(mob_id),
             ClickAction::AttackPlayer(target_id) => self.attack_player(target_id),
+            ClickAction::ToggleRail => self.toggle_panel(Panel::Rail),
         }
         true
     }

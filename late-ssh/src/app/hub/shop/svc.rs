@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::poll_fn,
-    sync::{Arc, Mutex},
+	sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -14,7 +14,7 @@ use late_core::{
         aquarium_shield::AquariumShield,
         bonsai_decay_protection::BonsaiDecayProtection,
         chat_room::ChatRoom,
-        chips::{CHIP_USER_CHANGED_CHANNEL, UserChips, listen_for_chip_changes},
+        chips::UserChips,
         drinks::{UserDrinks, hangover_cure_price, hangover_cure_seed},
         marketplace::{
             AQUARIUM_CONSUMABLE_ITEM_KIND, AQUARIUM_FISH_ITEM_KIND, AQUARIUM_MAX_FISH,
@@ -22,12 +22,11 @@ use late_core::{
             BONSAI_CONSUMABLE_ITEM_KIND, BONSAI_DECAY_SHIELD_SKU, CHAT_BADGE_SLOT,
             CHAT_CONSUMABLE_ITEM_KIND, CHAT_FLAG_SLOT, COMPANION_CONSUMABLE_ITEM_KIND,
             HANGOVER_CURE_EFFECT_KIND, MarketplaceItem, PET_COMPANION_SKU, PurchaseResult,
-            PurchaseStatus, PurchaseWithEffectResult, SHOP_CATALOG_CHANGED_CHANNEL,
-            SHOP_USER_CHANGED_CHANNEL, TankActiveStatus, TankStockKind, ULTIMATE_SPELL_KIND,
-            USERNAME_EFFECT_ITEM_KIND, UserPurchase, adjust_aquarium_active_by_sku, is_sprout_row,
-            is_welcome_fish, listen_for_shop_changes, purchase_item_by_sku_with_chat_effect,
-            purchase_item_by_sku_with_custom_title, purchase_item_by_sku_with_username_effect,
-            rental_duration_secs,
+			PurchaseStatus, PurchaseWithEffectResult, TankActiveStatus, TankStockKind,
+			ULTIMATE_SPELL_KIND, USERNAME_EFFECT_ITEM_KIND, UserPurchase,
+			adjust_aquarium_active_by_sku, is_sprout_row, is_welcome_fish,
+			purchase_item_by_sku_with_chat_effect, purchase_item_by_sku_with_custom_title,
+			purchase_item_by_sku_with_username_effect, rental_duration_secs,
         },
         milestone::{MILESTONE_BADGE_ITEM_KIND, MilestoneBadge},
         rental::{
@@ -39,9 +38,11 @@ use late_core::{
         username_effect::{USERNAME_EFFECT_KIND, UsernameEffect},
     },
 };
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_postgres::{AsyncMessage, NoTls};
 use uuid::Uuid;
+
+use crate::pg_listener::{Channel, Refresh, Signal, read_until_ok};
 
 use super::entitlements::ShopEntitlements;
 use crate::app::ai::screen::{TitleScreen, screen_custom_title};
@@ -1271,90 +1272,68 @@ impl ShopService {
         self.ai_service.as_ref().is_some_and(AiService::is_enabled)
     }
 
-    pub fn start_listener_task(&self, db_config: DbConfig) -> tokio::task::JoinHandle<()> {
+    /// What the notify worker subscribes to.
+    pub const CHANNELS: &'static [Channel] = &[
+        Channel::ShopUserChanged,
+        Channel::ChipUserChanged,
+        Channel::ShopCatalogChanged,
+    ];
+
+    /// Keep this replica's flair and open shop panels in step with
+    /// `shop_user_changed`, `chip_user_changed`, and `shop_catalog_changed`.
+    /// A resync reconciles the whole flair directory, and so does any
+    /// failed signal, retrying until it lands: the update is recovered by
+    /// the full read instead of dropped.
+    pub fn start_notify_worker(
+        &self,
+        mut signals: mpsc::UnboundedReceiver<Signal>,
+    ) -> tokio::task::JoinHandle<()> {
         let svc = self.clone();
         tokio::spawn(async move {
-            loop {
-                if let Err(error) = svc.listen_once(&db_config).await {
-                    tracing::warn!(error = ?error, "shop postgres listener stopped");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
+            while let Some(signal) = signals.recv().await {
+                let Err(error) = svc.apply_signal(signal).await else {
+                    continue;
+                };
+                tracing::warn!(error = ?error, "shop notify failed, reconciling flair directory");
+                read_until_ok(Refresh::ShopFlairDirectory, || {
+                    svc.reconcile_flair_directory()
+                })
+                .await;
             }
         })
     }
 
-    async fn listen_once(&self, db_config: &DbConfig) -> Result<()> {
-        let mut config = tokio_postgres::Config::new();
-        config.host(&db_config.host);
-        config.port(db_config.port);
-        config.user(&db_config.user);
-        config.password(&db_config.password);
-        config.dbname(&db_config.dbname);
-
-        let (client, mut connection) = config.connect(NoTls).await?;
-        let listen = async {
-            listen_for_shop_changes(&client).await?;
-            listen_for_chip_changes(&client).await
-        };
-        tokio::pin!(listen);
-        loop {
-            tokio::select! {
-                result = &mut listen => {
-                    result?;
-                    break;
-                }
-                message = poll_fn(|cx| connection.poll_message(cx)) => {
-                    let Some(message) = message else {
-                        return Ok(());
-                    };
-                    self.handle_async_message(message?).await?;
+    async fn apply_signal(&self, signal: Signal) -> Result<()> {
+        match signal {
+            Signal::Resync => self.reconcile_flair_directory().await?,
+            Signal::Notify {
+                channel: Channel::ShopUserChanged,
+                payload,
+            } => {
+                if let Ok(user_id) = payload.parse::<Uuid>() {
+                    // Flair refreshes unconditionally: an effect is visible
+                    // to every session, not only shop viewers. Chip notifies
+                    // stay out of this path on purpose; they fire far too
+                    // often for a per-notify query.
+                    self.refresh_user_flair(user_id).await?;
+                    self.refresh_user_if_active(user_id).await?;
                 }
             }
-        }
-
-        // LISTEN is registered; notifications now buffer on the connection,
-        // so a full snapshot here cannot race a concurrent purchase. On error
-        // the caller reconnects and reconciles again.
-        self.reconcile_flair_directory().await?;
-
-        loop {
-            let Some(message) = poll_fn(|cx| connection.poll_message(cx)).await else {
-                return Ok(());
-            };
-
-            self.handle_async_message(message?).await?;
-        }
-    }
-
-    async fn handle_async_message(&self, message: AsyncMessage) -> Result<()> {
-        match message {
-            AsyncMessage::Notification(notification) => match notification.channel() {
-                SHOP_USER_CHANGED_CHANNEL => {
-                    if let Ok(user_id) = notification.payload().parse::<Uuid>() {
-                        // Flair refreshes unconditionally: an effect is
-                        // visible to every session, not only shop viewers.
-                        // Chip notifies stay out of this path on purpose;
-                        // they fire far too often for a per-notify query.
-                        // Errors propagate so the listener reconnects and
-                        // reconciles instead of dropping the update.
-                        self.refresh_user_flair(user_id).await?;
-                        self.refresh_user_if_active(user_id).await?;
-                    }
+            Signal::Notify {
+                channel: Channel::ChipUserChanged,
+                payload,
+            } => {
+                if let Ok(user_id) = payload.parse::<Uuid>() {
+                    self.refresh_user_if_active(user_id).await?;
                 }
-                CHIP_USER_CHANGED_CHANNEL => {
-                    if let Ok(user_id) = notification.payload().parse::<Uuid>() {
-                        self.refresh_user_if_active(user_id).await?;
-                    }
-                }
-                SHOP_CATALOG_CHANGED_CHANNEL => {
-                    self.refresh_catalog_for_active_users().await?;
-                }
-                _ => {}
-            },
-            AsyncMessage::Notice(notice) => {
-                tracing::debug!(notice = ?notice, "postgres shop listener notice");
             }
-            _ => {}
+            Signal::Notify {
+                channel: Channel::ShopCatalogChanged,
+                ..
+            } => self.refresh_catalog_for_active_users().await?,
+            Signal::Notify { channel, .. } => {
+                unreachable!("shop subscribed only to shop and chip channels, got {channel:?}")
+            }
         }
         Ok(())
     }

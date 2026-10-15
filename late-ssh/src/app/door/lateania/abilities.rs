@@ -7,6 +7,8 @@
 // needs only one resolution path - the highest-leverage design choice in the
 // engine.
 
+use std::collections::HashSet;
+
 use super::classes::{Class, Resource};
 use super::damage::DamageType;
 
@@ -68,6 +70,39 @@ pub struct Ability {
     pub magnitude: i32,
     /// Ticks an over-time or buff effect persists (0 for instant effects).
     pub duration: u8,
+}
+
+impl Ability {
+    /// The school this ability actually lands in, or None where it lands in
+    /// none. `damage_type` is a plain field on every row of the roster, so a
+    /// ward or a heal carries one too, but only these four effects reach
+    /// `svc::damage_target` - the rest never consult it. Showing an inert
+    /// school would read as a tactical fact and be a lie, so the two are
+    /// separated here rather than at each call site.
+    pub fn school(&self) -> Option<DamageType> {
+        match self.effect {
+            AbilityEffect::Strike
+            | AbilityEffect::DamageOverTime
+            | AbilityEffect::Stun
+            | AbilityEffect::Finisher => Some(self.damage_type),
+            AbilityEffect::Heal
+            | AbilityEffect::HealOverTime
+            | AbilityEffect::Empower
+            | AbilityEffect::Ward => None,
+        }
+    }
+
+    /// What the ability does, as every ability list says it: the school in
+    /// front of the effect ("fire damage over time"), or the bare effect
+    /// where no school applies ("shield"). Mobs halve one school and take
+    /// +50% from another, and the battle panel already names a foe's, so the
+    /// rows that choose a spell have to carry the other half of that matchup.
+    pub fn effect_label(&self) -> String {
+        match self.school() {
+            Some(school) => format!("{} {}", school.label(), self.effect.label()),
+            None => self.effect.label().to_string(),
+        }
+    }
 }
 
 /// The full ability roster. Ordered by class, then unlock level.
@@ -5186,6 +5221,32 @@ pub fn unlocked_for(class: Class, level: i32) -> Vec<&'static Ability> {
         .filter(|a| a.class == class && a.level_req <= level)
         .collect();
     out.sort_by_key(|a| a.level_req);
+    out
+}
+
+/// The unlocked roster in the player's saved action-bar order.
+///
+/// Abilities whose ids appear in `order` come first, in exactly that order;
+/// then any unlocked ability the order does not mention is appended in its
+/// natural unlock order. Unknown ids in `order` are dropped, so a save from
+/// before an ability was renamed/removed (or from a different class) still
+/// resolves cleanly. An empty `order` is the natural roster.
+pub fn ordered_for<'a>(known: Vec<&'a Ability>, order: &[u32]) -> Vec<&'a Ability> {
+    let mut out: Vec<&'a Ability> = Vec::with_capacity(known.len());
+    let mut placed: HashSet<u32> = HashSet::with_capacity(known.len());
+    for id in order {
+        if !placed.insert(*id) {
+            continue;
+        }
+        if let Some(a) = known.iter().find(|a| a.id == *id) {
+            out.push(*a);
+        }
+    }
+    for a in known {
+        if placed.insert(a.id) {
+            out.push(a);
+        }
+    }
     out
 }
 

@@ -22,7 +22,7 @@ ENV_TEMPLATE = .env.dev
 #   make start-instance2          # bring up the stack (foreground)
 #   make .env-instance2           # just (re)generate .env without starting
 
-CHECK_PACKAGES = -p late-cli -p late-core -p late-ssh -p late-web -p late-webview
+CHECK_PACKAGES = -p late-cli -p late-core -p late-ssh -p late-web -p late-webview -p late-zork
 # `env -u MAKEFLAGS -u MFLAGS`: make exports command-line variables (the
 # `ARGS="..."` in `make test-llm ARGS=...`) through MAKEFLAGS, cargo forwards
 # it to build scripts, and tikv-jemalloc-sys's nested make then parses ARGS'
@@ -59,6 +59,23 @@ keys:
 seed-leaderboard:
 	scripts/seed_leaderboard_test_data.sh
 
+# Load a long fake edition for newspaper scrolling checks in the local TUI.
+PAPER_PARAGRAPHS ?= 100
+.PHONY: seed-paper
+seed-paper:
+	scripts/seed_paper_test_data.sh "$(PAPER_PARAGRAPHS)"
+
+# IRC history fixtures for an existing local account.
+.PHONY: seed-irc-history
+seed-irc-history:
+	scripts/seed_irc_history.sh "$(USERNAME)"
+
+# Artboard gallery fixtures: accounts, pieces, applause, and the on-connect splash.
+ART_SPLASH_PIECE ?= 1
+.PHONY: seed-artboard
+seed-artboard:
+	scripts/seed_artboard_test_data.sh "$(ART_SPLASH_PIECE)"
+
 .PHONY: check-db
 check-db:
 	$(CHECK_DB_START)
@@ -87,6 +104,29 @@ test-llm: .env
 .PHONY: arena
 arena:
 	$(MAKE) test-llm ARGS="-p late-ssh --run-ignored all -j1 -E 'test(lateania::svc::arena)'"
+
+# The deadchannel balance arena (late-ssh/src/app/deadchannel/fight/BALANCE.md):
+# every contract plus the report, every table for the live rules, written to
+# late-ssh/target/deadchannel-arena.md. Run it when the fight's numbers or
+# rules change.
+.PHONY: deadchannel-arena
+deadchannel-arena:
+	$(MAKE) test-llm ARGS="-p late-ssh --run-ignored all --no-capture -E 'test(deadchannel::fight::arena) and not test(arena_sweep)'"
+
+# The balance sweep: one reading per candidate set of rules in
+# arena_test.rs::SWEEP, side by side, written to
+# late-ssh/target/deadchannel-sweep.md. Edit SWEEP, run this, read the table.
+.PHONY: deadchannel-sweep
+deadchannel-sweep:
+	$(MAKE) test-llm ARGS="-p late-ssh --run-ignored all --no-capture -E 'test(arena_sweep)'"
+
+# Whole simulated runs, start to finish: one seeded climb a player from a
+# fresh row to the first mark, every shop visit, step, and turn, written to
+# late-ssh/target/deadchannel-run.md. Read it to see what a day of the
+# rules is like.
+.PHONY: deadchannel-run
+deadchannel-run:
+	$(MAKE) test-llm ARGS="-p late-ssh --run-ignored all --no-capture -E 'test(arena_run)'"
 
 # Full pre-merge sweep, and the only place the otel feature is exercised:
 # clippy + tests run the whole workspace WITH --features otel, so the real
@@ -125,3 +165,12 @@ down:
 stop:
 	docker compose -f docker-compose.yml -f docker-compose.monitoring.yml stop
 remove: down
+
+# Stops every running container on this machine, not just this project's.
+.PHONY: stop-all
+stop-all:
+	docker ps -q | xargs -r docker stop
+
+.PHONY: seed-calendar
+seed-calendar: .env
+	./scripts/seed_calendar_test_data.sh

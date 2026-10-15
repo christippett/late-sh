@@ -1,12 +1,7 @@
 use crate::app::ai::svc::AiService;
 use crate::app::chat::news::svc::ArticleService;
-use crate::app::chat::notifications::svc::NotificationService;
-use crate::app::chat::svc::ChatService;
 use late_core::models::{
-    article::{Article, ArticleParams},
-    article::{ArticleEvent, NEWS_MARKER},
-    chat_message::{ChatMessage, ChatMessageParams},
-    chat_room::ChatRoom,
+    article::{Article, ArticleEvent, ArticleParams},
     moderation_audit_log::ModerationAuditLog,
 };
 use tokio::time::{Duration, timeout};
@@ -16,10 +11,7 @@ use late_core::test_utils::create_test_user;
 use uuid::Uuid;
 
 fn make_article_service(db: late_core::db::Db) -> ArticleService {
-    let ai = AiService::new(false, None);
-    let notif = NotificationService::new(db.clone());
-    let chat = ChatService::new(db.clone(), notif);
-    ArticleService::new(db, ai, chat)
+    ArticleService::new(db, AiService::new(false, None))
 }
 
 fn article_params(user_id: Uuid, url: &str, title: &str) -> ArticleParams {
@@ -38,8 +30,7 @@ async fn recv_article_event(
     timeout(Duration::from_secs(2), async {
         loop {
             match events.recv().await.expect("article event") {
-                ArticleEvent::UnreadCountUpdated { .. }
-                | ArticleEvent::NewArticlesAvailable { .. } => continue,
+                ArticleEvent::ReadsLoaded { .. } => continue,
                 event => return event,
             }
         }
@@ -245,53 +236,116 @@ async fn admin_delete_of_other_users_article_is_audited() {
     );
 }
 
+/// News reaches every session through the `articles_changed` notify, so a
+/// replica that never ran the write itself (only listens) must end up with
+/// the new article in its shared snapshot, and lose it again on delete.
 #[tokio::test]
-async fn deleting_article_removes_lounge_news_announcement() {
+async fn a_listening_replica_picks_up_shares_and_deletes_from_the_notify() {
     let test_db = new_test_db().await;
     let client = test_db.db.get().await.expect("db client");
-    let owner = create_test_user(&test_db.db, "article-delete-announcement").await;
+    let author = create_test_user(&test_db.db, "article-notify-author").await;
+    let other_replica = make_article_service(test_db.db.clone());
+    let mut pg_listener = crate::pg_listener::PgListener::new();
+    let _worker = other_replica.start_notify_worker(
+        pg_listener.subscribe(crate::app::chat::news::svc::ArticleService::CHANNELS),
+    );
+    let _listener = pg_listener.start(test_db.db.config().clone());
+    let mut snapshot_rx = other_replica.subscribe_snapshot();
+
     let article = Article::create_by_user_id(
         &client,
-        owner.id,
-        article_params(
-            owner.id,
-            "https://example.com/delete-announcement",
-            "Delete Announcement",
-        ),
+        author.id,
+        article_params(author.id, "https://example.com/notified", "Notified"),
     )
     .await
-    .expect("seed article");
-    let lounge = ChatRoom::ensure_lounge(&client)
-        .await
-        .expect("ensure lounge room");
-    let announcement = ChatMessage::create(
-        &client,
-        ChatMessageParams {
-            room_id: lounge.id,
-            user_id: owner.id,
-            body: format!(
-                "{NEWS_MARKER} Delete Announcement || Summary || {} || ...",
-                article.url
-            ),
-        },
-    )
-    .await
-    .expect("seed news announcement");
-    drop(client);
+    .expect("create article");
 
+    // Whether the LISTEN is live before or after this insert, the listener's
+    // seed read or the notify lands the article.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let has_article = snapshot_rx
+                .borrow_and_update()
+                .articles
+                .iter()
+                .any(|item| item.article.id == article.id);
+            if has_article {
+                return;
+            }
+            snapshot_rx.changed().await.expect("snapshot watch open");
+        }
+    })
+    .await
+    .expect("the listening replica sees the share");
+
+    Article::delete(&client, article.id)
+        .await
+        .expect("delete article");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            snapshot_rx.changed().await.expect("snapshot watch open");
+            let has_article = snapshot_rx
+                .borrow_and_update()
+                .articles
+                .iter()
+                .any(|item| item.article.id == article.id);
+            if !has_article {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the listening replica drops the deleted article");
+}
+
+async fn recv_reads(events: &mut tokio::sync::broadcast::Receiver<ArticleEvent>) -> Vec<Uuid> {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let ArticleEvent::ReadsLoaded {
+                read_article_ids, ..
+            } = events.recv().await.expect("article event")
+            {
+                return read_article_ids;
+            }
+        }
+    })
+    .await
+    .expect("reads timeout")
+}
+
+/// Opening one article publishes it among the reader's reads and no other;
+/// a visit to the News room publishes every snapshot article read.
+#[tokio::test]
+async fn an_open_reads_one_article_and_a_room_visit_reads_the_feed() {
+    let test_db = new_test_db().await;
+    let client = test_db.db.get().await.expect("db client");
+    let sharer = create_test_user(&test_db.db, "reads-sharer").await;
+    let reader = create_test_user(&test_db.db, "reads-reader").await;
+    let older = Article::create_by_user_id(
+        &client,
+        sharer.id,
+        article_params(sharer.id, "https://example.com/reads-1", "Older"),
+    )
+    .await
+    .expect("create older article");
+    let newer = Article::create_by_user_id(
+        &client,
+        sharer.id,
+        article_params(sharer.id, "https://example.com/reads-2", "Newer"),
+    )
+    .await
+    .expect("create newer article");
     let service = make_article_service(test_db.db.clone());
     let mut events = service.subscribe_events();
 
-    service.delete_article(owner.id, article.id, false);
+    service.mark_article_read_task(reader.id, newer.id);
+    assert_eq!(recv_reads(&mut events).await, vec![newer.id]);
 
-    match recv_article_event(&mut events).await {
-        ArticleEvent::Deleted { user_id } => assert_eq!(user_id, owner.id),
-        other => panic!("expected Deleted event, got {other:?}"),
-    }
-
-    let client = test_db.db.get().await.expect("db client");
-    let deleted = ChatMessage::get(&client, announcement.id)
-        .await
-        .expect("reload announcement");
-    assert!(deleted.is_none());
+    service.mark_read_task(reader.id);
+    let mut read_article_ids = recv_reads(&mut events).await;
+    read_article_ids.sort();
+    let mut both = vec![older.id, newer.id];
+    both.sort();
+    assert_eq!(read_article_ids, both);
 }

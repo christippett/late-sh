@@ -1,23 +1,28 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
 use super::chips::INITIAL_CHIP_BALANCE;
 use super::message_translation::TranslateLang;
+use super::statusline::{
+    StatusComponentSetting, default_statusline_components, statusline_components_json,
+};
 use super::user::{
-    LandingPage, RightSidebarComponentSetting, RightSidebarMode, RoomListMode, User,
-    extract_auto_translate, extract_bio, extract_country, extract_enable_background_color,
-    extract_favorite_room_ids, extract_favorite_theme_ids, extract_ide,
+    LandingPage, RightSidebarComponentSetting, RightSidebarMode, RoomListMode, Screensaver,
+    TerminalImagesMode, User, extract_artboard_disclaimer, extract_auto_translate, extract_bio,
+    extract_country, extract_enable_background_color, extract_favorite_room_ids,
+    extract_favorite_theme_ids, extract_hidden_award_categories, extract_ide,
     extract_keep_composer_focused, extract_landing_page, extract_langs, extract_notify_bell,
     extract_notify_cooldown_mins, extract_notify_format, extract_notify_kinds, extract_os,
     extract_paper_at_login, extract_right_sidebar_components, extract_right_sidebar_mode,
-    extract_room_list_mode, extract_show_flag_fallback, extract_show_right_sidebar,
-    extract_show_room_list_sidebar, extract_start_with_music_muted, extract_terminal,
-    extract_text_brightness_adjustment, extract_theme_id, extract_timezone,
-    extract_translate_mine_to_en, extract_translate_to, normalize_right_sidebar_components,
-    normalize_text_brightness_adjustment,
+    extract_room_list_mode, extract_screensaver, extract_show_flag_fallback,
+    extract_show_right_sidebar, extract_show_room_list_sidebar, extract_show_watch_chat,
+    extract_start_with_music_muted, extract_statusline_components, extract_terminal,
+    extract_terminal_images, extract_text_brightness_adjustment, extract_theme_id,
+    extract_timezone, extract_translate_mine_to_en, extract_translate_to,
+    normalize_right_sidebar_components, normalize_text_brightness_adjustment,
 };
 
 #[derive(Clone, Debug)]
@@ -44,6 +49,11 @@ pub struct Profile {
     /// Ordered list of sidebar panels with their on/off state. List order is
     /// the render order (top to bottom); the clock is pinned above it.
     pub right_sidebar_components: Vec<RightSidebarComponentSetting>,
+    /// Ordered list of user-configurable bottom status bar segments with their
+    /// per-component dials. List order is the paint order, left to right along
+    /// the app frame's bottom border row. The top bar (pot, chips) is fixed UI
+    /// policy and is not stored here.
+    pub statusline_components: Vec<StatusComponentSetting>,
     /// Legacy mirror of `room_list_mode`, kept in sync on write so an older
     /// binary rolled back onto new data still shows the right rail.
     pub show_room_list_sidebar: bool,
@@ -58,6 +68,14 @@ pub struct Profile {
     pub landing_page: LandingPage,
     /// Tweak: open The Late Edition once a day at login.
     pub paper_at_login: bool,
+    /// Tweak: the piece that covers the screen while the session is away.
+    pub screensaver: Screensaver,
+    /// Show the watchers' chat beside this player's own running door game.
+    pub show_watch_chat: bool,
+    /// Ask before showing potentially NSFW Artboard content on each visit.
+    pub artboard_disclaimer: bool,
+    pub terminal_images: TerminalImagesMode,
+    pub hidden_award_categories: Vec<String>,
     /// Tweak: show text labels instead of flag emoji in the shop Flags tab.
     pub show_flag_fallback: bool,
     /// Target language for chat message translation (`t` and auto mode).
@@ -101,12 +119,18 @@ impl Default for Profile {
             show_right_sidebar: true,
             right_sidebar_mode: RightSidebarMode::On,
             right_sidebar_components: super::user::default_right_sidebar_components(),
+            statusline_components: default_statusline_components(),
             show_room_list_sidebar: true,
             room_list_mode: RoomListMode::On,
             keep_composer_focused: false,
             start_with_music_muted: false,
             landing_page: LandingPage::Clubhouse,
             paper_at_login: true,
+            screensaver: Screensaver::DEFAULT,
+            show_watch_chat: true,
+            artboard_disclaimer: true,
+            terminal_images: TerminalImagesMode::Auto,
+            hidden_award_categories: Vec::new(),
             show_flag_fallback: false,
             translate_to: TranslateLang::En,
             auto_translate: false,
@@ -137,12 +161,18 @@ pub struct ProfileParams {
     pub show_right_sidebar: bool,
     pub right_sidebar_mode: RightSidebarMode,
     pub right_sidebar_components: Vec<RightSidebarComponentSetting>,
+    pub statusline_components: Vec<StatusComponentSetting>,
     pub show_room_list_sidebar: bool,
     pub room_list_mode: RoomListMode,
     pub keep_composer_focused: bool,
     pub start_with_music_muted: bool,
     pub landing_page: LandingPage,
     pub paper_at_login: bool,
+    pub screensaver: Screensaver,
+    pub show_watch_chat: bool,
+    pub artboard_disclaimer: bool,
+    pub terminal_images: TerminalImagesMode,
+    pub hidden_award_categories: Vec<String>,
     pub show_flag_fallback: bool,
     pub translate_to: TranslateLang,
     pub auto_translate: bool,
@@ -206,7 +236,7 @@ impl Profile {
     /// enable_background_color/text_brightness_adjustment/
     /// show_right_sidebar/right_sidebar_mode/right_sidebar_components/
     /// show_room_list_sidebar/room_list_mode/keep_composer_focused/
-    /// start_with_music_muted/show_flag_fallback into settings via
+    /// start_with_music_muted/show_flag_fallback/show_watch_chat/screensaver into settings via
     /// `settings || jsonb_build_object(...)`, so concurrent writes to
     /// unrelated keys (ignored_user_ids) are preserved.
     pub async fn update(client: &Client, user_id: Uuid, params: ProfileParams) -> Result<Self> {
@@ -219,6 +249,7 @@ impl Profile {
                 .collect::<Vec<_>>(),
         )?;
         let favorite_theme_ids_json = serde_json::to_value(&params.favorite_theme_ids)?;
+        let hidden_award_categories_json = serde_json::to_value(&params.hidden_award_categories)?;
         let right_sidebar_components_json = serde_json::to_value(
             normalize_right_sidebar_components(&params.right_sidebar_components)
                 .into_iter()
@@ -230,6 +261,7 @@ impl Profile {
                 })
                 .collect::<Vec<_>>(),
         )?;
+        let statusline_components_json = statusline_components_json(&params.statusline_components);
         let cooldown = params.notify_cooldown_mins.max(0);
         let bio = params.bio.trim().to_string();
         let country = params
@@ -247,7 +279,7 @@ impl Profile {
         let ide = normalize_profile_text(params.ide.as_deref());
         let terminal = normalize_profile_text(params.terminal.as_deref());
         let os = normalize_profile_text(params.os.as_deref());
-        let langs = normalize_profile_tags(params.langs.iter().map(String::as_str));
+        let langs = crate::vocab::normalize_langs(params.langs.iter().map(String::as_str));
         let langs_json = serde_json::to_value(&langs)?;
         let current_user = User::get(client, user_id)
             .await?
@@ -302,10 +334,16 @@ impl Profile {
                          'auto_translate', $27::bool,
                          'translate_mine_to_en', $28::bool,
                          'favorite_theme_ids', $29::jsonb,
-                         'paper_at_login', $30::bool
+                         'paper_at_login', $30::bool,
+                         'terminal_images', $31::text,
+                         'hidden_award_categories', $32::jsonb,
+                         'statusline_components', $33::jsonb,
+                         'show_watch_chat', $34::bool,
+                         'artboard_disclaimer', $35::bool,
+                         'screensaver', $36::text
                      ),
                      updated = current_timestamp
-                 WHERE id = $31
+                 WHERE id = $37
                  RETURNING *",
                 &[
                     &params.username,
@@ -338,6 +376,12 @@ impl Profile {
                     &params.translate_mine_to_en,
                     &favorite_theme_ids_json,
                     &params.paper_at_login,
+                    &params.terminal_images.as_str(),
+                    &hidden_award_categories_json,
+                    &statusline_components_json,
+                    &params.show_watch_chat,
+                    &params.artboard_disclaimer,
+                    &params.screensaver.as_str(),
                     &user_id,
                 ],
             )
@@ -367,12 +411,18 @@ impl Profile {
             show_right_sidebar: extract_show_right_sidebar(&user.settings),
             right_sidebar_mode: extract_right_sidebar_mode(&user.settings),
             right_sidebar_components: extract_right_sidebar_components(&user.settings),
+            statusline_components: extract_statusline_components(&user.settings),
             show_room_list_sidebar: extract_show_room_list_sidebar(&user.settings),
             room_list_mode: extract_room_list_mode(&user.settings),
             keep_composer_focused: extract_keep_composer_focused(&user.settings),
             start_with_music_muted: extract_start_with_music_muted(&user.settings),
             landing_page: extract_landing_page(&user.settings),
             paper_at_login: extract_paper_at_login(&user.settings),
+            screensaver: extract_screensaver(&user.settings),
+            show_watch_chat: extract_show_watch_chat(&user.settings),
+            artboard_disclaimer: extract_artboard_disclaimer(&user.settings),
+            terminal_images: extract_terminal_images(&user.settings),
+            hidden_award_categories: extract_hidden_award_categories(&user.settings),
             show_flag_fallback: extract_show_flag_fallback(&user.settings),
             translate_to: extract_translate_to(&user.settings),
             auto_translate: extract_auto_translate(&user.settings),
@@ -388,30 +438,6 @@ fn normalize_profile_text(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-}
-
-pub fn normalize_profile_tags<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    for value in values {
-        for raw in value.split(|c: char| c == ',' || c.is_whitespace()) {
-            let tag: String = raw
-                .trim()
-                .trim_matches('#')
-                .to_ascii_lowercase()
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '-' | '_' | '.'))
-                .collect();
-            if tag.is_empty() || tag.len() > 24 || !seen.insert(tag.clone()) {
-                continue;
-            }
-            out.push(tag);
-            if out.len() >= 8 {
-                return out;
-            }
-        }
-    }
-    out
 }
 
 /// Look up a user's display name by user_id. Returns "someone" on failure.

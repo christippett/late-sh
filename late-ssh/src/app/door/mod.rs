@@ -18,4 +18,7 @@ pub mod minecraft;
 pub mod nethack;
 pub mod rc;
 pub mod rebels;
+pub mod spectate;
 pub mod usurper;
+pub mod vintagestory;
+pub mod zork;

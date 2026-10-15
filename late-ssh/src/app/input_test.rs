@@ -55,8 +55,6 @@ fn blocks_arrow_when_chat_is_composing_on_dashboard() {
         chat_ac_active: false,
         feeds_processing: false,
         news_composing: false,
-        showcase_composing: false,
-        work_composing: false,
         door_rc_modal: false,
     };
     assert!(ctx.blocks_arrow_sequence());
@@ -70,8 +68,6 @@ fn blocks_arrow_when_chat_is_composing_on_chat_screen() {
         chat_ac_active: false,
         feeds_processing: false,
         news_composing: false,
-        showcase_composing: false,
-        work_composing: false,
         door_rc_modal: false,
     };
     assert!(ctx.blocks_arrow_sequence());
@@ -85,8 +81,6 @@ fn allows_arrow_when_idle() {
         chat_ac_active: false,
         feeds_processing: false,
         news_composing: false,
-        showcase_composing: false,
-        work_composing: false,
         door_rc_modal: false,
     };
     assert!(!ctx.blocks_arrow_sequence());
@@ -108,9 +102,10 @@ fn topbar_screen_hit_test_maps_screen_digits() {
     assert_eq!(topbar_screen_hit_test(20, 0), Some(Screen::Artboard));
     assert_eq!(topbar_screen_hit_test(22, 0), Some(Screen::Profiles));
     assert_eq!(topbar_screen_hit_test(24, 0), Some(Screen::Leaderboard));
+    assert_eq!(topbar_screen_hit_test(26, 0), Some(Screen::Calendars));
     // The door games are no longer top-level tabs; the column past the last
     // digit and the gaps between digits map to nothing.
-    assert_eq!(topbar_screen_hit_test(26, 0), None);
+    assert_eq!(topbar_screen_hit_test(28, 0), None);
     assert_eq!(topbar_screen_hit_test(13, 0), None);
     assert_eq!(topbar_screen_hit_test(12, 1), None);
 }
@@ -322,8 +317,6 @@ fn paste_target_prefers_chat_composer() {
         chat_ac_active: false,
         feeds_processing: false,
         news_composing: true,
-        showcase_composing: false,
-        work_composing: false,
         door_rc_modal: false,
     };
     assert_eq!(paste_target(ctx), PasteTarget::ChatComposer);
@@ -337,26 +330,9 @@ fn paste_target_routes_to_news_composer() {
         chat_ac_active: false,
         feeds_processing: false,
         news_composing: true,
-        showcase_composing: false,
-        work_composing: false,
         door_rc_modal: false,
     };
     assert_eq!(paste_target(ctx), PasteTarget::NewsComposer);
-}
-
-#[test]
-fn paste_target_routes_to_showcase_composer() {
-    let ctx = InputContext {
-        screen: Screen::Dashboard,
-        chat_composing: false,
-        chat_ac_active: false,
-        feeds_processing: false,
-        news_composing: false,
-        showcase_composing: true,
-        work_composing: false,
-        door_rc_modal: false,
-    };
-    assert_eq!(paste_target(ctx), PasteTarget::ShowcaseComposer);
 }
 
 #[test]
@@ -685,8 +661,6 @@ fn allows_arrow_when_autocomplete_active() {
         chat_ac_active: true,
         feeds_processing: false,
         news_composing: false,
-        showcase_composing: false,
-        work_composing: false,
         door_rc_modal: false,
     };
     assert!(!ctx.blocks_arrow_sequence());
@@ -700,8 +674,6 @@ fn blocks_arrow_when_composing_without_autocomplete() {
         chat_ac_active: false,
         feeds_processing: false,
         news_composing: false,
-        showcase_composing: false,
-        work_composing: false,
         door_rc_modal: false,
     };
     assert!(ctx.blocks_arrow_sequence());

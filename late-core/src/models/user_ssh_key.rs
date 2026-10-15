@@ -8,6 +8,8 @@
 // 50-column phone and a 200-column desktop on one account no longer overwrite
 // each other's sidebars. `settings` is empty for a key that has never been
 // configured, and an empty override means "inherit the account default".
+// The Artboard content disclaimer lives here for the same reason: the NSFW
+// gate wants to be on at work and off at home on one account.
 //
 // A key is not perfectly a device (one key copied to two machines, or a
 // forwarded agent, reads as one identity). `RoomListMode::Auto` /
@@ -49,15 +51,25 @@ const ROOM_LIST_MODE_KEY: &str = "room_list_mode";
 const RIGHT_SIDEBAR_MODE_KEY: &str = "right_sidebar_mode";
 const AUDIO_MUTED_KEY: &str = "audio_muted";
 const AUDIO_VOLUME_KEY: &str = "audio_volume_percent";
+const ARTBOARD_DISCLAIMER_KEY: &str = "artboard_disclaimer";
+
+/// This device's Artboard content disclaimer, or `None` when the key has never
+/// set one and should follow the account's `artboard_disclaimer`. Anything but
+/// a bool reads as `None`, so a mangled blob inherits rather than guessing.
+pub fn extract_key_artboard_disclaimer(settings: &Value) -> Option<bool> {
+    settings
+        .get(ARTBOARD_DISCLAIMER_KEY)
+        .and_then(Value::as_bool)
+}
 
 /// One device's music mute and volume, and the only source of truth for
 /// either. Both live on the key rather than the account because they belong
 /// to the machine with the speakers: muting on a laptop must not silence the
 /// desktop. The server writes this from what the paired CLI reports after
 /// applying a control (the webview helper's reports are never persisted; the
-/// CLI is the surface of record), so `m`, `+`/`-`, a media key, and `/brb`'s
-/// auto-mute all land here through one path, and a session resumes exactly
-/// where the last one left off.
+/// CLI is the surface of record), so `m`, `+`/`-`, and a media key all land
+/// here through one path, and a session resumes exactly where the last one
+/// left off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyAudio {
     pub muted: bool,
@@ -184,19 +196,20 @@ impl UserSshKey {
         fingerprint: &str,
         layout: KeyLayout,
     ) -> Result<()> {
-        let updated = client
-            .execute(
-                "UPDATE user_ssh_keys
-                 SET settings = settings || $1::jsonb,
-                     updated = current_timestamp
-                 WHERE fingerprint = $2 AND user_id = $3",
-                &[&layout.to_value(), &fingerprint, &user_id],
-            )
-            .await?;
-        if updated == 0 {
-            bail!("ssh key not found");
-        }
-        Ok(())
+        Self::merge_settings(client, user_id, fingerprint, layout.to_value()).await
+    }
+
+    /// Store whether this device shows the Artboard content disclaimer.
+    /// Scoped by owner as well as fingerprint so a stale fingerprint can never
+    /// write onto another account's key.
+    pub async fn set_artboard_disclaimer(
+        client: &Client,
+        user_id: Uuid,
+        fingerprint: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let value = json!({ ARTBOARD_DISCLAIMER_KEY: enabled });
+        Self::merge_settings(client, user_id, fingerprint, value).await
     }
 
     /// Load just this device's stored mute/volume, or `None` when the key has
@@ -218,13 +231,24 @@ impl UserSshKey {
         fingerprint: &str,
         audio: KeyAudio,
     ) -> Result<()> {
+        Self::merge_settings(client, user_id, fingerprint, audio.to_value()).await
+    }
+
+    /// Merge `value` into this key's settings, leaving every other per-device
+    /// preference alone. Fails when the key is not this owner's.
+    async fn merge_settings(
+        client: &Client,
+        user_id: Uuid,
+        fingerprint: &str,
+        value: Value,
+    ) -> Result<()> {
         let updated = client
             .execute(
                 "UPDATE user_ssh_keys
                  SET settings = settings || $1::jsonb,
                      updated = current_timestamp
                  WHERE fingerprint = $2 AND user_id = $3",
-                &[&audio.to_value(), &fingerprint, &user_id],
+                &[&value, &fingerprint, &user_id],
             )
             .await?;
         if updated == 0 {

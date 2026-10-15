@@ -179,7 +179,10 @@ fn constants() {
 #[test]
 fn earning_exclusions_and_reason_uniqueness() {
     // Top Chips ranks what a player earned: every credit except the two
-    // house tables, gifts, and the starting stipend (decided 2026-09-07). Spending is a debit and a debit never counts,
+    // house tables, gifts, the starting stipend (decided 2026-09-07), the
+    // two referral payouts, and every monthly prize (the gallery's today):
+    // one of each would decide a month's board.
+    // Spending is a debit and a debit never counts,
     // so buying a beer or a pot ticket cannot cost anyone their place.
     assert_eq!(
         ChipMove::excluded_earning_reasons(),
@@ -197,10 +200,14 @@ fn earning_exclusions_and_reason_uniqueness() {
             "chip_gild_sent",
             "chip_crown_taken",
             "pot_ticket",
+            "artboard_prize",
             "round_purchase",
+            "drink_gift",
             "drink_purchase",
             "shop_purchase",
             "ssnake_arena_lost",
+            "referral_reward",
+            "referral_welcome",
         ]
     );
     // The board is earnings-only: nothing that leaves a balance may count,
@@ -251,74 +258,6 @@ async fn ensure_writes_the_stipend_once() {
         ChipMove::InitialBalance.source_kind()
     );
     assert_eq!(rows[0].get::<_, &str>("source_ref"), user.id.to_string());
-}
-
-#[tokio::test]
-async fn the_tab_board_ranks_round_buyers_by_chips_spent() {
-    let test_db = test_db().await;
-    let generous = create_test_user(&test_db.db, "tab-generous").await;
-    let modest = create_test_user(&test_db.db, "tab-modest").await;
-    let client = test_db.db.get().await.expect("db client");
-    for user in [generous.id, modest.id] {
-        UserChips::ensure(&client, user).await.expect("ensure");
-    }
-
-    UserChips::apply(
-        &**client,
-        generous.id,
-        ChipMove::RoundPurchase,
-        300,
-        "round-a",
-    )
-    .await
-    .expect("round a")
-    .expect("affordable");
-    UserChips::apply(
-        &**client,
-        generous.id,
-        ChipMove::RoundPurchase,
-        100,
-        "round-b",
-    )
-    .await
-    .expect("round b")
-    .expect("affordable");
-    UserChips::apply(
-        &**client,
-        modest.id,
-        ChipMove::RoundPurchase,
-        200,
-        "round-c",
-    )
-    .await
-    .expect("round c")
-    .expect("affordable");
-    // A drink is not a round: it stays off the board.
-    UserChips::apply(
-        &**client,
-        modest.id,
-        ChipMove::DrinkPurchase,
-        500,
-        "top shelf",
-    )
-    .await
-    .expect("drink")
-    .expect("affordable");
-
-    let board = UserChips::top_round_buyers(&client, 3)
-        .await
-        .expect("board");
-    let names: Vec<(&str, i64, i64)> = board
-        .iter()
-        .map(|row| (row.username.as_str(), row.rounds, row.chips))
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            (generous.username.as_str(), 2, 400),
-            (modest.username.as_str(), 1, 200),
-        ]
-    );
 }
 
 /// A gift's two rows each name the other party, so either side of the

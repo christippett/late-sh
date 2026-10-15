@@ -3,10 +3,12 @@
 //! to you. Pure: no I/O, no clock reads (the tick is handed in).
 //!
 //! The city is the wallet (GAME.md, "The three surfaces"): nothing happens
-//! here that you could miss, so there is no shared lobby and no crowd. One
-//! runner, one street, the doors you walk up to.
+//! here that you could miss. This is your runner only; the other runners
+//! on the street are `deadchannel/street`'s.
 
+use super::data::COST_LADDER;
 use super::map::{self, Landmark};
+use crate::app::deadchannel::fight::cards::{DRAFTS, Draft};
 
 /// How long a street line (a vendor's remark) stays pinned, in
 /// `marquee_tick` units (~15 per second; the clock is sampled on every
@@ -14,18 +16,25 @@ use super::map::{self, Landmark};
 const LINE_TICKS: u64 = 120;
 /// How far one run goes.
 pub const RUN_STEPS: u16 = 6;
+/// Rows on the armorer's wall.
+const TIERS: usize = COST_LADDER.len();
 
 /// What Enter does at the landmark within reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Enter {
-    /// Opens the landmark's panel (the shops and the board).
+    /// Opens the landmark's panel (the shops, the board, the blade shop).
     Panel(Landmark),
-    /// The street answers with a line (carts, the screen, the stairs).
+    /// The street answers with a line (carts, the stairs, a shop that is
+    /// not open yet).
     Line(Landmark),
     /// Back up the wire: the way out of the city.
     Leave,
     /// Look over the ledge: the lower city fills the screen until Enter.
     Ledge,
+    /// Walk up to the static: the screen is where the road starts
+    /// (`fight/`). The road opens over the street (or a waiting fight
+    /// resumes), and a step spends a ration on what waits on its lane.
+    Fight,
 }
 
 impl Landmark {
@@ -39,13 +48,22 @@ impl Landmark {
             | Landmark::Bar
             | Landmark::Repairs
             | Landmark::Board
-            | Landmark::Bits => Enter::Panel(self),
-            Landmark::Screen
-            | Landmark::Noodles
-            | Landmark::Umbrellas
+            | Landmark::Bits
             | Landmark::Blades
-            | Landmark::Reader
-            | Landmark::Stairs => Enter::Line(self),
+            | Landmark::Ink => Enter::Panel(self),
+            Landmark::Screen => Enter::Fight,
+            Landmark::Noodles | Landmark::Umbrellas | Landmark::Reader | Landmark::Stairs => {
+                Enter::Line(self)
+            }
+            // Not open yet: the door says so. Opening a shop moves it up
+            // to `Enter::Panel`.
+            Landmark::Baths
+            | Landmark::Sleep
+            | Landmark::Shrine
+            | Landmark::Market
+            | Landmark::Coin
+            | Landmark::Vids
+            | Landmark::Pawn => Enter::Line(self),
             Landmark::Wire => Enter::Leave,
             Landmark::Ledge => Enter::Ledge,
         }
@@ -59,8 +77,16 @@ pub struct State {
     /// Wall-synced animation clock (`marquee_tick`), mirrored on each tick.
     pub anim_tick: u64,
     panel: Option<Landmark>,
+    /// The row under the cursor on the armorer's wall (tier index, 0 is
+    /// tier 1). Kept across visits.
+    pick: usize,
+    /// The row under the cursor at INK (draft index, 0 is the level 3
+    /// draft). Kept across visits.
+    draft_pick: usize,
     /// Looking over the ledge: the lower city instead of the street.
     ledge: bool,
+    /// Leaning out over the ledge: the next `r` steps off (`Command::Reset`).
+    reset_armed: bool,
     /// A line the street said, and the tick it stops showing.
     line: Option<(Landmark, usize, u64)>,
 }
@@ -78,7 +104,10 @@ impl State {
             player_y: map::SPAWN.1,
             anim_tick: 0,
             panel: None,
+            pick: 0,
+            draft_pick: 0,
             ledge: false,
+            reset_armed: false,
             line: None,
         }
     }
@@ -107,17 +136,21 @@ impl State {
     }
 
     /// Several steps in one go (Shift+arrow, `HJKL`): up to `RUN_STEPS`,
-    /// stopping at anything solid and at the first landmark that comes
-    /// within reach, so a run never overshoots a door. Returns the steps
-    /// taken.
+    /// stopping at anything solid and at the first *new* landmark that
+    /// comes within reach, so a run never overshoots a door. The landmark
+    /// you set off from does not count: the railing runs the length of
+    /// the ledge, and a run along it must not stop every step. Returns
+    /// the steps taken.
     pub fn run(&mut self, dx: i32, dy: i32) -> u16 {
+        let from = self.nearby();
         let mut steps = 0;
         while steps < RUN_STEPS {
             if !self.walk(dx, dy) {
                 break;
             }
             steps += 1;
-            if self.nearby().is_some() {
+            let here = self.nearby();
+            if here.is_some() && here != from {
                 break;
             }
         }
@@ -137,6 +170,36 @@ impl State {
         self.panel = Some(landmark);
     }
 
+    /// The tier under the cursor on the armorer's wall, 1 to 15.
+    pub fn picked_tier(&self) -> i32 {
+        self.pick as i32 + 1
+    }
+
+    /// Move the cursor up the wall (toward tier 1) or down it; the ends
+    /// hold.
+    pub fn pick_up(&mut self) {
+        self.pick = self.pick.saturating_sub(1);
+    }
+
+    pub fn pick_down(&mut self) {
+        self.pick = (self.pick + 1).min(TIERS - 1);
+    }
+
+    /// The draft under the cursor at INK.
+    pub fn picked_draft(&self) -> &'static Draft {
+        &DRAFTS[self.draft_pick]
+    }
+
+    /// Move the cursor at INK up the drafts (toward level 3) or down them;
+    /// the ends hold.
+    pub fn pick_draft_up(&mut self) {
+        self.draft_pick = self.draft_pick.saturating_sub(1);
+    }
+
+    pub fn pick_draft_down(&mut self) {
+        self.draft_pick = (self.draft_pick + 1).min(DRAFTS.len() - 1);
+    }
+
     /// Whether the runner is looking over the ledge.
     pub fn at_ledge(&self) -> bool {
         self.ledge
@@ -144,6 +207,20 @@ impl State {
 
     pub fn look_over(&mut self) {
         self.ledge = true;
+        self.reset_armed = false;
+    }
+
+    /// Leaning out: the first `r` at the ledge. The second steps off.
+    pub fn arm_reset(&mut self) {
+        self.reset_armed = self.ledge;
+    }
+
+    pub fn disarm_reset(&mut self) {
+        self.reset_armed = false;
+    }
+
+    pub fn reset_armed(&self) -> bool {
+        self.reset_armed
     }
 
     /// Back on the street: closes the panel and steps back from the ledge,
@@ -152,6 +229,7 @@ impl State {
     pub fn dismiss(&mut self) {
         self.panel = None;
         self.ledge = false;
+        self.reset_armed = false;
     }
 
     /// The street says something: which landmark spoke and which line of

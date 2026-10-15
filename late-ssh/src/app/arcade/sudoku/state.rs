@@ -9,6 +9,7 @@ use rumenx_sudoku::{Board, Difficulty, set_rand_seed};
 use uuid::Uuid;
 
 use super::svc::SudokuService;
+use crate::metrics::{ArcadeDifficulty, ArcadeFinish, ArcadeMode};
 use late_core::models::sudoku::{Game, GameParams};
 
 pub type Grid = [[u8; 9]; 9];
@@ -23,6 +24,13 @@ pub type Notes = [[u16; 9]; 9];
 const NOTE_MASK: u16 = 0x01ff;
 
 pub const DIFFICULTIES: [&str; 3] = ["easy", "medium", "hard"];
+/// The metric label of each row of `DIFFICULTIES`, in the same order.
+/// Sized by the table, so a new difficulty must be labeled to build.
+const DIFFICULTY_METRICS: [ArcadeDifficulty; DIFFICULTIES.len()] = [
+    ArcadeDifficulty::Easy,
+    ArcadeDifficulty::Medium,
+    ArcadeDifficulty::Hard,
+];
 const MAX_UNDO: usize = 50;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -474,6 +482,16 @@ impl State {
         self.daily_date
     }
 
+    /// Tell the dashboard this board ended.
+    fn record_finish(&self, finish: ArcadeFinish) {
+        let mode = match self.mode {
+            Mode::Daily => ArcadeMode::Daily,
+            Mode::Personal => ArcadeMode::Personal,
+        };
+        let difficulty = DIFFICULTY_METRICS[self.selected_difficulty];
+        self.svc.record_finish(mode, difficulty, finish);
+    }
+
     fn check_win(&mut self) {
         let mut s = String::with_capacity(81);
         for r in 0..9 {
@@ -491,6 +509,7 @@ impl State {
         {
             self.is_game_over = true;
             self.store_active_snapshot();
+            self.record_finish(ArcadeFinish::Won);
             if self.mode == Mode::Daily {
                 self.svc.record_win_task(
                     self.user_id,

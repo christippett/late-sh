@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::deadchannel::city::data;
 
 #[test]
 fn walking_stops_at_the_railing_and_moves_on_the_street() {
@@ -54,6 +55,34 @@ fn panels_open_and_close() {
 }
 
 #[test]
+fn the_armorer_cursor_walks_the_wall_and_holds_at_the_ends() {
+    let mut state = State::new();
+    assert_eq!(state.picked_tier(), 1);
+    state.pick_up();
+    assert_eq!(state.picked_tier(), 1, "the top holds");
+    for _ in 0..40 {
+        state.pick_down();
+    }
+    assert_eq!(state.picked_tier(), 15, "the bottom holds");
+    state.pick_up();
+    assert_eq!(state.picked_tier(), 14);
+}
+
+#[test]
+fn the_needle_cursor_walks_the_drafts_and_holds_at_the_ends() {
+    let mut state = State::new();
+    assert_eq!(state.picked_draft().level, 3);
+    state.pick_draft_up();
+    assert_eq!(state.picked_draft().level, 3, "the top holds");
+    for _ in 0..10 {
+        state.pick_draft_down();
+    }
+    assert_eq!(state.picked_draft().level, 12, "the bottom holds");
+    state.pick_draft_up();
+    assert_eq!(state.picked_draft().level, 9);
+}
+
+#[test]
 fn a_street_line_expires_on_its_own() {
     let mut state = State::new();
     state.tick(100);
@@ -76,6 +105,20 @@ fn enter_routes_shops_to_panels_and_the_wire_out() {
 }
 
 #[test]
+fn a_run_along_the_railing_does_not_stop_at_every_step() {
+    let mut state = State::new();
+    // One row north of the wire stairs and a few cells west, clear of
+    // the wire's reach, at the railing; running west stays at the railing
+    // the whole way.
+    state.player_x = map::SPAWN.0 - 5;
+    state.player_y = map::RAIL_Y - 1;
+    assert_eq!(state.nearby(), Some(Landmark::Ledge));
+    assert_eq!(state.run(-1, 0), RUN_STEPS);
+    assert_eq!(state.player_x, map::SPAWN.0 - 5 - RUN_STEPS);
+    assert_eq!(state.nearby(), Some(Landmark::Ledge));
+}
+
+#[test]
 fn enter_at_the_railing_looks_over_the_ledge_and_enter_again_steps_back() {
     let mut state = State::new();
     // One row north of the wire stairs: at the railing, not on the wire.
@@ -87,4 +130,51 @@ fn enter_at_the_railing_looks_over_the_ledge_and_enter_again_steps_back() {
     assert!(state.at_ledge());
     state.dismiss();
     assert!(!state.at_ledge());
+}
+
+#[test]
+fn leaning_out_only_happens_at_the_ledge_and_never_outlives_it() {
+    let mut state = State::new();
+    state.arm_reset();
+    assert!(!state.reset_armed(), "no leaning out from the street");
+
+    state.look_over();
+    state.arm_reset();
+    assert!(state.reset_armed());
+    state.disarm_reset();
+    assert!(!state.reset_armed());
+
+    state.arm_reset();
+    state.dismiss();
+    state.look_over();
+    assert!(
+        !state.reset_armed(),
+        "stepping back and looking again starts leaned in"
+    );
+}
+
+/// Every shop that is not open yet is wired the same way: within reach
+/// of its door, Enter gets the one closed line, never a panel and never
+/// silence.
+#[test]
+fn every_closed_shop_answers_enter_with_the_same_line() {
+    for landmark in [
+        Landmark::Baths,
+        Landmark::Sleep,
+        Landmark::Shrine,
+        Landmark::Market,
+        Landmark::Coin,
+        Landmark::Vids,
+        Landmark::Pawn,
+    ] {
+        assert_eq!(landmark.on_enter(), Enter::Line(landmark));
+        assert_eq!(data::lines(landmark), data::CLOSED_LINES, "{landmark:?}");
+        assert_eq!(data::pitch(landmark), data::CLOSED_PITCH, "{landmark:?}");
+        let door = landmark.reach();
+        assert_eq!(
+            map::nearest_landmark(door.x0, door.y0 + 1),
+            Some(landmark),
+            "{landmark:?} from the street in front of its door"
+        );
+    }
 }

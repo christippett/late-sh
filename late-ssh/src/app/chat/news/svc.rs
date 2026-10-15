@@ -1,15 +1,13 @@
-use crate::app::{
-    ai::svc::AiService,
-    chat::svc::{ChatService, SendLoungeMessageTask},
-};
+use crate::app::ai::svc::AiService;
 use crate::metrics;
+use crate::pg_listener::{Channel, Refresh, Signal, read_until_ok};
 use anyhow::{Context, Result};
-use late_core::models::article::{ArticleEvent, ArticleFeedItem, ArticleSnapshot, NEWS_MARKER};
+use late_core::models::article::{ArticleEvent, ArticleFeedItem, ArticleSnapshot, NEWS_FEED_LIMIT};
 use late_core::{
     db::Db,
     models::{
         article::{Article, ArticleParams},
-        article_feed_read::ArticleFeedRead,
+        article_read::ArticleRead,
         moderation_audit_log::ModerationAuditLog,
         user::User,
     },
@@ -19,11 +17,10 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{Instrument, info_span};
 use uuid::Uuid;
 
-const NEWS_SEPARATOR: &str = " || ";
 const ASCII_WIDTH: u32 = 12;
 const ASCII_HEIGHT: u32 = 6;
 const PROCESS_URL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -45,7 +42,6 @@ const TWEET_TEXT_BULLETS: usize = 2;
 pub struct ArticleService {
     db: Db,
     ai_service: AiService,
-    chat_service: ChatService,
     http_client: reqwest::Client,
     snapshot_tx: watch::Sender<ArticleSnapshot>,
     snapshot_rx: watch::Receiver<ArticleSnapshot>,
@@ -53,14 +49,13 @@ pub struct ArticleService {
 }
 
 impl ArticleService {
-    pub fn new(db: Db, ai_service: AiService, chat_service: ChatService) -> Self {
+    pub fn new(db: Db, ai_service: AiService) -> Self {
         let (snapshot_tx, snapshot_rx) = watch::channel(ArticleSnapshot::default());
         let (evt_tx, _) = broadcast::channel(512);
 
         Self {
             db,
             ai_service,
-            chat_service,
             http_client: reqwest::Client::new(),
             snapshot_tx,
             snapshot_rx,
@@ -78,21 +73,21 @@ impl ArticleService {
         self.snapshot_tx.send(snapshot)?;
         Ok(())
     }
-    fn publish_event(&self, event: ArticleEvent) {
+    pub(crate) fn publish_event(&self, event: ArticleEvent) {
         if let Err(e) = self.evt_tx.send(event) {
             tracing::error!(%e, "failed to send article event");
         }
     }
 
-    pub fn refresh_unread_count_task(&self, user_id: Uuid) {
+    pub fn load_reads_task(&self, user_id: Uuid) {
         let service = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = service.publish_unread_count(user_id).await {
+            if let Err(e) = service.load_and_publish_reads(user_id).await {
                 late_core::error_span!(
-                    "article_unread_refresh_failed",
+                    "article_reads_load_failed",
                     error = ?e,
                     user_id = %user_id,
-                    "failed to refresh article unread count"
+                    "failed to load article reads"
                 );
             }
         });
@@ -112,6 +107,26 @@ impl ArticleService {
         });
     }
 
+    /// Mark the one article a modal opened on as read for this reader, then
+    /// republish their reads so every session of theirs drops its mark.
+    pub fn mark_article_read_task(&self, user_id: Uuid, article_id: Uuid) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = service
+                .mark_article_read_and_publish(user_id, article_id)
+                .await
+            {
+                late_core::error_span!(
+                    "article_mark_article_read_failed",
+                    error = ?e,
+                    user_id = %user_id,
+                    article_id = %article_id,
+                    "failed to mark article read"
+                );
+            }
+        });
+    }
+
     pub fn list_articles_task(&self) {
         let service = self.clone();
         tokio::spawn(async move {
@@ -125,10 +140,33 @@ impl ArticleService {
         });
     }
 
+    /// What the notify worker subscribes to.
+    pub const CHANNELS: &'static [Channel] = &[Channel::ArticlesChanged];
+
+    /// Keep this replica's shared news snapshot in step with `articles`.
+    /// Every write fires `articles_changed` (migration 198), routed here by
+    /// the process listener (`crate::pg_listener`), so a share or a delete
+    /// on any replica reaches every session. A resync and a notify are the
+    /// same re-read, a burst of writes collapses into one, and a failed
+    /// read retries until it lands: the resync read is what seeds this
+    /// replica, so it may not be dropped.
+    pub fn start_notify_worker(
+        &self,
+        mut signals: mpsc::UnboundedReceiver<Signal>,
+    ) -> tokio::task::JoinHandle<()> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            while signals.recv().await.is_some() {
+                while signals.try_recv().is_ok() {}
+                read_until_ok(Refresh::Articles, || service.do_list_articles()).await;
+            }
+        })
+    }
+
     #[tracing::instrument(skip(self))]
     async fn do_list_articles(&self) -> Result<()> {
         let db_client = self.db.get().await?;
-        let articles = Article::list_recent(&db_client, 20).await?;
+        let articles = Article::list_recent(&db_client, NEWS_FEED_LIMIT).await?;
         let user_ids = articles
             .iter()
             .map(|article| article.user_id)
@@ -152,51 +190,36 @@ impl ArticleService {
         Ok(())
     }
 
-    async fn publish_unread_count(&self, user_id: Uuid) -> Result<()> {
+    async fn load_and_publish_reads(&self, user_id: Uuid) -> Result<()> {
         let db_client = self.db.get().await?;
-        let unread_count = ArticleFeedRead::unread_count_for_user(&db_client, user_id).await?;
-        let last_read_at = ArticleFeedRead::last_read_at(&db_client, user_id).await?;
-        self.publish_event(ArticleEvent::UnreadCountUpdated {
-            user_id,
-            unread_count,
-            last_read_at,
-        });
-        Ok(())
+        self.publish_reads(&db_client, user_id).await
     }
 
+    /// A visit to the News room: every article in the snapshot is read.
     async fn mark_read_and_publish(&self, user_id: Uuid) -> Result<()> {
         let db_client = self.db.get().await?;
-        ArticleFeedRead::mark_read_now(&db_client, user_id).await?;
-        let last_read_at = ArticleFeedRead::last_read_at(&db_client, user_id).await?;
-        self.publish_event(ArticleEvent::UnreadCountUpdated {
-            user_id,
-            unread_count: 0,
-            last_read_at,
-        });
-        Ok(())
+        ArticleRead::mark_feed_read(&db_client, user_id)
+            .await
+            .context("marking article feed read")?;
+        self.publish_reads(&db_client, user_id).await
     }
 
-    async fn publish_unread_updates_for_all(
-        &self,
-        announce_new: bool,
-        actor_user_id: Option<Uuid>,
-    ) -> Result<()> {
+    async fn mark_article_read_and_publish(&self, user_id: Uuid, article_id: Uuid) -> Result<()> {
         let db_client = self.db.get().await?;
-        for user_id in User::list_ids(&db_client).await? {
-            let unread_count = ArticleFeedRead::unread_count_for_user(&db_client, user_id).await?;
-            let last_read_at = ArticleFeedRead::last_read_at(&db_client, user_id).await?;
-            self.publish_event(ArticleEvent::UnreadCountUpdated {
-                user_id,
-                unread_count,
-                last_read_at,
-            });
-            if announce_new && Some(user_id) != actor_user_id && unread_count > 0 {
-                self.publish_event(ArticleEvent::NewArticlesAvailable {
-                    user_id,
-                    unread_count,
-                });
-            }
-        }
+        ArticleRead::mark_read(&db_client, user_id, article_id)
+            .await
+            .context("marking article read")?;
+        self.publish_reads(&db_client, user_id).await
+    }
+
+    async fn publish_reads(&self, db_client: &tokio_postgres::Client, user_id: Uuid) -> Result<()> {
+        let read_article_ids = ArticleRead::article_ids_for_user(db_client, user_id)
+            .await
+            .context("loading article reads")?;
+        self.publish_event(ArticleEvent::ReadsLoaded {
+            user_id,
+            read_article_ids,
+        });
         Ok(())
     }
 
@@ -207,8 +230,7 @@ impl ArticleService {
                 let result = async {
                     let client = service.db.get().await?;
 
-                    // Fetch the article so we can (a) enforce ownership, (b)
-                    // clean up the chat announcement afterwards.
+                    // Fetch the article to enforce ownership.
                     let Some(article) = Article::get(&client, article_id).await? else {
                         anyhow::bail!("Article not found");
                     };
@@ -230,28 +252,6 @@ impl ArticleService {
                         json!({ "target_user_id": article.user_id, "url": article.url }),
                     )
                     .await?;
-                    drop(client);
-
-                    // Delete the news announcement from lounge chat and
-                    // notify active chat clients so the stale card disappears.
-                    if let Err(e) = service
-                        .chat_service
-                        .delete_news_announcements_by_user_and_url(
-                            article.user_id,
-                            NEWS_MARKER,
-                            &article.url,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            error = ?e,
-                            url = %article.url,
-                            "failed to delete news chat announcement"
-                        );
-                    }
-
-                    service.do_list_articles().await?;
-                    service.publish_unread_updates_for_all(false, None).await?;
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
@@ -362,9 +362,6 @@ impl ArticleService {
             .article_ascii_art(url, extraction.image_url.as_deref())
             .await?;
 
-        let announcement =
-            build_news_chat_announcement(&extraction.title, &extraction.summary, url, &ascii_art);
-
         // 4. Save to database and pay the sharer, scoped so the client is
         //    dropped before helper calls. Both share paths (the News composer
         //    and an RSS entry shared with `s`) land here, so this is the one
@@ -388,37 +385,10 @@ impl ArticleService {
             reward
         };
 
-        // Post the announcement into #lounge via the same send path as any
-        // other message, preserving the normal composer success/failure event.
-        self.chat_service
-            .send_lounge_message_task(SendLoungeMessageTask {
-                user_id,
-                body: announcement,
-                request_id: Some(Uuid::now_v7()),
-                join_if_needed: false,
-                failure_log: "failed to share news in lounge chat",
-            });
-
-        // Refresh the shared feed snapshot immediately so clients see the new item
-        // without waiting for the periodic poll tick.
-        if let Err(e) = self.do_list_articles().await {
-            late_core::error_span!(
-                "article_refresh_failed",
-                error = ?e,
-                "failed to refresh article snapshot after create"
-            );
-        }
-
-        if let Err(e) = self
-            .publish_unread_updates_for_all(true, Some(user_id))
-            .await
-        {
-            late_core::error_span!(
-                "article_unread_broadcast_failed",
-                error = ?e,
-                "failed to publish article unread updates after create"
-            );
-        }
+        // The insert fired `articles_changed`; every replica's listener,
+        // this one included, refreshes the shared snapshot from it, and the
+        // #lounge live strip features the article from there
+        // (`news/live.rs`). Nothing is posted into the chat.
 
         // 5. Publish Event
         tracing::info!(%url, "publishing ArticleEvent::Created");
@@ -1141,17 +1111,6 @@ fn procedural_ascii_art(url: &str) -> String {
     art
 }
 
-fn build_news_chat_announcement(title: &str, summary: &str, url: &str, ascii_art: &str) -> String {
-    let title = truncate_for_chat(&sanitize_payload_field(title.trim()), 90);
-    let summary = truncate_for_chat(&encode_summary_bullets(summary), 400);
-    let url = sanitize_payload_field(url.trim());
-    let ascii = encode_ascii_payload(ascii_art);
-    let payload = format!(
-        "{NEWS_MARKER} {title}{NEWS_SEPARATOR}{summary}{NEWS_SEPARATOR}{url}{NEWS_SEPARATOR}{ascii}"
-    );
-    truncate_for_chat(&payload, 1800)
-}
-
 fn truncate_for_chat(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -1163,39 +1122,6 @@ fn truncate_for_chat(input: &str, max_chars: usize) -> String {
     }
     out.push_str("...");
     out
-}
-
-fn sanitize_payload_field(input: &str) -> String {
-    input
-        .replace(NEWS_SEPARATOR, " | ")
-        .replace(['\n', '\r'], " ")
-}
-
-fn encode_summary_bullets(summary: &str) -> String {
-    summary
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| {
-            !line
-                .to_ascii_lowercase()
-                .starts_with("• no content details")
-        })
-        .take(3)
-        .map(|line| {
-            truncate_for_chat(
-                &sanitize_payload_field(
-                    line.trim_start_matches('•').trim_start_matches('-').trim(),
-                ),
-                120,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\\n")
-}
-
-fn encode_ascii_payload(ascii_art: &str) -> String {
-    ascii_art.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
 #[cfg(test)]

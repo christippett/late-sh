@@ -6,7 +6,8 @@
 //     > or . down (also shown as a hint in-game when a room has a vertical exit).
 //   - Combat: space/x attack; 1-9 use the ability in that action-bar slot (0 is
 //     slot 10; deeper rosters cast from the Abilities panel); Q quaffs the best
-//     healing potion without leaving the view; z flee.
+//     healing potion without leaving the view; C coats your weapon with the
+//     coat the foe in front of you likes least; z flee.
 //   - Companion care: G feeds and tends your own companion from anywhere
 //     (20g; four loyalty-raising meals a UTC day, and past them it still
 //     mends). ~ does the same, except that if a wild
@@ -29,18 +30,24 @@
 //     where you're headed, and the room panel then names the next exit to
 //     take until you get there; M toggles RPG mode (the live walk-around
 //     field beside the room) on/off - off is a plain text MUD.
+//   - = shows the room rail (the wide layout's side panel) full screen;
+//     the phone layout has no rail, so this is how it reads the whole room.
 //   - ! opens the Leaderboard: top adventurers currently online by level,
 //     pvp kills, and gold (read-only). Not `?`, which late.sh reserves
 //     globally for a cross-door help overlay.
-//   - Panels: c character, v abilities, o look, b shop, t inventory ("things"),
+//   - Panels: c character (lowercase only - C coats a weapon), v abilities,
+//     o look, b shop, t inventory ("things"),
 //     p the Stable (companion vendor) where one stands. In the Stable, Enter
 //     buys the selected beast and x feeds/tends the one you have. q opens the
 //     Animal Taming panel where a tameable wild beast roams (Enter attempts the
 //     tame). n opens the housing ledger (buy a deed at the clerk, furnish a home
 //     you own from inside).
 //     In a list panel, 1-9 select a row, Enter activates (equip/use/buy),
-//     w/s move the cursor, x sells (inventory). List panels auto-scroll to
-//     follow the cursor; [ / ] scroll the cursor-less text panels.
+//     w/s move the cursor, x sells (inventory). In the Abilities panel x
+//     instead arms the selected ability for swapping (a second x swaps,
+//     x on the same row cancels), and while armed r restores the natural
+//     order. List panels auto-scroll to follow the cursor; [ / ] scroll
+//     the cursor-less text panels.
 //   - Chat: ' opens the say line, sent to the room by default. Lead the
 //     message with "/z " (or "/zone ") for everyone in the same named zone,
 //     or "/w " (or "/world ") for every adventurer in Lateania right now.
@@ -251,6 +258,18 @@ pub fn handle_key(state: &mut State, byte: u8) -> InputAction {
         }
     }
 
+    // In the Abilities panel, `x` arms a row for swapping; while one is armed,
+    // `r` drops the custom order and returns the bar to its natural order. The
+    // capture runs before `r`'s recall binding so swap mode temporarily owns the
+    // key; anywhere else `r` still recalls.
+    if panel == Panel::Abilities
+        && state.ability_swap_source().is_some()
+        && (byte == b'r' || byte == b'R')
+    {
+        state.ability_reset_order();
+        return InputAction::Handled;
+    }
+
     // The overhead world map captures pan keys (wasd/hjkl) and Enter (re-centre)
     // while it's open; every other key falls through, so panel keys still work
     // and `m` closes the map.
@@ -306,8 +325,15 @@ pub fn handle_key(state: &mut State, byte: u8) -> InputAction {
 
     match byte {
         // Panels.
-        b'c' | b'C' => {
+        b'c' => {
             state.toggle_panel(Panel::Character);
+            InputAction::Handled
+        }
+        b'C' => {
+            // Coat the weapon in one keystroke, the sibling of `Q`. Shift-c no
+            // longer opens the character sheet; plain `c` still does, and the
+            // game already splits three other pairs this way (q/Q, g/G, m/M).
+            state.coat();
             InputAction::Handled
         }
         b'v' | b'V' => {
@@ -410,6 +436,12 @@ pub fn handle_key(state: &mut State, byte: u8) -> InputAction {
             // (`app::input::door_games_allows_global_help`), so a Lateania
             // binding on `?` is intercepted before this function ever runs.
             state.toggle_panel(Panel::Leaderboard);
+            InputAction::Handled
+        }
+        b'=' => {
+            // The room rail full screen: the phone layout has none, and this
+            // gives it the rail's whole room summary without a second layout.
+            state.toggle_panel(Panel::Rail);
             InputAction::Handled
         }
         b';' => {
@@ -518,10 +550,13 @@ pub fn handle_key(state: &mut State, byte: u8) -> InputAction {
             } else if panel == Panel::Appearance {
                 // The secondary action cycles the trait the other way.
                 state.cycle_appearance(-1);
+            } else if panel == Panel::Abilities {
+                // First press arms the selected ability for swapping; the
+                // second press (on the target row) swaps them.
+                state.ability_swap_selection();
             } else if in_list {
                 state.sell_selection();
-            } else if panel == Panel::Room || panel == Panel::Character || panel == Panel::Abilities
-            {
+            } else if matches!(panel, Panel::Room | Panel::Rail | Panel::Character) {
                 state.attack();
             }
             InputAction::Handled

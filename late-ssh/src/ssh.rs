@@ -3,7 +3,7 @@ use getrandom::SysRng;
 use late_core::MutexRecover;
 use late_core::models::{
     artboard_ban::ArtboardBan,
-    article_feed_read::ArticleFeedRead,
+    article_read::ArticleRead,
     server_ban::ServerBan,
     user::{User, UserParams, extract_theme_id},
 };
@@ -146,6 +146,49 @@ struct ClientHandler {
     terminal_env_hints: Vec<(String, String)>,
     session_token: Option<String>,
     session_rx: Option<tokio::sync::mpsc::Receiver<crate::session::SessionMessage>>,
+
+    /// Session start marks for `metrics::record_session_start`: the accept,
+    /// then the key accepted, then (once the `App` is built) the marks the
+    /// render loop reports on its first drawn frame.
+    connected_at: Instant,
+    authed_at: Option<Instant>,
+    session_start: Option<SessionStart>,
+}
+
+/// The session's start, carried into the render loop and reported once,
+/// on the first frame actually drawn.
+struct SessionStart {
+    connected_at: Instant,
+    authed_at: Instant,
+    app_ready_at: Instant,
+    user: metrics::SessionUser,
+}
+
+impl SessionStart {
+    fn record_first_frame(self) {
+        let drawn_at = Instant::now();
+        let stages = [
+            (
+                metrics::SessionStartStage::Auth,
+                self.authed_at - self.connected_at,
+            ),
+            (
+                metrics::SessionStartStage::Bootstrap,
+                self.app_ready_at - self.authed_at,
+            ),
+            (
+                metrics::SessionStartStage::FirstFrame,
+                drawn_at - self.app_ready_at,
+            ),
+            (
+                metrics::SessionStartStage::Total,
+                drawn_at - self.connected_at,
+            ),
+        ];
+        for (stage, took) in stages {
+            metrics::record_session_start(stage, self.user, took.as_secs_f64());
+        }
+    }
 }
 
 pub fn load_or_generate_key(state: &State) -> anyhow::Result<PrivateKey> {
@@ -404,6 +447,9 @@ impl Server {
             terminal_env_hints: Vec::new(),
             session_token: None,
             session_rx: None,
+            connected_at: Instant::now(),
+            authed_at: None,
+            session_start: None,
         }
     }
 }
@@ -478,16 +524,6 @@ impl Drop for ClientHandler {
                     .online_user_disconnected(user_id);
             }
             drop(active_users);
-            // A status is session-local, so this session's retires with it.
-            // The user's shared entry falls back to whatever their remaining
-            // sessions carry, and clears once none does (always, on the last
-            // connection). There is nothing to resume when they come back.
-            crate::app::common::status::publish_for_user(
-                &self.state.status_directory,
-                &self.state.active_users,
-                user_id,
-                None,
-            );
         }
 
         if !self.per_ip_incremented {
@@ -546,7 +582,7 @@ impl ClientHandler {
             token: session_token.to_string(),
             fingerprint: Some(user.fingerprint.clone()),
             peer_ip: self.peer_ip,
-            status: None,
+            away: false,
         });
     }
 }
@@ -558,10 +594,10 @@ impl russh::server::Handler for ClientHandler {
         Ok(Some(AUTH_SETUP_BANNER.to_string()))
     }
 
-    #[tracing::instrument(skip(self, _user, key), fields(peer = ?self.peer_addr, transport = ?self.transport_peer_addr))]
+    #[tracing::instrument(skip(self, ssh_user, key), fields(peer = ?self.peer_addr, transport = ?self.transport_peer_addr))]
     async fn auth_publickey(
         &mut self,
-        _user: &str,
+        ssh_user: &str,
         key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
         tracing::debug!("public key auth accepted");
@@ -626,6 +662,16 @@ impl russh::server::Handler for ClientHandler {
             }
         };
         self.is_new_user = is_new_user;
+        // `ssh invite-<code>@late.sh` names an inviter, read once: on the
+        // connect that created the account. Any other login name (plain
+        // `ssh late.sh` sends the local $USER) is ignored, as it always was.
+        if is_new_user && let Some(code) = crate::app::referral::state::ssh_invite_code(ssh_user) {
+            self.state.referral_service.attach_task(
+                user.id,
+                code,
+                late_core::models::referral::ReferralSource::Ssh,
+            );
+        }
         if !self.active_user_incremented {
             let mut active_users = self.state.active_users.lock_recover();
 
@@ -681,6 +727,7 @@ impl russh::server::Handler for ClientHandler {
             .state
             .activity_feed
             .send(ActivityEvent::joined(user_id, username));
+        self.authed_at = Some(Instant::now());
         Ok(Auth::Accept)
     }
 
@@ -854,10 +901,6 @@ impl russh::server::Handler for ClientHandler {
                 None
             }
         };
-        // The door: the next of last month's podium pieces this account has
-        // not seen, or the cup. One claim per login, the gallery logs its
-        // own failures.
-        let splash_piece = self.state.gallery_service.claim_splash_piece(user_id).await;
         let key_fingerprint = self.auth_fingerprint.clone();
         let device = crate::session_bootstrap::load_device_state(
             &self.state,
@@ -865,6 +908,13 @@ impl russh::server::Handler for ClientHandler {
             key_fingerprint.as_deref(),
         )
         .await;
+        // The door: the day's wall piece for those who chose Always View on
+        // the Artboard content disclaimer (on this device), else the cup.
+        let splash_piece = self
+            .state
+            .gallery_service
+            .splash_piece_for_login(device.shows_artboard_disclaimer(user))
+            .await;
         let initial_door_rcs = match self.state.door_rc_service.list(user_id).await {
             Ok(rcs) => rcs,
             Err(e) => {
@@ -893,8 +943,10 @@ impl russh::server::Handler for ClientHandler {
             translation_service: self.state.translation_service.clone(),
             summary_service: self.state.summary_service.clone(),
             paper_service: self.state.paper_service.clone(),
+            jobs_service: self.state.jobs_service.clone(),
             notification_service: self.state.notification_service.clone(),
             article_service,
+            calendar_service: self.state.calendar_service.clone(),
             feed_service: self.state.feed_service.clone(),
             cyberspace_service: self.state.cyberspace_service.clone(),
             showcase_service: self.state.showcase_service.clone(),
@@ -931,6 +983,7 @@ impl russh::server::Handler for ClientHandler {
             greendragon_service: self.state.greendragon_service.clone(),
             darkroom_service: self.state.darkroom_service.clone(),
             arcade_handle_service: self.state.arcade_handle_service.clone(),
+            live_games: self.state.live_games.clone(),
             door_rc_service: self.state.door_rc_service.clone(),
             initial_door_rcs,
             daily_service: self.state.daily_service.clone(),
@@ -944,6 +997,18 @@ impl russh::server::Handler for ClientHandler {
             splash_piece,
             username: user.username.clone(),
             bonsai_service: self.state.bonsai_service.clone(),
+            fight_service: crate::app::deadchannel::fight::svc::FightService::new(
+                self.state.db.clone(),
+                self.state.chat_service.clone(),
+                self.state.chip_service.clone(),
+            ),
+            tailor_service: crate::app::deadchannel::tailor::svc::TailorService::new(
+                self.state.db.clone(),
+            ),
+            guide_service: crate::app::deadchannel::guide::svc::GuideService::new(
+                self.state.db.clone(),
+            ),
+            lounge_service: self.state.lounge_service.clone(),
             initial_bonsai_tree,
             initial_bonsai_decay_protection,
             pet_service: self.state.pet_service.clone(),
@@ -1005,6 +1070,10 @@ impl russh::server::Handler for ClientHandler {
             codekeep_host: self.state.config.codekeep_host.clone(),
             codekeep_port: self.state.config.codekeep_port,
             codekeep_secret: self.state.config.codekeep_secret.clone(),
+            zork_enabled: self.state.config.zork_enabled,
+            zork_host: self.state.config.zork_host.clone(),
+            zork_port: self.state.config.zork_port,
+            zork_secret: self.state.config.zork_secret.clone(),
             session_token,
             session_registry: Some(self.state.session_registry.clone()),
             paired_client_registry: Some(self.state.paired_client_registry.clone()),
@@ -1012,8 +1081,7 @@ impl russh::server::Handler for ClientHandler {
             now_playing_rx: Some(self.state.now_playing_rx.clone()),
             radio_meta_rx: Some(self.state.radio_meta_rx.clone()),
             active_users: Some(self.state.active_users.clone()),
-            clubhouse_lobby: Some(self.state.clubhouse_lobby.clone()),
-            nightcap_lobby: Some(self.state.nightcap_lobby.clone()),
+            drunk_map: self.state.drunk_map.clone(),
             nightcap_house: Some(self.state.nightcap_house.clone()),
             mention_ladders: self.state.mention_ladders.clone(),
             files: self.state.config.files.clone(),
@@ -1025,18 +1093,22 @@ impl russh::server::Handler for ClientHandler {
                 &user.settings,
             ),
             first_contact_gate,
-            app_flags_rx: self.state.app_flags.subscribe(),
-            app_flags: Some(self.state.app_flags.clone()),
             runner_looks_rx: self.state.runner_looks.subscribe(),
+            presence: self.state.presence.clone(),
             zen_layout: late_core::models::user::extract_zen_layout(&user.settings),
             key_fingerprint,
             key_layout: device.layout,
+            key_artboard_disclaimer: device.artboard_disclaimer,
             key_left_at: device.left_at,
             username_directory: Some(self.state.username_directory.clone()),
             flair_directory: Some(self.state.flair_directory.clone()),
-            status_directory: Some(self.state.status_directory.clone()),
             crown_service: Some(self.state.crown_service.clone()),
             pot_service: Some(self.state.pot_service.clone()),
+            referral_service: self.state.referral_service.clone(),
+            newcomer_clock: crate::app::referral::state::NewcomerClock::new(
+                user.created,
+                chrono::Utc::now(),
+            ),
             activity_feed_rx: self.activity_feed_rx.take(),
             user_id,
             permissions,
@@ -1053,8 +1125,8 @@ impl russh::server::Handler for ClientHandler {
                 &user.settings,
             ),
             initial_audio_source: late_core::models::user::extract_audio_source(&user.settings),
-            initial_icecast_stream: late_core::models::user::extract_icecast_stream(&user.settings),
             initial_radio_station: late_core::models::user::extract_radio_station(&user.settings),
+            initial_radio_slots: late_core::models::user::extract_radio_slots(&user.settings),
 
             // Server state
             is_draining: self.state.is_draining.clone(),
@@ -1064,6 +1136,17 @@ impl russh::server::Handler for ClientHandler {
             app.apply_terminal_env_hint(name, value);
         }
         self.app = Some(Arc::new(TokioMutex::new(app)));
+        self.session_start = Some(SessionStart {
+            connected_at: self.connected_at,
+            authed_at: self
+                .authed_at
+                .expect("a pty session is built only after its key was accepted"),
+            app_ready_at: Instant::now(),
+            user: match self.is_new_user {
+                true => metrics::SessionUser::New,
+                false => metrics::SessionUser::Returning,
+            },
+        });
         self.input_tx = Some(input_tx);
         self.input_rx = Some(input_rx);
         match session.channel_success(channel) {
@@ -1211,6 +1294,7 @@ impl russh::server::Handler for ClientHandler {
                 budget: Arc::clone(&self.output_budget),
             };
             app.lock().await.set_repaint_signal(Arc::clone(&signal));
+            let mut session_start = self.session_start.take();
             tokio::spawn(async move {
                 let mut previous_render: Option<Instant> = None;
                 let mut input_pending = false;
@@ -1283,6 +1367,11 @@ impl russh::server::Handler for ClientHandler {
                     match render_once(&app, &mut input_rx, &ctx, advance_world).await {
                         Ok(outcome) => {
                             previous_render = Some(Instant::now());
+                            if outcome.drew
+                                && let Some(start) = session_start.take()
+                            {
+                                start.record_first_frame();
+                            }
                             if outcome.drew {
                                 stats_drawn += 1;
                             } else {
@@ -1761,11 +1850,13 @@ async fn ensure_user(state: &State, fingerprint: &str) -> Result<(User, bool)> {
                     );
                 }
             }
-            if let Err(e) = ArticleFeedRead::seed_read_for_new_user(&client, user.id).await {
+            // A first login never shows the back catalog as unread: the new
+            // user has read the feed as it stands.
+            if let Err(e) = ArticleRead::mark_feed_read(&client, user.id).await {
                 tracing::warn!(
                     user_id = %user.id,
                     error = ?e,
-                    "failed to seed news read cursor for newly created user"
+                    "failed to seed news reads for newly created user"
                 );
             }
             (user, true)

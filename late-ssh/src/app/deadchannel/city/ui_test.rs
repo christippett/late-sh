@@ -2,6 +2,11 @@ use super::*;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
+use crate::app::deadchannel::fight::state::{Lookout, Sheet};
+use crate::app::deadchannel::guide::state::State as GuideState;
+use crate::app::deadchannel::street::state::StreetRunner;
+use crate::app::deadchannel::tailor::ui as tailor_ui;
+
 fn render(state: &State, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -15,6 +20,22 @@ fn render(state: &State, width: u16, height: u16) -> String {
                     state,
                     own_username: "mira",
                     look: None,
+                    sheet: None,
+                    scene: None,
+                    picker: None,
+                    lookout: &Lookout::default(),
+                    till: None,
+                    tailor: tailor_ui::MirrorView {
+                        draft: None,
+                        word: None,
+                        changed: false,
+                        saving: false,
+                    },
+                    guide: &GuideState::new(),
+                    own_user_id: Uuid::nil(),
+                    street: &StreetView::new(),
+                    runner_looks: &HashMap::new(),
+                    usernames: &UsernameLookup::new(&HashMap::new(), None),
                 },
             );
         })
@@ -47,12 +68,535 @@ fn the_runner_and_the_wire_popover_render_at_the_spawn() {
 #[test]
 fn a_shop_panel_lists_its_catalog() {
     let mut state = State::new();
+    state.open_panel(Landmark::Board);
+    let screen = render(&state, 120, 40);
+    assert!(screen.contains("the board"), "{screen}");
+    assert!(screen.contains("standing orders"), "{screen}");
+}
+
+#[test]
+fn the_armorer_prices_the_picked_row_against_the_sheet() {
+    let mut state = State::new();
     state.open_panel(Landmark::Armorer);
+    // Nothing to trade with until the sheet comes down the wire.
     let screen = render(&state, 120, 40);
     assert!(screen.contains("the armorer"), "{screen}");
-    assert!(screen.contains("bent antenna"), "{screen}");
+    assert!(
+        screen.contains("the sheet has not come down the wire yet."),
+        "{screen}"
+    );
+
+    let mut sheet = Sheet::fresh(
+        uuid::Uuid::nil(),
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
+    );
+    sheet.level = 3;
+    sheet.bits = 1300;
+    sheet.weapon_tier = 2;
+    state.pick_down();
+    state.pick_down();
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            draw(
+                frame,
+                frame.area(),
+                CityView {
+                    state: &state,
+                    own_username: "mira",
+                    look: None,
+                    sheet: Some(&sheet),
+                    scene: None,
+                    picker: None,
+                    lookout: &Lookout::default(),
+                    till: Some("the armorer hands over the box cutter. 506 bits."),
+                    tailor: tailor_ui::MirrorView {
+                        draft: None,
+                        word: None,
+                        changed: false,
+                        saving: false,
+                    },
+                    guide: &GuideState::new(),
+                    own_user_id: Uuid::nil(),
+                    street: &StreetView::new(),
+                    runner_looks: &HashMap::new(),
+                    usernames: &UsernameLookup::new(&HashMap::new(), None),
+                },
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            screen.push_str(buffer[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    assert!(screen.contains("on hand 1300 bits"), "{screen}");
+    assert!(screen.contains("weapon box cutter"), "{screen}");
+    assert!(screen.contains("armor street clothes"), "{screen}");
+    assert!(
+        screen.contains("▸    3  tire iron"),
+        "the cursor on tier 3\n{screen}"
+    );
     assert!(screen.contains("the last broadcast"), "{screen}");
-    assert!(screen.contains("10350"), "{screen}");
+    // The top of the wall at level 3: 23287 on the ladder, and half as
+    // much again for each of the twelve tiers it sits above the level.
+    assert!(screen.contains("163009"), "{screen}");
+    // Tier 3 weapon, level with the runner: 1316 less 75% of 506 (379).
+    // Tier 3 armor off street clothes: 1316.
+    assert!(screen.contains("[w] tire iron for 937 bits"), "{screen}");
+    assert!(
+        screen.contains("[a] padded jacket for 1316 bits"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("the armorer hands over the box cutter. 506 bits."),
+        "the till line\n{screen}"
+    );
+}
+
+/// The city with `state` over it, `sheet` as the mirror, and `till` as the
+/// counter's last word, on a 120 by 40 terminal.
+fn render_with_sheet(state: &State, sheet: &Sheet, till: Option<&str>) -> String {
+    render_panel(120, 40, state, sheet, till, None)
+}
+
+/// [`render_with_sheet`] on a `width` by `height` terminal, with
+/// `tailor_word` as the tailor's last word.
+fn render_panel(
+    width: u16,
+    height: u16,
+    state: &State,
+    sheet: &Sheet,
+    till: Option<&str>,
+    tailor_word: Option<&str>,
+) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            draw(
+                frame,
+                frame.area(),
+                CityView {
+                    state,
+                    own_username: "mira",
+                    look: None,
+                    sheet: Some(sheet),
+                    scene: None,
+                    picker: None,
+                    lookout: &Lookout::default(),
+                    till,
+                    tailor: tailor_ui::MirrorView {
+                        draft: None,
+                        word: tailor_word,
+                        changed: false,
+                        saving: false,
+                    },
+                    guide: &GuideState::new(),
+                    own_user_id: Uuid::nil(),
+                    street: &StreetView::new(),
+                    runner_looks: &HashMap::new(),
+                    usernames: &UsernameLookup::new(&HashMap::new(), None),
+                },
+            )
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            screen.push_str(buffer[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+/// Where `needle` first sits on `screen`: its row and its column.
+fn spot(screen: &str, needle: &str) -> (usize, usize) {
+    screen
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            line.find(needle)
+                .map(|at| (row, line[..at].chars().count()))
+        })
+        .unwrap_or_else(|| panic!("{needle} on the screen\n{screen}"))
+}
+
+/// A shop's panel holds its frame whatever happens at the counter: the
+/// counter's word arriving, or a purchase changing what the keys say.
+#[test]
+fn a_shop_panel_keeps_its_frame_whatever_the_counter_says() {
+    let mut state = State::new();
+    state.open_panel(Landmark::Armorer);
+    state.pick_down();
+    state.pick_down();
+    let mut sheet = Sheet::fresh(
+        uuid::Uuid::nil(),
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
+    );
+    sheet.level = 3;
+    sheet.bits = 1300;
+    sheet.weapon_tier = 2;
+    let corners = |screen: &str| (spot(screen, " the armorer "), spot(screen, " Esc closes "));
+
+    let quiet = render_with_sheet(&state, &sheet, None);
+    let word =
+        "the armorer hands over the tire iron. the box cutter goes back on the wall. 937 bits.";
+    let answered = render_with_sheet(&state, &sheet, Some(word));
+    assert!(answered.contains(word), "{answered}");
+    assert_eq!(corners(&answered), corners(&quiet), "{answered}");
+
+    sheet.weapon_tier = 3;
+    sheet.bits = 363;
+    let bought = render_with_sheet(&state, &sheet, Some(word));
+    assert!(bought.contains("you carry that, or better"), "{bought}");
+    assert_eq!(corners(&bought), corners(&quiet), "{bought}");
+}
+
+/// On a short screen the armorer's wall gives way, never the keys: the
+/// tiers around the cursor stay, and so do both keys with their prices,
+/// the terms, and the counter's word. 22 rows is the city on a 24-row
+/// terminal, under the app's frame.
+#[test]
+fn a_short_screen_keeps_the_armorers_keys_and_prices() {
+    let mut state = State::new();
+    state.open_panel(Landmark::Armorer);
+    state.pick_down();
+    state.pick_down();
+    let mut sheet = Sheet::fresh(
+        uuid::Uuid::nil(),
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
+    );
+    sheet.level = 3;
+    sheet.bits = 1300;
+    sheet.weapon_tier = 2;
+    let word = "the armorer hands over the box cutter. 506 bits.";
+    for height in [22, 24, 26] {
+        let screen = render_panel(120, height, &state, &sheet, Some(word), None);
+        for needle in [
+            "▸    3  tire iron",
+            "[↑↓] pick a tier",
+            "[w] tire iron for 937 bits",
+            "[a] padded jacket for 1316 bits",
+            "power equals tier.",
+            word,
+        ] {
+            assert!(
+                screen.contains(needle),
+                "{needle} at {height} rows\n{screen}"
+            );
+        }
+    }
+
+    // The window walks with the cursor to the top of the wall.
+    for _ in 0..12 {
+        state.pick_down();
+    }
+    let screen = render_panel(120, 22, &state, &sheet, Some(word), None);
+    assert!(screen.contains("▸   15  the last broadcast"), "{screen}");
+    assert!(screen.contains("[w] the last broadcast for"), "{screen}");
+}
+
+/// The tailor's last word sits at the foot of the mirror's panel, where
+/// every counter's word goes.
+#[test]
+fn the_tailors_word_sits_at_the_foot_of_the_mirror() {
+    let mut state = State::new();
+    state.open_panel(Landmark::Tailor);
+    let sheet = Sheet::fresh(
+        uuid::Uuid::nil(),
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
+    );
+    let word = "the tailor turns the mirror. that is you now.";
+    let screen = render_panel(120, 40, &state, &sheet, None, Some(word));
+    assert!(screen.contains(word), "{screen}");
+    let (row, _) = spot(&screen, word);
+    let (foot, _) = spot(&screen, " Esc closes ");
+    assert!(
+        row < foot && foot - row <= 2,
+        "the word at the foot\n{screen}"
+    );
+}
+
+/// Dead Air lists what each glass does at this level, and spells the
+/// refusal the row would give ahead of the keys.
+#[test]
+fn dead_air_prices_the_menu_and_says_why_it_would_not_pour() {
+    let mut state = State::new();
+    state.open_panel(Landmark::Bar);
+    let mut sheet = Sheet::fresh(
+        uuid::Uuid::nil(),
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
+    );
+    sheet.level = 8;
+    sheet.signal = 80;
+    sheet.crystals = 2;
+    let till = "static on ice. it goes down like a short circuit. +3 attack until the roll.";
+    let screen = render_with_sheet(&state, &sheet, Some(till));
+    assert!(screen.contains(" dead air "), "{screen}");
+    assert!(
+        screen.contains("crystals 2      in you nothing"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("[s] static on ice     +3 attack"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("[d] dead air, neat    +3 defense"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("[t] test pattern      +16 signal, and filled"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("[f] feedback          a surge in tonight's deck"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("[u] squelch           a burn in tonight's deck"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("[o] sign-off          a mute in tonight's deck"),
+        "{screen}"
+    );
+    assert!(screen.contains(till), "the bartender's last word\n{screen}");
+
+    sheet.crystals = 0;
+    let dry = render_with_sheet(&state, &sheet, None);
+    assert!(
+        dry.contains("a glass is a crystal, and you have none."),
+        "{dry}"
+    );
+
+    sheet.crystals = 1;
+    sheet.drink = Some(crate::app::deadchannel::fight::state::Drink::DeadAirNeat);
+    let poured = render_with_sheet(&state, &sheet, None);
+    assert!(poured.contains("in you dead air, neat"), "{poured}");
+    assert!(
+        poured.contains("one glass a day. you still have the dead air, neat in you."),
+        "{poured}"
+    );
+}
+
+/// INK lists every draft with its two cards, says which are inked, prices
+/// the rest, and offers the key for the picked draft, or spells out why
+/// the needle would not take it in the key's row.
+#[test]
+fn ink_lists_the_drafts_and_says_what_the_needle_will_take() {
+    let mut state = State::new();
+    state.open_panel(Landmark::Ink);
+    state.pick_draft_down();
+    let mut sheet = Sheet::fresh(
+        uuid::Uuid::nil(),
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
+    );
+    sheet.level = 7;
+    sheet.signal = 70;
+    sheet.crystals = 12;
+    let screen = render_with_sheet(&state, &sheet, None);
+    assert!(screen.contains(" ink "), "{screen}");
+    assert!(
+        screen.contains("crystals 12      marks 0      the needle holds 1 more"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("  level 3   jab · brace        for 10 crystals"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("▸ level 6   riposte · bulwark  for 10 crystals"),
+        "the cursor on the level 6 draft\n{screen}"
+    );
+    assert!(screen.contains("[↑↓] pick a draft"), "{screen}");
+    assert!(
+        screen.contains("[i] ink riposte and bulwark for 10 crystals"),
+        "{screen}"
+    );
+
+    sheet.inks = vec![6];
+    sheet.crystals = 4;
+    let inked = render_with_sheet(&state, &sheet, None);
+    assert!(
+        inked.contains("▸ level 6   riposte · bulwark  inked"),
+        "{inked}"
+    );
+    assert!(inked.contains("the needle holds no more"), "{inked}");
+    assert!(
+        inked.contains("the level 6 draft is already in your skin."),
+        "the refusal in the key's row\n{inked}"
+    );
+    assert!(!inked.contains("[i] ink"), "{inked}");
+
+    state.pick_draft_up();
+    let full = render_with_sheet(&state, &sheet, None);
+    assert!(
+        full.contains("the needle has done what it will for you. bring it a mark."),
+        "{full}"
+    );
+
+    sheet.marks = 1;
+    let short = render_with_sheet(&state, &sheet, None);
+    assert!(
+        short.contains("▸ level 3   jab · brace        for 10 crystals, 6 short"),
+        "{short}"
+    );
+    assert!(
+        short.contains("10 crystals to ink jab and brace. you are 6 short."),
+        "{short}"
+    );
+    assert!(!short.contains("bring it a mark"), "{short}");
+}
+
+/// The blade shop prices the next tier up in each slot in crystals, and
+/// says what the wall would ask for it.
+#[test]
+fn the_blade_cart_prices_the_next_tier_up_in_crystals() {
+    let mut state = State::new();
+    state.open_panel(Landmark::Blades);
+    let mut sheet = Sheet::fresh(
+        uuid::Uuid::nil(),
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
+    );
+    sheet.weapon_tier = 3;
+    sheet.armor_tier = 15;
+    sheet.crystals = 3;
+    let screen = render_with_sheet(&state, &sheet, None);
+    assert!(screen.contains(" the blade shop "), "{screen}");
+    assert!(
+        screen.contains("crystals 3      weapon tire iron"),
+        "{screen}"
+    );
+    // Tier 4 for a level 1 runner: three crystals, and two more a tier
+    // past the level.
+    assert!(
+        screen.contains("[w] rebar club for 9 crystals   the wall asks"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("[a] nothing is made past the top of the wall"),
+        "{screen}"
+    );
+}
+
+/// Patch prices the gap against the sheet and spells its refusals ahead
+/// of the key: a dropped signal is the roll's, a full one buys nothing.
+#[test]
+fn patch_prices_the_gap_and_says_when_there_is_nothing_to_buy() {
+    let mut state = State::new();
+    state.open_panel(Landmark::Repairs);
+    let render_with = |state: &State, sheet: Option<&Sheet>| {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    CityView {
+                        state,
+                        own_username: "mira",
+                        look: None,
+                        sheet,
+                        scene: None,
+                        picker: None,
+                        lookout: &Lookout::default(),
+                        till: Some("patch works fast. +18 signal, back to full. 54 bits."),
+                        tailor: tailor_ui::MirrorView {
+                            draft: None,
+                            word: None,
+                            changed: false,
+                            saving: false,
+                        },
+                        guide: &GuideState::new(),
+                        own_user_id: Uuid::nil(),
+                        street: &StreetView::new(),
+                        runner_looks: &HashMap::new(),
+                        usernames: &UsernameLookup::new(&HashMap::new(), None),
+                    },
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut screen = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                screen.push_str(buffer[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        screen
+    };
+
+    let screen = render_with(&state, None);
+    assert!(screen.contains(" patch "), "{screen}");
+    assert!(
+        screen.contains("the sheet has not come down the wire yet."),
+        "{screen}"
+    );
+
+    let mut sheet = Sheet::fresh(
+        uuid::Uuid::nil(),
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
+    );
+    sheet.level = 3;
+    sheet.signal = 12;
+    sheet.bits = 100;
+    let screen = render_with(&state, Some(&sheet));
+    assert!(
+        screen.contains("signal 12/30      on hand 100 bits"),
+        "{screen}"
+    );
+    assert!(screen.contains("[p] patch to full for 54 bits"), "{screen}");
+    assert!(
+        screen.contains("patch works fast. +18 signal, back to full. 54 bits."),
+        "{screen}"
+    );
+
+    sheet.signal = 30;
+    let screen = render_with(&state, Some(&sheet));
+    assert!(
+        screen.contains("nothing on you needs patching."),
+        "{screen}"
+    );
+    assert!(!screen.contains("[p] patch"), "{screen}");
+
+    // Patched today already: the key is not offered again before the roll.
+    sheet.signal = 12;
+    sheet.road.patched = true;
+    let screen = render_with(&state, Some(&sheet));
+    assert!(
+        screen.contains("patched once today already. the roll is the next one."),
+        "{screen}"
+    );
+    assert!(!screen.contains("[p] patch"), "{screen}");
+    sheet.road.patched = false;
+
+    sheet.signal = 0;
+    let screen = render_with(&state, Some(&sheet));
+    assert!(
+        screen.contains("your signal is down. nothing here brings it back before the roll."),
+        "{screen}"
+    );
+
+    // Spent for the day: the roll refills for free, so the key is not
+    // offered.
+    sheet.signal = 12;
+    sheet.rations_left = 0;
+    let screen = render_with(&state, Some(&sheet));
+    assert!(
+        screen.contains("you are spent for today. the roll brings the signal back for nothing."),
+        "{screen}"
+    );
+    assert!(!screen.contains("[p] patch"), "{screen}");
 }
 
 #[test]
@@ -65,7 +609,7 @@ fn the_street_line_pins_what_the_cart_said() {
 
 #[test]
 fn animation_never_paints_over_a_prop() {
-    let scene = Scene::build(12_345, map::SPAWN.0, map::SPAWN.1);
+    let scene = Scene::build(12_345, map::SPAWN.0, map::SPAWN.1, &[]);
     let mut cells = compose_grid(&scene);
     animate(&mut cells, 12_345, &scene);
     for sign in map::SIGNS.iter().chain(map::CART_SIGNS.iter()) {
@@ -83,7 +627,7 @@ fn animation_never_paints_over_a_prop() {
 
 #[test]
 fn light_falls_on_the_street_and_stops_at_walls() {
-    let scene = Scene::build(0, map::SPAWN.0, map::SPAWN.1);
+    let scene = Scene::build(0, map::SPAWN.0, map::SPAWN.1, &[]);
     // The cell next to a street lamp is lit; deep inside a tenement's
     // back rooms, away from every window and door, it is not.
     let lamp = map::LIGHTS
@@ -129,6 +673,22 @@ fn every_cell_sits_on_the_city_night_not_the_theme_canvas() {
                     state: &state,
                     own_username: "mira",
                     look: None,
+                    sheet: None,
+                    scene: None,
+                    picker: None,
+                    lookout: &Lookout::default(),
+                    till: None,
+                    tailor: tailor_ui::MirrorView {
+                        draft: None,
+                        word: None,
+                        changed: false,
+                        saving: false,
+                    },
+                    guide: &GuideState::new(),
+                    own_user_id: Uuid::nil(),
+                    street: &StreetView::new(),
+                    runner_looks: &HashMap::new(),
+                    usernames: &UsernameLookup::new(&HashMap::new(), None),
                 },
             );
         })
@@ -149,7 +709,7 @@ fn the_car_route_is_open_street_end_to_end() {
     // With the car and the train on the street the props still stand.
     let t = 50;
     assert!(car_at(t).is_some(), "the car is out at tick {t}");
-    let scene = Scene::build(t, map::SPAWN.0, map::SPAWN.1);
+    let scene = Scene::build(t, map::SPAWN.0, map::SPAWN.1, &[]);
     let mut cells = compose_grid(&scene);
     animate(&mut cells, t, &scene);
     for sign in map::SIGNS.iter().chain(map::CART_SIGNS.iter()) {
@@ -165,7 +725,7 @@ fn the_car_route_is_open_street_end_to_end() {
 
 #[test]
 fn billboards_scroll_street_copy_across_blank_cells() {
-    let scene = Scene::build(0, map::SPAWN.0, map::SPAWN.1);
+    let scene = Scene::build(0, map::SPAWN.0, map::SPAWN.1, &[]);
     let mut cells = compose_grid(&scene);
     let mut seen: Vec<String> = Vec::new();
     for t in 0..BILLBOARD_CYCLE {
@@ -195,7 +755,7 @@ fn billboards_scroll_street_copy_across_blank_cells() {
 
 #[test]
 fn where_the_runner_stands_is_lit_even_with_no_lamp_near() {
-    let scene = Scene::build(0, map::OPEN.0, map::OPEN.1);
+    let scene = Scene::build(0, map::OPEN.0, map::OPEN.1, &[]);
     assert!(
         luma(scene.light(map::OPEN.0, map::OPEN.1)) > 0.3,
         "the carried light"
@@ -216,7 +776,7 @@ fn looking_over_the_ledge_swaps_the_street_for_the_lower_city() {
 
 #[test]
 fn rain_falls_on_the_street_and_the_drop_but_never_in_a_room() {
-    let scene = Scene::build(0, map::SPAWN.0, map::SPAWN.1);
+    let scene = Scene::build(0, map::SPAWN.0, map::SPAWN.1, &[]);
     let mut cells = compose_grid(&scene);
     let mut outside = 0;
     for t in 0..8u64 {
@@ -237,4 +797,159 @@ fn rain_falls_on_the_street_and_the_drop_but_never_in_a_room() {
         }
     }
     assert!(outside > 100, "the city rains: {outside}");
+}
+
+#[test]
+fn other_runners_stand_on_the_street_with_their_names_and_you_are_not_twice() {
+    let state = State::new();
+    let (mira, kade, nox) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    // Open street a few rows up from the stairs, clear of your own label,
+    // one spot west of you and one east, far enough apart that no label
+    // sits on another.
+    let (sx, sy) = map::SPAWN;
+    let open = |xs: &mut dyn Iterator<Item = u16>| {
+        xs.flat_map(|x| (sy - 6..=sy - 3).map(move |y| (x, y)))
+            .find(|&(x, y)| map::walkable(x, y))
+            .expect("open street near the stairs")
+    };
+    let west = open(&mut (sx - 20..=sx - 8).rev());
+    let east = open(&mut (sx + 8..=sx + 20));
+    let street: StreetView = [
+        (kade, west, true),
+        (nox, east, false),
+        // Your own entry (the street's copy of you) is not drawn: the
+        // runner under your keys is.
+        (mira, east, true),
+    ]
+    .into_iter()
+    .map(|(user_id, (x, y), present)| (user_id, StreetRunner { x, y, present }))
+    .collect();
+    let names: HashMap<Uuid, String> = [
+        (mira, "mira".to_string()),
+        (kade, "kade".to_string()),
+        (nox, "nox".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let usernames = UsernameLookup::new(&names, None);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            draw(
+                frame,
+                frame.area(),
+                CityView {
+                    state: &state,
+                    own_username: "mira",
+                    look: None,
+                    sheet: None,
+                    scene: None,
+                    picker: None,
+                    lookout: &Lookout::default(),
+                    till: None,
+                    tailor: tailor_ui::MirrorView {
+                        draft: None,
+                        word: None,
+                        changed: false,
+                        saving: false,
+                    },
+                    guide: &GuideState::new(),
+                    own_user_id: mira,
+                    street: &street,
+                    runner_looks: &HashMap::new(),
+                    usernames: &usernames,
+                },
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            screen.push_str(buffer[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    assert!(screen.contains("kade"), "a runner who is looking\n{screen}");
+    assert!(screen.contains("nox"), "a runner who is away\n{screen}");
+    assert_eq!(screen.matches("mira").count(), 1, "you, once\n{screen}");
+}
+
+#[test]
+fn a_runner_who_is_looking_carries_a_light_and_one_who_is_away_does_not() {
+    let (px, py) = map::SPAWN;
+    let lonely = Scene::build(0, px, py, &[]);
+    let with_company = Scene::build(0, px, py, &[map::OPEN]);
+    let (ox, oy) = map::OPEN;
+    assert!(
+        luma(with_company.light(ox, oy)) > luma(lonely.light(ox, oy)) + 0.3,
+        "the other runner's pool of light"
+    );
+
+    // Side by side under the same light, the one who is looking is the
+    // brighter mark.
+    let street: StreetView = [
+        (
+            Uuid::now_v7(),
+            StreetRunner {
+                x: px + 1,
+                y: py,
+                present: true,
+            },
+        ),
+        (
+            Uuid::now_v7(),
+            StreetRunner {
+                x: px + 1,
+                y: py,
+                present: false,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let brightness = |present: bool| {
+        let street: StreetView = street
+            .iter()
+            .filter(|(_, runner)| runner.present == present)
+            .map(|(id, runner)| (*id, *runner))
+            .collect();
+        let state = State::new();
+        let guide = GuideState::new();
+        let names = HashMap::new();
+        let usernames = UsernameLookup::new(&names, None);
+        let looks = HashMap::new();
+        let view = CityView {
+            state: &state,
+            own_username: "mira",
+            look: None,
+            sheet: None,
+            scene: None,
+            picker: None,
+            lookout: &Lookout::default(),
+            till: None,
+            tailor: tailor_ui::MirrorView {
+                draft: None,
+                word: None,
+                changed: false,
+                saving: false,
+            },
+            guide: &guide,
+            own_user_id: Uuid::nil(),
+            street: &street,
+            runner_looks: &looks,
+            usernames: &usernames,
+        };
+        let mut cells = compose_grid(&lonely);
+        draw_others(&mut cells, &lonely, &view);
+        let (ch, style) = cells[usize::from(py)][usize::from(px + 1)];
+        assert_eq!(ch, '@');
+        match style.fg {
+            Some(Color::Rgb(r, g, b)) => u32::from(r) + u32::from(g) + u32::from(b),
+            other => panic!("the mark has a fixed RGB color, got {other:?}"),
+        }
+    };
+    assert!(brightness(true) > brightness(false));
 }

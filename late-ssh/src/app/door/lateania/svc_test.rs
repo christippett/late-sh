@@ -25,6 +25,7 @@ fn craft_entry(name: &str, skill: &str) -> CraftEntryView {
         worn_stats: None,
         desc: "",
         category: "Goods",
+        held: None,
         craftable: true,
         reason: String::new(),
     }
@@ -317,6 +318,63 @@ fn crafting_needs_both_the_station_and_the_materials() {
 }
 
 #[test]
+fn the_craft_panel_leads_with_alchemy_and_counts_the_made_goods_you_hold() {
+    use super::super::items::{ingot_id, potion_id, smith_weapon_id};
+    let mut s = world();
+    s.join(uid(1));
+    s.choose_class(uid(1), Class::Warrior);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.room = 3; // Embergate's crafters' row: all five stations
+        p.inventory
+            .extend([potion_id(0), potion_id(0), potion_id(0)]);
+        p.inventory.extend([ingot_id(0), ingot_id(0)]);
+    }
+    let craft = s.snapshot().players[&uid(1)]
+        .crafting
+        .clone()
+        .expect("stations stand in room 3");
+
+    // Alchemy is the trade worked most, so it opens the list.
+    let mut trades: Vec<&str> = Vec::new();
+    for e in &craft.entries {
+        if !trades.contains(&e.skill.as_str()) {
+            trades.push(&e.skill);
+        }
+    }
+    assert_eq!(
+        trades,
+        [
+            "Alchemy",
+            "Smithing",
+            "Woodworking",
+            "Leatherworking",
+            "Cooking"
+        ]
+    );
+    assert_eq!(
+        craft.stations,
+        "alchemy lab, forge, workbench, tannery, cooking fire"
+    );
+
+    // A stock good carries how many are already in the pack; gear (weighed
+    // against what is worn) and a crafted material (an ingot is a resource)
+    // carry none.
+    let held = |id: u32| {
+        craft
+            .entries
+            .iter()
+            .find(|e| e.item_id == id)
+            .expect("the recipe is listed")
+            .held
+    };
+    assert_eq!(held(potion_id(0)), Some(3));
+    assert_eq!(held(potion_id(1)), Some(0));
+    assert_eq!(held(ingot_id(0)), None);
+    assert_eq!(held(smith_weapon_id(0)), None);
+}
+
+#[test]
 fn craft_skill_xp_survives_a_save_load_round_trip() {
     let mut s = world();
     s.join(uid(1));
@@ -357,12 +415,11 @@ fn a_poison_coats_the_weapon_instead_of_being_drunk() {
 #[test]
 fn a_coated_weapon_poisons_the_foe_and_spends_a_charge() {
     let (mut s, mob_id) = engaged_with(MobBehavior::Brute);
-    s.players.get_mut(&uid(1)).unwrap().weapon_coat =
-        Some((DamageType::Poison, 10, POISON_CHARGES));
+    s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Poison, 10, COAT_CHARGES));
     s.tick();
     assert_eq!(
         s.players[&uid(1)].weapon_coat.map(|(_, _, c)| c),
-        Some(POISON_CHARGES - 1),
+        Some(COAT_CHARGES - 1),
         "a landed strike spends one poison charge"
     );
     assert!(
@@ -388,10 +445,224 @@ fn an_oil_coats_the_weapon_with_its_school_and_replaces_the_last_coat() {
     let p = &s.players[&uid(1)];
     assert_eq!(
         p.weapon_coat,
-        Some((DamageType::Fire, OIL_PER_TICK[2], OIL_CHARGES)),
+        Some((DamageType::Fire, COAT_PER_TICK[2], COAT_CHARGES)),
         "the oil takes the one coat slot, replacing the poison"
     );
     assert!(!p.inventory.contains(&oil), "the vial is used up");
+}
+
+#[test]
+fn the_coat_key_picks_the_school_the_foe_is_weak_to_over_the_better_vial() {
+    // The whole reason the key can't just grab the biggest vial: every coat
+    // carries the same rider, so the school is the entire decision, and the
+    // foe in front of you is the only thing that answers it.
+    let (mut s, mob_id) = engaged_with(MobBehavior::Brute);
+    s.mobs.get_mut(&mob_id).unwrap().spawn.profile =
+        DamageProfile::new(DamageType::Physical, None, Some(DamageType::Frost));
+    let top_fire = super::super::items::oil_id(0, 5);
+    let weak_frost = super::super::items::oil_id(1, 0);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.inventory.push(top_fire);
+        p.inventory.push(weak_frost);
+    }
+    s.coat_best(uid(1));
+    assert_eq!(
+        s.players[&uid(1)].weapon_coat.map(|(school, _, _)| school),
+        Some(DamageType::Frost),
+        "the tier-0 frost oil beats the tier-5 fire one against a frost-weak foe"
+    );
+    assert!(
+        s.players[&uid(1)].inventory.contains(&top_fire),
+        "and the fire oil is still in the bag, unspent"
+    );
+}
+
+#[test]
+fn the_coat_key_avoids_a_school_the_foe_resists_and_falls_back_to_tier() {
+    let (mut s, mob_id) = engaged_with(MobBehavior::Brute);
+    // Resists fire, weak to nothing a coat can bring.
+    s.mobs.get_mut(&mob_id).unwrap().spawn.profile =
+        DamageProfile::new(DamageType::Physical, Some(DamageType::Fire), None);
+    let top_fire = super::super::items::oil_id(0, 5);
+    let lesser_frost = super::super::items::oil_id(1, 3);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.inventory.push(top_fire);
+        p.inventory.push(lesser_frost);
+    }
+    s.coat_best(uid(1));
+    assert_eq!(
+        s.players[&uid(1)].weapon_coat.map(|(school, _, _)| school),
+        Some(DamageType::Frost),
+        "a halved tier-5 rider loses to a full tier-3 one"
+    );
+}
+
+#[test]
+fn the_coat_key_takes_the_highest_tier_when_nothing_is_locked_on() {
+    // At a zone gate there is no foe to read, so the pick falls through to
+    // tier. This is the common case - coating is a thing you do before you
+    // walk in, not mid-swing.
+    let mut s = world();
+    s.join(uid(1));
+    s.choose_class(uid(1), Class::Warrior);
+    let low = super::super::items::oil_id(3, 1);
+    let high = super::super::items::oil_id(3, 4);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.inventory.push(low);
+        p.inventory.push(high);
+    }
+    s.coat_best(uid(1));
+    assert_eq!(
+        s.players[&uid(1)].weapon_coat,
+        Some((DamageType::Lightning, COAT_PER_TICK[4], COAT_CHARGES)),
+        "with no foe to read, the best coat is simply the best coat"
+    );
+}
+
+#[test]
+fn the_coat_key_refuses_to_throw_away_a_healthy_coat_of_the_same_school() {
+    // The one way a one-keystroke coat could cost you something: overwriting a
+    // coat that still had most of its strikes left. A nearly spent one still
+    // tops up, because that is what you actually want before a boss.
+    let mut s = world();
+    s.join(uid(1));
+    s.choose_class(uid(1), Class::Warrior);
+    let oil = super::super::items::oil_id(0, 3);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.inventory.push(oil);
+        p.inventory.push(oil);
+        p.weapon_coat = Some((DamageType::Fire, COAT_PER_TICK[3], COAT_CHARGES));
+    }
+    s.coat_best(uid(1));
+    assert_eq!(
+        s.players[&uid(1)]
+            .inventory
+            .iter()
+            .filter(|&&i| i == oil)
+            .count(),
+        2,
+        "a full fire coat is not replaced by another fire oil"
+    );
+    s.players.get_mut(&uid(1)).unwrap().weapon_coat =
+        Some((DamageType::Fire, COAT_PER_TICK[3], COAT_TOPUP_AT));
+    s.coat_best(uid(1));
+    assert_eq!(
+        s.players[&uid(1)].weapon_coat.map(|(_, _, c)| c),
+        Some(COAT_CHARGES),
+        "but a nearly spent one tops back up to full"
+    );
+}
+
+#[test]
+fn the_coat_key_keeps_a_healthy_coat_of_another_school_when_nothing_calls_for_a_switch() {
+    // The cross-school version of the same promise. A better vial in the bag
+    // is not a reason to throw away thirty-nine strikes: with no foe locked
+    // on, or a foe that is neutral to both, the key refuses and spends
+    // nothing.
+    let mut s = world();
+    s.join(uid(1));
+    s.choose_class(uid(1), Class::Warrior);
+    let top_fire = super::super::items::oil_id(0, 5);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.inventory.push(top_fire);
+        p.weapon_coat = Some((DamageType::Frost, COAT_PER_TICK[0], COAT_CHARGES - 1));
+    }
+    s.coat_best(uid(1));
+    assert_eq!(
+        s.players[&uid(1)].weapon_coat,
+        Some((DamageType::Frost, COAT_PER_TICK[0], COAT_CHARGES - 1)),
+        "with no foe to read, the healthy frost coat stays"
+    );
+    assert!(
+        s.players[&uid(1)].inventory.contains(&top_fire),
+        "and the fire oil is still in the bag"
+    );
+    assert!(
+        s.players[&uid(1)]
+            .log
+            .iter()
+            .any(|l| l.text.contains("already carries frost")),
+        "and the refusal names the coat that is on the weapon"
+    );
+
+    // A foe neutral to both schools is no better a reason.
+    let (mut s, mob_id) = engaged_with(MobBehavior::Brute);
+    s.mobs.get_mut(&mob_id).unwrap().spawn.profile =
+        DamageProfile::new(DamageType::Physical, None, None);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.inventory.push(top_fire);
+        p.weapon_coat = Some((DamageType::Frost, COAT_PER_TICK[0], COAT_CHARGES - 1));
+    }
+    s.coat_best(uid(1));
+    assert_eq!(
+        s.players[&uid(1)]
+            .weapon_coat
+            .map(|(school, _, c)| (school, c)),
+        Some((DamageType::Frost, COAT_CHARGES - 1)),
+        "a neutral foe leaves the healthy coat alone too"
+    );
+}
+
+#[test]
+fn the_coat_key_switches_a_healthy_coat_only_when_the_foe_calls_for_it() {
+    // The two matchup upgrades that are worth a coat's remaining strikes: the
+    // foe is weak to what the bag holds, or resists what the weapon carries.
+    let (mut s, mob_id) = engaged_with(MobBehavior::Brute);
+    s.mobs.get_mut(&mob_id).unwrap().spawn.profile =
+        DamageProfile::new(DamageType::Physical, None, Some(DamageType::Fire));
+    let fire = super::super::items::oil_id(0, 2);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.inventory.push(fire);
+        p.weapon_coat = Some((DamageType::Frost, COAT_PER_TICK[5], COAT_CHARGES));
+    }
+    s.coat_best(uid(1));
+    assert_eq!(
+        s.players[&uid(1)].weapon_coat,
+        Some((DamageType::Fire, COAT_PER_TICK[2], COAT_CHARGES)),
+        "a foe weak to fire is worth dropping a full frost coat for"
+    );
+
+    let (mut s, mob_id) = engaged_with(MobBehavior::Brute);
+    s.mobs.get_mut(&mob_id).unwrap().spawn.profile =
+        DamageProfile::new(DamageType::Physical, Some(DamageType::Frost), None);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.inventory.push(fire);
+        p.weapon_coat = Some((DamageType::Frost, COAT_PER_TICK[5], COAT_CHARGES));
+    }
+    s.coat_best(uid(1));
+    assert_eq!(
+        s.players[&uid(1)].weapon_coat,
+        Some((DamageType::Fire, COAT_PER_TICK[2], COAT_CHARGES)),
+        "a foe that resists the live coat is worth replacing it over"
+    );
+}
+
+#[test]
+fn the_coat_key_says_so_when_the_bag_is_empty_instead_of_coating_nothing() {
+    let mut s = world();
+    s.join(uid(1));
+    s.choose_class(uid(1), Class::Warrior);
+    s.players.get_mut(&uid(1)).unwrap().inventory.clear();
+    s.coat_best(uid(1));
+    assert!(
+        s.players[&uid(1)].weapon_coat.is_none(),
+        "nothing is coated"
+    );
+    assert!(
+        s.players[&uid(1)]
+            .log
+            .iter()
+            .any(|l| l.text.contains("no coating")),
+        "and the player is told why"
+    );
 }
 
 #[test]
@@ -423,50 +694,71 @@ fn the_attack_bar_still_matches_a_real_character() {
 }
 
 #[test]
-fn the_coat_curves_stay_inside_their_share_of_the_bar() {
+fn the_coat_curve_stays_inside_its_share_of_the_bar() {
     // The balance contract for weapon coats, in the only terms that mean
-    // anything: what fraction of a real swing the rider is worth. An oil
-    // sustains about a fifth of the auto for a whole fight; a poison bursts
-    // about a third of it for a handful of strikes. Both are held to a band,
-    // and both are held to it at *every* tier, so the curves can never quietly
-    // outgrow the attack curve the way they did before.
+    // anything: what fraction of a real swing the rider is worth. One curve
+    // covers every coat in the game now, held to its band at *every* tier, so
+    // it can never quietly outgrow the attack curve the way it did before.
     for t in 0..6usize {
         let bar = TIER_ATTACK_BAR[t] as f64;
-        let oil = OIL_PER_TICK[t] as f64 / bar;
-        let poison = POISON_PER_TICK[t] as f64 / bar;
+        let share = COAT_PER_TICK[t] as f64 / bar;
         assert!(
-            (0.15..=0.22).contains(&oil),
-            "tier {t}: oil rider is {oil:.3} of the bar, outside the sustain band"
-        );
-        assert!(
-            (0.24..=0.32).contains(&poison),
-            "tier {t}: poison rider is {poison:.3} of the bar, outside the burst band"
-        );
-        assert!(
-            POISON_PER_TICK[t] > OIL_PER_TICK[t],
-            "tier {t}: poison must hit harder per tick than oil, or it is dead content"
+            (0.15..=0.22).contains(&share),
+            "tier {t}: coat rider is {share:.3} of the bar, outside the band"
         );
     }
-    // And the shape that keeps them from being the same item: the poison
-    // bursts, the oil lasts. A coat wound is live for its charges plus the
-    // trailing POISON_DOT_TICKS after the final swing.
-    let ticks = |charges: u8| (charges + POISON_DOT_TICKS - 1) as f64;
-    let oil_total = ticks(OIL_CHARGES) * OIL_PER_TICK[5] as f64;
-    let poison_total = ticks(POISON_CHARGES) * POISON_PER_TICK[5] as f64;
-    assert!(
-        poison_total < oil_total,
-        "the cheap vial must not out-total the prepared coat"
-    );
-    assert!(
-        poison_total / oil_total > 0.6,
-        "but it must stay a real alternative, not a strictly worse one"
+    // The curve climbs with the tier the whole way up, or the top tiers are
+    // dead content nobody would gather for.
+    for t in 1..6usize {
+        assert!(
+            COAT_PER_TICK[t] > COAT_PER_TICK[t - 1],
+            "tier {t}: the coat curve must keep climbing"
+        );
+    }
+}
+
+#[test]
+fn every_coat_in_the_game_carries_the_same_rider_and_differs_only_by_school() {
+    // Poison and oil were two curves for one mechanic, and the split was an
+    // accident of order: the vial shipped with crafting, the oils arrived with
+    // the resist/weak pass, and poison simply kept the older constants. This
+    // pins the merge - if a second curve is ever reintroduced, it should be
+    // because someone decided to, not because a family drifted.
+    use super::super::items::{COAT_SCHOOLS, coat_school_tier, item, oil_id, poison_id};
+    let mut seen: Vec<DamageType> = Vec::new();
+    let coats = (0..6u32)
+        .flat_map(|t| {
+            (0..4u32)
+                .map(move |s| oil_id(s, t))
+                .chain(std::iter::once(poison_id(t)))
+        })
+        .collect::<Vec<_>>();
+    for id in coats {
+        let (school, tier) = coat_school_tier(id).expect("every coat resolves a school and tier");
+        if !seen.contains(&school) {
+            seen.push(school);
+        }
+        let it = item(id).expect("coat exists");
+        assert_eq!(
+            it.sell_price(),
+            item(oil_id(0, tier)).expect("fire oil exists").sell_price(),
+            "{} is priced as the same tier of coat, not as its own family",
+            it.name
+        );
+    }
+    seen.sort_by_key(|d| format!("{d:?}"));
+    let mut want = COAT_SCHOOLS.to_vec();
+    want.sort_by_key(|d| format!("{d:?}"));
+    assert_eq!(
+        seen, want,
+        "the five coat schools are exactly what the catalog produces"
     );
 }
 
 #[test]
 fn a_coat_keeps_one_refreshing_wound_however_many_swings_land() {
     // A coat re-seeds on every landed strike, at the very cadence its DoT
-    // ticks. If each strike opened its own wound, POISON_DOT_TICKS of them
+    // ticks. If each strike opened its own wound, COAT_DOT_TICKS of them
     // would be live at once and the rider would be paid three times over -
     // which is not the bar the grind-rate budget is written against. One
     // wound per attacker, refreshed, is the contract.
@@ -477,7 +769,7 @@ fn a_coat_keeps_one_refreshing_wound_however_many_swings_land() {
     if let Some(m) = s.mobs.get_mut(&mob_id) {
         m.spawn.profile = DamageProfile::new(DamageType::Physical, None, None);
     }
-    s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Fire, 10, OIL_CHARGES));
+    s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Fire, 10, COAT_CHARGES));
     for _ in 0..5 {
         s.tick();
     }
@@ -502,7 +794,7 @@ fn ability_dots_still_stack_on_top_of_a_coat() {
     // keeps stacking (its cooldown is what rations it), and it stacks
     // alongside the coat's single wound rather than refreshing it.
     let (mut s, mob_id) = engaged_with(MobBehavior::Brute);
-    s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Fire, 10, OIL_CHARGES));
+    s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Fire, 10, COAT_CHARGES));
     s.tick();
     s.seed_mob_dot(
         uid(1),
@@ -533,7 +825,7 @@ fn an_oiled_strike_rides_the_zone_profile() {
     if let Some(m) = s.mobs.get_mut(&mob_id) {
         m.spawn.profile = DamageProfile::new(DamageType::Physical, None, Some(DamageType::Fire));
     }
-    s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Fire, 10, OIL_CHARGES));
+    s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Fire, 10, COAT_CHARGES));
     s.tick();
     let seeded = s
         .mob_dots
@@ -688,6 +980,70 @@ fn abilities_scale_with_spell_power_and_the_auto_swings_by_calling() {
         100_000 - 46 - 19,
         "the auto swings for half the rating"
     );
+}
+
+#[test]
+fn swapping_abilities_reorders_the_bar_and_survives_save_load() {
+    let mut s = world();
+    s.join(uid(1));
+    s.choose_class(uid(1), Class::Mage);
+    s.players.get_mut(&uid(1)).unwrap().level = 50;
+
+    let before = s.snapshot().players[&uid(1)].abilities.clone();
+    assert!(before.len() >= 8, "a Mage at 50 has a deep kit");
+    let first = before[0].name.clone();
+    let second = before[1].name.clone();
+    assert_ne!(first, second);
+
+    s.swap_abilities(uid(1), 1, 2);
+
+    let after = s.snapshot().players[&uid(1)].abilities.clone();
+    assert_eq!(after[0].name, second, "slot 1 now holds the old slot 2");
+    assert_eq!(after[1].name, first, "slot 2 now holds the old slot 1");
+
+    // The new order is part of the save and comes back after a reload.
+    let saved = s.export_saved(uid(1)).expect("classed characters export");
+    let mut s2 = world();
+    s2.join(uid(1));
+    s2.hydrate(uid(1), &saved);
+    let reloaded = s2.snapshot().players[&uid(1)].abilities.clone();
+    assert_eq!(reloaded[0].name, second, "the swap survives a save/load");
+    assert_eq!(reloaded[1].name, first, "both slots keep their new places");
+}
+
+#[test]
+fn resetting_the_ability_order_restores_natural_order() {
+    let mut s = world();
+    s.join(uid(1));
+    s.choose_class(uid(1), Class::Mage);
+    s.players.get_mut(&uid(1)).unwrap().level = 50;
+
+    let natural = s.snapshot().players[&uid(1)].abilities.clone();
+    assert!(natural.len() >= 8, "a Mage at 50 has a deep kit");
+
+    s.swap_abilities(uid(1), 1, 2);
+    let swapped = s.snapshot().players[&uid(1)].abilities.clone();
+    assert_ne!(swapped[0].name, natural[0].name, "the swap took effect");
+    assert!(
+        !s.players[&uid(1)].ability_order.is_empty(),
+        "a swap records a custom order"
+    );
+
+    s.reset_ability_order(uid(1));
+    let reset = s.snapshot().players[&uid(1)].abilities.clone();
+    assert_eq!(
+        reset.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+        natural.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+        "resetting returns the bar to the natural order"
+    );
+    assert!(
+        s.players[&uid(1)].ability_order.is_empty(),
+        "resetting clears the saved order"
+    );
+
+    // Idempotent: resetting an already-natural bar changes nothing.
+    s.reset_ability_order(uid(1));
+    assert!(s.players[&uid(1)].ability_order.is_empty());
 }
 
 #[test]
@@ -1599,6 +1955,35 @@ fn monk_iron_body_blunts_physical_but_not_elemental() {
     assert!(
         physical < fire,
         "Iron Body should reduce physical but not fire ({physical} vs {fire})"
+    );
+}
+
+#[test]
+fn reaching_the_level_cap_announces_the_real_cap() {
+    let mut s = world();
+    s.join(uid(1));
+    s.choose_class(uid(1), Class::Warrior);
+    {
+        let p = s.players.get_mut(&uid(1)).unwrap();
+        p.level = Class::MAX_LEVEL - 1;
+        p.xp = xp_for_level(Class::MAX_LEVEL);
+    }
+    s.check_level_up(uid(1));
+    let texts: Vec<String> = s.players[&uid(1)]
+        .log
+        .iter()
+        .map(|l| l.text.clone())
+        .collect();
+    let cap = format!("level {}", Class::MAX_LEVEL);
+    let pinnacle: Vec<&String> = texts.iter().filter(|t| t.contains("pinnacle")).collect();
+    assert_eq!(
+        pinnacle.len(),
+        2,
+        "personal and world announcements: {texts:?}"
+    );
+    assert!(
+        pinnacle.iter().all(|t| t.contains(&cap)),
+        "the pinnacle names the real cap: {pinnacle:?}"
     );
 }
 
@@ -2710,6 +3095,47 @@ fn taming_a_beast_makes_it_your_companion_and_trains_the_trade() {
 }
 
 #[test]
+fn a_kill_trains_taming_only_beside_a_standing_companion() {
+    let mut s = world();
+    let species = super::super::pets::pet_species_by_key("war_hound").unwrap();
+    for n in 1..=3 {
+        s.join(uid(n));
+        s.choose_class(uid(n), Class::Ranger);
+    }
+    // uid(1) fights beside a standing hound, uid(2) has no companion, and
+    // uid(3)'s hound is beaten down.
+    s.players.get_mut(&uid(1)).unwrap().pet = Some(super::super::pets::Pet::new(species, 0));
+    let mut downed = super::super::pets::Pet::new(species, 0);
+    downed.downed = true;
+    s.players.get_mut(&uid(3)).unwrap().pet = Some(downed);
+    let (mob_id, mob_xp) = s
+        .mobs
+        .iter()
+        .map(|(id, m)| (*id, m.spawn.xp))
+        .max_by_key(|(_, xp)| *xp)
+        .expect("world has mobs");
+    for n in 1..=3 {
+        s.kill_mob(uid(n), mob_id);
+    }
+    let expected = i64::from(mob_xp) * 15 / 100;
+    assert!(expected > 0, "the richest foe is worth some taming");
+    assert_eq!(s.players[&uid(1)].taming_xp, expected);
+    assert!(
+        s.players[&uid(1)]
+            .log
+            .iter()
+            .any(|l| l.text.contains(&format!("+{expected} Animal Taming xp"))),
+        "the kill line names the taming share"
+    );
+    assert_eq!(s.players[&uid(2)].taming_xp, 0, "no companion, no taming");
+    assert_eq!(
+        s.players[&uid(3)].taming_xp,
+        0,
+        "a downed companion did not fight"
+    );
+}
+
+#[test]
 fn an_underskilled_tamer_cannot_take_a_great_beast() {
     let mut s = world();
     s.join(uid(1));
@@ -3510,6 +3936,40 @@ fn loading_saved_character_reconciles_level_from_xp() {
         view.abilities.iter().any(|a| a.name == "Frost Nova"),
         "restored level should update unlocked skills"
     );
+}
+
+// The rows that pick a spell are where the school has to be: the battle panel
+// already names the foe's attack school and its weak/resist, and both ability
+// lists (`v` and the battle side panel) render this one string.
+#[test]
+fn the_ability_rows_a_player_sees_carry_the_school_they_land_in() {
+    let mut s = world();
+    s.join(uid(1));
+    s.choose_class(uid(1), Class::Runemaster);
+    let mut saved = s.export_saved(uid(1)).expect("character saves");
+    saved.level = 1;
+    saved.xp = xp_for_level(16);
+    s.hydrate(uid(1), &saved);
+
+    let snap = s.snapshot();
+    let view = snap.players.get(&uid(1)).expect("player view");
+    let row = |name: &str| {
+        view.abilities
+            .iter()
+            .find(|a| a.name == name)
+            .unwrap_or_else(|| panic!("a level 16 Runemaster knows {name}"))
+            .effect
+            .clone()
+    };
+
+    // One Fire among four Arcane - the whole reason the row has to say it.
+    assert_eq!(row("Force Rune"), "arcane damage");
+    assert_eq!(row("Graven Rune"), "fire damage over time");
+    assert_eq!(row("Binding Rune"), "arcane stun");
+    // A ward and an empower never reach `damage_target`, so their rows claim
+    // no school rather than showing the inert one the roster carries.
+    assert_eq!(row("Ward Rune"), "shield");
+    assert_eq!(row("Overcharge"), "empower");
 }
 
 #[test]
@@ -5556,11 +6016,11 @@ fn the_top_poison_tier_is_no_longer_a_clone_of_the_fourth() {
     s.use_item(uid(1), vial);
     assert_eq!(
         s.players[&uid(1)].weapon_coat,
-        Some((DamageType::Poison, POISON_PER_TICK[5], POISON_CHARGES)),
+        Some((DamageType::Poison, COAT_PER_TICK[5], COAT_CHARGES)),
         "tier 5 continues the per-tick curve instead of clamping to tier 4's"
     );
     assert!(
-        POISON_PER_TICK[5] > POISON_PER_TICK[4],
+        COAT_PER_TICK[5] > COAT_PER_TICK[4],
         "and the curve really does keep climbing at the top"
     );
 }
@@ -5572,10 +6032,11 @@ fn the_active_coat_shows_on_the_player_view() {
     s.choose_class(uid(1), Class::Warrior);
     s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Fire, 21, 8));
     let view = s.snapshot().players[&uid(1)].clone();
+    let coat = view.coat.expect("the view carries the live coat");
     assert_eq!(
-        view.coat.as_deref(),
-        Some("fire coat x8"),
-        "the battle panels read the coat from the view"
+        (coat.school.as_str(), coat.charges),
+        ("fire", 8),
+        "the battle panels and the action-bar chip read the coat from the view"
     );
 }
 
@@ -5590,7 +6051,7 @@ fn a_coated_weapon_works_in_a_duel_too() {
     s.players.get_mut(&uid(1)).unwrap().room = pvp_room;
     s.players.get_mut(&uid(2)).unwrap().room = pvp_room;
     s.engage_player(uid(1), uid(2));
-    s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Fire, 10, OIL_CHARGES));
+    s.players.get_mut(&uid(1)).unwrap().weapon_coat = Some((DamageType::Fire, 10, COAT_CHARGES));
     s.tick();
     assert!(
         s.pvp_dots.get(&uid(2)).is_some_and(|d| d.iter().any(|dot| {
@@ -5600,13 +6061,13 @@ fn a_coated_weapon_works_in_a_duel_too() {
     );
     assert_eq!(
         s.players[&uid(1)].weapon_coat.map(|(_, _, c)| c),
-        Some(OIL_CHARGES - 1),
+        Some(COAT_CHARGES - 1),
         "the duel swing spends one coat charge"
     );
     // And the one-wound rule holds in a duel too. It matters more here than
     // against a mob: a pvp dot is *not* pre-scaled, so each tick is charged
     // against the victim's armor live, and a stacking coat would have made a
-    // 12-charge vial worth a third of an endgame duel all by itself.
+    // full coat worth a large slice of an endgame duel all by itself.
     // Both duellists need the hit points to still be trading blows five
     // swings in, or the wound count below only proves someone died.
     for id in [uid(1), uid(2)] {

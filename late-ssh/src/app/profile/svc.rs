@@ -7,7 +7,8 @@ use late_core::models::bonsai_decay_protection::BonsaiDecayProtection;
 use late_core::models::chat_message_gild::{ChatMessageGild, GildCounts};
 use late_core::models::chips::{MonthChips, PROFILE_LEDGER_ROWS, UserChips};
 use late_core::models::crown::CrownReign;
-use late_core::models::drink_round::DrinkRound;
+use late_core::models::deadchannel_runner::DeadchannelRunner;
+use late_core::models::drink_round::{DrinkCredit, DrinkRound};
 use late_core::models::game_payout::GamePayout;
 use late_core::models::irc_token::IrcToken;
 use late_core::models::marketplace;
@@ -19,8 +20,9 @@ use late_core::models::profile_award::{
     ProfileAward, find_profile_awards_by_ids, list_profile_awards_for_user,
 };
 use late_core::models::quest;
+use late_core::models::showcase::Showcase;
 use late_core::models::user::{
-    FirstContactHitCaps, FirstContactHitClaim, User, sanitize_username_input,
+    FirstContactHitCaps, FirstContactHitClaim, InteractionMode, User, sanitize_username_input,
 };
 use late_core::models::user_ssh_key::{KeyLayout, UserSshKey};
 use tokio_postgres::error::SqlState;
@@ -43,6 +45,8 @@ use crate::usernames::{self, UsernameDirectory};
 pub struct ProfileService {
     db: Db,
     snapshot_txs: Arc<Mutex<HashMap<Uuid, watch::Sender<ProfileSnapshot>>>>,
+    interaction_mode_writes: Arc<Mutex<HashMap<Uuid, watch::Sender<InteractionMode>>>>,
+    profile_edit_writes: Arc<Mutex<HashMap<Uuid, watch::Sender<ProfileParams>>>>,
     evt_tx: broadcast::Sender<ProfileEvent>,
     active_users: ActiveUsers,
     username_directory: Option<UsernameDirectory>,
@@ -58,6 +62,17 @@ pub struct ProfilePet {
     pub name: Option<String>,
 }
 
+/// What a profile shows of a runner: the face and the sheet, for the
+/// runner section. Present only while the viewed user stands on the row
+/// (`deadchannel_runners.left_at` unset); a look or sheet the row cannot
+/// parse is logged and shown as no runner, the way the directory treats
+/// it, so one bad row never blanks a profile.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfileRunner {
+    pub look: crate::app::deadchannel::runner::state::Look,
+    pub sheet: crate::app::deadchannel::fight::state::Sheet,
+}
+
 #[derive(Clone, Default)]
 pub struct ProfileSnapshot {
     pub user_id: Option<Uuid>,
@@ -69,6 +84,8 @@ pub struct ProfileSnapshot {
     /// The Pet Companion, for owners only, in the mood its owner's session
     /// last left it in.
     pub pet: Option<ProfilePet>,
+    /// The standing runner behind this profile, if any.
+    pub runner: Option<ProfileRunner>,
     pub profile_awards: Vec<ProfileAward>,
     /// Gilds this profile's owner has received, per tier.
     pub gild_counts: GildCounts,
@@ -80,6 +97,8 @@ pub struct ProfileSnapshot {
     pub chip_ledger: Vec<LedgerRow>,
     /// This UTC month's earned (the board's own figure) and net.
     pub chips_month: MonthChips,
+    /// Every showcase this profile's owner has posted, newest first.
+    pub showcases: Vec<Showcase>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +177,8 @@ impl ProfileService {
         Self {
             db,
             snapshot_txs: Arc::new(Mutex::new(HashMap::new())),
+            interaction_mode_writes: Arc::new(Mutex::new(HashMap::new())),
+            profile_edit_writes: Arc::new(Mutex::new(HashMap::new())),
             evt_tx,
             active_users,
             username_directory: None,
@@ -258,11 +279,37 @@ impl ProfileService {
         } else {
             None
         };
+        let runner = match DeadchannelRunner::find_by_user(&client, user_id).await? {
+            Some(row) if row.left_at.is_none() => {
+                let look = crate::app::deadchannel::runner::state::Look::parse(&row.look);
+                let sheet = crate::app::deadchannel::fight::state::Sheet::from_row(&row);
+                match (look, sheet) {
+                    (Ok(look), Ok(mut sheet)) => {
+                        // The lazy day roll, applied to the view only: the
+                        // row rolls on the runner's next touch, and until
+                        // then it can hold yesterday's dead signal. Nothing
+                        // is written here; the fight service owns the row.
+                        sheet.settle(crate::app::deadchannel::fight::svc::FightService::today());
+                        Some(ProfileRunner { look, sheet })
+                    }
+                    (Err(error), _) => {
+                        tracing::error!(error = %error, user_id = %user_id, "runner look failed to parse; profile shows no runner");
+                        None
+                    }
+                    (_, Err(error)) => {
+                        tracing::error!(error = %error, user_id = %user_id, "runner sheet failed to parse; profile shows no runner");
+                        None
+                    }
+                }
+            }
+            Some(_) | None => None,
+        };
         let profile_awards = list_profile_awards_for_user(&client, user_id).await?;
         let gild_counts = ChatMessageGild::counts_for_author(&client, user_id).await?;
         let gallery_counts = ArtboardPiece::counts_for_user(&client, user_id).await?;
         let chip_ledger = UserChips::recent_ledger(&client, user_id, PROFILE_LEDGER_ROWS).await?;
         let chips_month = UserChips::month_figures(&client, user_id).await?;
+        let showcases = Showcase::list_by_user_id(&client, user_id).await?;
         // One batched lookup per table the ledger's refs point at, each a
         // primary-key or unique-index scan over at most PROFILE_LEDGER_ROWS
         // ids, and only when a profile is opened.
@@ -274,8 +321,10 @@ impl ProfileService {
         let quests = quest::assignment_titles(&**client, &refs.quests).await?;
         let awards = find_profile_awards_by_ids(&client, &refs.awards).await?;
         let rounds = DrinkRound::find_by_ids(&client, &refs.rounds).await?;
+        let gift_recipients =
+            DrinkCredit::recipients_for_rounds(&client, &refs.gift_rounds).await?;
         let songs = MediaQueueItem::titles_for_video_ids(&client, &refs.videos).await?;
-        let named_ids = ledger::named_user_ids(&refs, &gilds, &deposed);
+        let named_ids = ledger::named_user_ids(&refs, &gilds, &deposed, &gift_recipients);
         let usernames = User::list_usernames_by_ids(&client, &named_ids).await?;
         let chip_ledger = ledger::resolve(
             chip_ledger,
@@ -287,6 +336,7 @@ impl ProfileService {
                 quests,
                 awards,
                 rounds,
+                gift_recipients,
                 songs,
                 usernames,
             },
@@ -301,30 +351,53 @@ impl ProfileService {
                 bonsai_decay_protection,
                 aquarium_fish,
                 pet,
+                runner,
                 profile_awards,
                 gild_counts,
                 gallery_counts,
                 chip_ledger,
                 chips_month,
+                showcases,
             },
         )?;
         Ok(())
     }
 
+    /// Persist the latest profile draft with one background writer per user.
+    /// Every save carries the whole draft, so saves land in order and a burst
+    /// collapses into its newest draft instead of racing an older one.
     pub fn edit_profile(&self, user_id: Uuid, params: ProfileParams) {
+        let mut writers = self.profile_edit_writes.lock_recover();
+        if let Some(writer) = writers.get(&user_id) {
+            writer.send_replace(params);
+            return;
+        }
+        let (writer, mut pending) = watch::channel(params);
+        writers.insert(user_id, writer);
+        drop(writers);
         let service = self.clone();
         tokio::spawn(
             async move {
-                if let Err(e) = service.do_edit_profile(user_id, params).await {
-                    late_core::error_span!(
-                        "profile_edit_failed",
-                        error = ?e,
-                        "failed to edit profile"
-                    );
-                    service.publish_event(ProfileEvent::Error {
-                        user_id,
-                        message: profile_error_message(&e).to_string(),
-                    });
+                loop {
+                    let params = pending.borrow_and_update().clone();
+                    if let Err(e) = service.do_edit_profile(user_id, params).await {
+                        late_core::error_span!(
+                            "profile_edit_failed",
+                            error = ?e,
+                            "failed to edit profile"
+                        );
+                        service.publish_event(ProfileEvent::Error {
+                            user_id,
+                            message: profile_error_message(&e).to_string(),
+                        });
+                    }
+                    // Share the enqueue lock so a new draft cannot arrive
+                    // between checking for work and retiring this writer.
+                    let mut writers = service.profile_edit_writes.lock_recover();
+                    if !pending.has_changed().unwrap_or(false) {
+                        writers.remove(&user_id);
+                        break;
+                    }
                 }
             }
             .instrument(info_span!("profile.edit_task", user_id = %user_id)),
@@ -578,6 +651,30 @@ impl ProfileService {
         );
     }
 
+    /// Fire-and-forget: persist this device's Artboard content disclaimer onto
+    /// the SSH key the session authenticated with. Logged on failure only, like
+    /// the rail layout: the choice already applies for the rest of the session.
+    pub fn set_key_artboard_disclaimer(&self, user_id: Uuid, fingerprint: String, enabled: bool) {
+        let service = self.clone();
+        tokio::spawn(
+            async move {
+                let result = async {
+                    let client = service.db.get().await?;
+                    UserSshKey::set_artboard_disclaimer(&client, user_id, &fingerprint, enabled)
+                        .await
+                }
+                .await;
+                if let Err(e) = result {
+                    tracing::warn!(error = ?e, "failed to persist device artboard disclaimer");
+                }
+            }
+            .instrument(info_span!(
+                "profile.device_artboard_disclaimer_task",
+                user_id = %user_id
+            )),
+        );
+    }
+
     /// Fire-and-forget: persist when this device's session went quiet before
     /// it ended, the mark the next session's bare `/summary` reads from. A
     /// failure is only logged: the next session falls back to the default
@@ -619,22 +716,36 @@ impl ProfileService {
         );
     }
 
-    /// Persist the chosen interaction mode (keyboard / mouse / hybrid).
-    pub fn set_interaction_mode(
-        &self,
-        user_id: Uuid,
-        mode: late_core::models::user::InteractionMode,
-    ) {
+    /// Persist the latest interaction mode with one background writer per user.
+    pub fn set_interaction_mode(&self, user_id: Uuid, mode: InteractionMode) {
+        let mut writers = self.interaction_mode_writes.lock_recover();
+        if let Some(writer) = writers.get(&user_id) {
+            writer.send_replace(mode);
+            return;
+        }
+        let (writer, mut pending) = watch::channel(mode);
+        writers.insert(user_id, writer);
+        drop(writers);
         let service = self.clone();
         tokio::spawn(
             async move {
-                let result = async {
-                    let client = service.db.get().await?;
-                    User::set_interaction_mode(&client, user_id, mode).await
-                }
-                .await;
-                if let Err(e) = result {
-                    tracing::warn!(error = ?e, "failed to persist interaction mode");
+                loop {
+                    let mode = *pending.borrow_and_update();
+                    let result = async {
+                        let client = service.db.get().await?;
+                        User::set_interaction_mode(&client, user_id, mode).await
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        tracing::warn!(error = ?e, "failed to persist interaction mode");
+                    }
+                    // Share the enqueue lock so a new choice cannot arrive
+                    // between checking for work and retiring this writer.
+                    let mut writers = service.interaction_mode_writes.lock_recover();
+                    if !pending.has_changed().unwrap_or(false) {
+                        writers.remove(&user_id);
+                        break;
+                    }
                 }
             }
             .instrument(info_span!("profile.interaction_mode_task", user_id = %user_id)),

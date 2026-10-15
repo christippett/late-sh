@@ -91,44 +91,48 @@ fn is_dm_room_matches_kind_or_visibility() {
 }
 
 #[test]
-fn should_handle_bot_mention_event_in_public_room() {
-    let bot = Uuid::from_u128(7);
-    assert!(should_handle_bot_mention_event(
-        "hey @bot can you help",
-        None,
-        bot,
-        "bot"
-    ));
+fn bot_address_answers_a_mention_anywhere_in_the_text() {
+    assert_eq!(
+        bot_address("hey @Bot can you help", None, "bot"),
+        Some(BotAddress::Mention)
+    );
+    assert_eq!(bot_address("normal room traffic", None, "bot"), None);
 }
 
 #[test]
-fn should_handle_bot_mention_event_in_private_room_when_bot_is_member() {
-    let bot = Uuid::from_u128(7);
-    let targets = [Uuid::from_u128(1), bot];
-    assert!(should_handle_bot_mention_event(
-        "hey @bot can you help",
-        Some(&targets),
-        bot,
-        "bot"
-    ));
+fn bot_address_answers_a_reply_to_the_bot_without_a_mention() {
+    let parent = Uuid::from_u128(9);
+    assert_eq!(
+        bot_address(
+            "> @bot: try cargo check\nthat worked, why?",
+            Some(parent),
+            "bot"
+        ),
+        Some(BotAddress::Reply { parent_id: parent })
+    );
+    assert_eq!(
+        bot_address(
+            "> @Bartender: one stout\nmake it two",
+            Some(parent),
+            "bartender"
+        ),
+        Some(BotAddress::Reply { parent_id: parent })
+    );
 }
 
 #[test]
-fn should_handle_bot_mention_event_in_private_room_when_bot_is_not_yet_member() {
-    let bot = Uuid::from_u128(7);
-    let targets = [Uuid::from_u128(1), Uuid::from_u128(2)];
-    assert!(should_handle_bot_mention_event(
-        "hey @bot can you help",
-        Some(&targets),
-        bot,
-        "bot"
-    ));
-    assert!(!should_handle_bot_mention_event(
-        "normal room traffic",
-        Some(&targets),
-        bot,
-        "bot"
-    ));
+fn bot_address_ignores_replies_to_anyone_else_and_hand_typed_quotes() {
+    let parent = Uuid::from_u128(9);
+    // A reply to a human is not addressed to the bot.
+    assert_eq!(
+        bot_address("> @alice: earlier message\nthanks", Some(parent), "bot"),
+        None
+    );
+    // A quote line typed by hand is not a reply: there is no parent message.
+    assert_eq!(
+        bot_address("> @bot: earlier message\nthanks", None, "bot"),
+        None
+    );
 }
 
 #[test]
@@ -137,6 +141,7 @@ fn parse_bartender_order_pours_within_spendable() {
     assert_eq!(
         parse_bartender_order(raw, BartenderTab::Paying { spendable: 900 }, "bartender"),
         BartenderDecision::Pour {
+            intoxicating: true,
             drink: "Segfault Sour".to_string(),
             price: 400,
             line: "one segfault sour, that is 400 chips".to_string(),
@@ -163,6 +168,63 @@ fn parse_bartender_order_refuses_out_of_range_price() {
             line: "here".to_string()
         }
     );
+}
+
+#[test]
+fn parse_bartender_order_pours_non_intoxicating_drinks_on_either_tab() {
+    // Both valid JSON and the trailing-quote repair must preserve false.
+    for raw in [
+        r#"{"action":"pour","drink":"coffee","price":50,"intoxicating":false,"line":"coffee, 50 chips"}"#,
+        r#"{"action":"pour","drink":"coffee","price":50,"intoxicating":false,"line":"coffee, 50 chips""}"#,
+    ] {
+        assert_eq!(
+            parse_bartender_order(raw, BartenderTab::Paying { spendable: 50 }, "bartender"),
+            BartenderDecision::Pour {
+                drink: "coffee".to_string(),
+                price: 50,
+                intoxicating: false,
+                line: "coffee, 50 chips".to_string(),
+            }
+        );
+        assert!(matches!(
+            parse_bartender_order(raw, BartenderTab::Paying { spendable: 49 }, "bartender"),
+            BartenderDecision::Say { .. }
+        ));
+    }
+    for action in ["pour", "offer"] {
+        let raw = format!(
+            r#"{{"action":"{action}","drink":"water","price":null,"intoxicating":false,"line":"on the house"}}"#
+        );
+        assert_eq!(
+            parse_bartender_order(&raw, BartenderTab::Comped, "bartender"),
+            BartenderDecision::PourComped {
+                drink: "water".to_string(),
+                intoxicating: false,
+                line: "on the house".to_string(),
+            }
+        );
+    }
+}
+
+#[test]
+fn parse_bartender_order_pins_non_intoxicating_drinks_to_the_soft_price() {
+    // Any other price on a coffee is a model slip: served uncharged, never
+    // debited at a number the prompt did not promise.
+    for price in [
+        0,
+        SOFT_DRINK_PRICE - 1,
+        SOFT_DRINK_PRICE + 1,
+        DRINK_PRICE_MIN,
+        DRINK_PRICE_MAX,
+    ] {
+        let raw = format!(
+            r#"{{"action":"pour","price":{price},"intoxicating":false,"line":"a coffee"}}"#
+        );
+        assert!(matches!(
+            parse_bartender_order(&raw, BartenderTab::Paying { spendable: 5000 }, "bartender"),
+            BartenderDecision::Say { .. }
+        ));
+    }
 }
 
 #[test]
@@ -206,6 +268,7 @@ fn parse_bartender_order_pours_a_comped_drink_past_every_price_gate() {
         assert_eq!(
             parse_bartender_order(&raw, BartenderTab::Comped, "bartender"),
             BartenderDecision::PourComped {
+                intoxicating: true,
                 drink: "Null Pointer Negroni".to_string(),
                 line: "this one's on them".to_string(),
             }
@@ -231,6 +294,7 @@ fn parse_bartender_order_accepts_fenced_json_and_defaults_drink() {
     assert_eq!(
         parse_bartender_order(raw, BartenderTab::Paying { spendable: 900 }, "bartender"),
         BartenderDecision::Pour {
+            intoxicating: true,
             drink: "house pour".to_string(),
             price: 200,
             line: "here you go".to_string(),
@@ -288,6 +352,7 @@ fn parse_bartender_order_recovers_pour_fields_when_json_is_broken() {
     assert_eq!(
         parse_bartender_order(raw, BartenderTab::Paying { spendable: 900 }, "bartender"),
         BartenderDecision::Pour {
+            intoxicating: true,
             drink: "Kernel Panic Punch".to_string(),
             price: 250,
             line: "one Kernel Panic Punch, 250 chips.".to_string(),

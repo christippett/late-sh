@@ -1,11 +1,12 @@
-use chrono::{DateTime, Utc};
+use std::collections::HashSet;
+
 use ratatui_textarea::{TextArea, WrapMode};
 use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use crate::app::common::{composer, primitives::Banner};
 use late_core::models::article::{
-    ArticleEvent, ArticleFeedItem, ArticleSnapshot, NEWS_SHARE_MAX_PAID_PER_DAY,
+    ArticleEvent, ArticleFeedItem, ArticleSnapshot, NEWS_FEED_LIMIT, NEWS_SHARE_MAX_PAID_PER_DAY,
     NEWS_SHARE_REWARD_CHIPS, NewsShareReward,
 };
 
@@ -28,6 +29,74 @@ pub fn news_share_banner(lead: &str, reward: NewsShareReward) -> Banner {
 
 use super::svc::ArticleService;
 
+/// This session's news reads: the ids of the snapshot's articles the
+/// reader has read (`article_reads`), a visit to the News room reading
+/// every one of them and the article modal reading one. Reads only grow,
+/// so a load merges into what is held. Until the first load answers, the
+/// badge stays empty rather than guessing: no reads means everything is
+/// unread, which is not the same as not knowing yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Reads {
+    Loading,
+    Loaded(HashSet<Uuid>),
+}
+
+pub(crate) fn is_unread(item: &ArticleFeedItem, read_ids: &HashSet<Uuid>) -> bool {
+    !read_ids.contains(&item.article.id)
+}
+
+/// Whether an article is unread against the reads, for a mark that must
+/// not guess: nothing is unread until the reads have loaded.
+pub(crate) fn is_unread_at(item: &ArticleFeedItem, reads: &Reads) -> bool {
+    match reads {
+        Reads::Loading => false,
+        Reads::Loaded(read_ids) => is_unread(item, read_ids),
+    }
+}
+
+/// The news badge: articles in the shared snapshot the reader has not read.
+/// The snapshot holds the newest [`NEWS_FEED_LIMIT`] articles, so the
+/// count saturates there.
+pub(crate) fn unread_in_snapshot(articles: &[ArticleFeedItem], read_ids: &HashSet<Uuid>) -> i64 {
+    let unread = articles
+        .iter()
+        .filter(|item| is_unread(item, read_ids))
+        .count();
+    unread as i64
+}
+
+/// Badge text for a news unread count: a full snapshot of unread articles
+/// reads as a floor ("20+"), since older unread ones sit past the snapshot.
+pub(crate) fn news_unread_label(unread: i64) -> String {
+    if unread >= NEWS_FEED_LIMIT {
+        format!("{NEWS_FEED_LIMIT}+")
+    } else {
+        unread.to_string()
+    }
+}
+
+/// Whether a refreshed snapshot brought this reader something to announce:
+/// an article newer than anything the previous snapshot held, still
+/// unread, shared by someone else. Newer by `created`, not by id: the
+/// snapshot is capped, so a delete backfills an older article whose id was
+/// never seen, and that is not news. The first snapshot a session sees is
+/// its starting state, not news, so it never announces.
+pub(crate) fn has_fresh_unread_from_others(
+    previous: &[ArticleFeedItem],
+    next: &[ArticleFeedItem],
+    read_ids: &HashSet<Uuid>,
+    reader: Uuid,
+) -> bool {
+    let Some(newest_seen) = previous.iter().map(|item| item.article.created).max() else {
+        return false;
+    };
+    next.iter().any(|item| {
+        item.article.created > newest_seen
+            && item.article.user_id != reader
+            && is_unread(item, read_ids)
+    })
+}
+
 /// Outcome of one tab tick: the banner to surface plus whether a drained
 /// snapshot or event may have changed the rendered tab (badge counts, article list).
 pub struct NewsTick {
@@ -45,10 +114,9 @@ pub struct State {
     selected: usize,
     snapshot_rx: watch::Receiver<ArticleSnapshot>,
     event_rx: broadcast::Receiver<ArticleEvent>,
-    unread_count: i64,
-    last_read_at: Option<DateTime<Utc>>,
-    marker_read_at: Option<DateTime<Utc>>,
-    preserve_marker_read_at: bool,
+    reads: Reads,
+    marker: HashSet<Uuid>,
+    preserve_marker: bool,
     composing: bool,
     composer: TextArea<'static>,
     processing: bool,
@@ -60,7 +128,7 @@ impl State {
         let snapshot_rx = article_service.subscribe_snapshot();
         let event_rx = article_service.subscribe_events();
         article_service.list_articles_task();
-        article_service.refresh_unread_count_task(user_id);
+        article_service.load_reads_task(user_id);
         Self {
             article_service,
             user_id,
@@ -71,10 +139,9 @@ impl State {
             selected: 0,
             snapshot_rx,
             event_rx,
-            unread_count: 0,
-            last_read_at: None,
-            marker_read_at: None,
-            preserve_marker_read_at: false,
+            reads: Reads::Loading,
+            marker: HashSet::new(),
+            preserve_marker: false,
             composing: false,
             composer: new_news_textarea(),
             processing: false,
@@ -181,23 +248,21 @@ impl State {
         self.articles.get(self.selected_index())
     }
 
-    pub fn article_id_by_url(&self, url: &str) -> Option<Uuid> {
-        let url = url.trim();
-        if url.is_empty() {
-            return None;
-        }
-        self.source_articles
-            .iter()
-            .find(|item| item.article.url.trim() == url)
-            .map(|item| item.article.id)
-    }
-
     pub fn unread_count(&self) -> i64 {
-        self.unread_count
+        match &self.reads {
+            Reads::Loading => 0,
+            Reads::Loaded(read_ids) => unread_in_snapshot(&self.source_articles, read_ids),
+        }
     }
 
-    pub fn marker_read_at(&self) -> Option<DateTime<Utc>> {
-        self.marker_read_at
+    /// The reads the News list marks its dots against: held at what they
+    /// were when the room was entered, so the visit keeps showing what was new.
+    pub(crate) fn marker(&self) -> &HashSet<Uuid> {
+        &self.marker
+    }
+
+    pub(crate) fn reads(&self) -> &Reads {
+        &self.reads
     }
 
     pub fn composing(&self) -> bool {
@@ -231,11 +296,32 @@ impl State {
         self.processing = false;
     }
 
+    /// A visit to the News room: every article in the snapshot is read.
+    /// The badge clears now; the stored reads come back as `ReadsLoaded`
+    /// once the write lands and merge into these.
     pub fn mark_read(&mut self) {
-        self.marker_read_at = self.last_read_at;
-        self.preserve_marker_read_at = true;
-        self.unread_count = 0;
+        self.marker = match &self.reads {
+            Reads::Loading => HashSet::new(),
+            Reads::Loaded(read_ids) => read_ids.clone(),
+        };
+        self.preserve_marker = true;
+        let snapshot_ids = self.source_articles.iter().map(|item| item.article.id);
+        match &mut self.reads {
+            Reads::Loading => self.reads = Reads::Loaded(snapshot_ids.collect()),
+            Reads::Loaded(read_ids) => read_ids.extend(snapshot_ids),
+        }
         self.article_service.mark_read_task(self.user_id);
+    }
+
+    /// Mark the one article the modal opened on as read, and no other. Its
+    /// mark clears now, and the write always goes: it is a no-op on a row
+    /// that exists, and a reopen is the retry of a write that failed.
+    pub fn mark_article_read(&mut self, item: &ArticleFeedItem) {
+        if let Reads::Loaded(read_ids) = &mut self.reads {
+            read_ids.insert(item.article.id);
+        }
+        self.article_service
+            .mark_article_read_task(self.user_id, item.article.id);
     }
 
     pub fn composer_push(&mut self, ch: char) {
@@ -352,19 +438,39 @@ impl State {
         // Peek before draining: anything queued may change the rendered tab
         // (badge counts, article list), so it counts as changed.
         let changed = self.snapshot_rx.has_changed().unwrap_or(false) || !self.event_rx.is_empty();
-        self.drain_snapshot();
+        let snapshot_banner = self.drain_snapshot();
+        let event_banner = self.drain_events();
         NewsTick {
-            banner: self.drain_events(),
+            banner: event_banner.or(snapshot_banner),
             changed,
         }
     }
 
-    fn drain_snapshot(&mut self) {
-        if let Ok(true) = self.snapshot_rx.has_changed() {
-            let snapshot = self.snapshot_rx.borrow_and_update().clone();
-            self.source_articles = snapshot.articles;
-            self.rebuild_display();
+    fn drain_snapshot(&mut self) -> Option<Banner> {
+        let Ok(true) = self.snapshot_rx.has_changed() else {
+            return None;
+        };
+        let snapshot = self.snapshot_rx.borrow_and_update().clone();
+        let announce = match &self.reads {
+            Reads::Loading => false,
+            Reads::Loaded(read_ids) => has_fresh_unread_from_others(
+                &self.source_articles,
+                &snapshot.articles,
+                read_ids,
+                self.user_id,
+            ),
+        };
+        self.source_articles = snapshot.articles;
+        self.rebuild_display();
+        if !announce {
+            return None;
         }
+        let unread = self.unread_count();
+        let noun = if unread == 1 { "article" } else { "articles" };
+        Some(Banner::success(&format!(
+            "{} new {noun} in news",
+            news_unread_label(unread)
+        )))
     }
 
     fn drain_events(&mut self) -> Option<Banner> {
@@ -393,41 +499,36 @@ impl State {
                     ArticleEvent::Deleted { user_id } if self.user_id == user_id => {
                         banner = Some(Banner::success("Article deleted."));
                     }
-                    ArticleEvent::UnreadCountUpdated {
+                    ArticleEvent::ReadsLoaded {
                         user_id,
-                        unread_count,
-                        last_read_at,
+                        read_article_ids,
                     } if self.user_id == user_id => {
-                        self.unread_count = unread_count;
-                        self.last_read_at = last_read_at;
-                        if unread_count == 0 && !self.preserve_marker_read_at {
-                            self.marker_read_at = last_read_at;
+                        // Reads only grow, so a load merges: two writes'
+                        // loads landing in either order never take a read
+                        // back, and neither does a load older than a mark
+                        // this session made itself.
+                        match &mut self.reads {
+                            Reads::Loading => {
+                                self.reads = Reads::Loaded(read_article_ids.into_iter().collect());
+                            }
+                            Reads::Loaded(read_ids) => read_ids.extend(read_article_ids),
                         }
-                    }
-                    ArticleEvent::NewArticlesAvailable {
-                        user_id,
-                        unread_count,
-                    } if self.user_id == user_id => {
-                        let increased = unread_count > self.unread_count;
-                        self.unread_count = unread_count;
-                        if increased {
-                            let noun = if unread_count == 1 {
-                                "article"
-                            } else {
-                                "articles"
-                            };
-                            banner = Some(Banner::success(&format!(
-                                "{unread_count} new {noun} in news"
-                            )));
+                        if self.unread_count() == 0
+                            && !self.preserve_marker
+                            && let Reads::Loaded(read_ids) = &self.reads
+                        {
+                            self.marker = read_ids.clone();
                         }
                     }
                     _ => (),
                 },
                 Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(e) => {
-                    tracing::error!(%e, "failed to receive article event");
-                    break;
+                // Skipped events are gone; the receiver resumes at the oldest
+                // one still buffered, so keep draining.
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "article event receiver lagged");
                 }
+                Err(broadcast::error::TryRecvError::Closed) => break,
             }
         }
         banner

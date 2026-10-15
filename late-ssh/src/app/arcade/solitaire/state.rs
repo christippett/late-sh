@@ -6,9 +6,16 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::svc::SolitaireService;
+use super::win_anim::{Viewport, WinAnimation};
+use crate::app::games::cards::{CardRank, CardSuit, PlayingCard};
+use crate::metrics::{ArcadeDifficulty, ArcadeFinish, ArcadeMode};
 use late_core::models::solitaire::{Game, GameParams};
 
 pub const DIFFICULTIES: [&str; 2] = ["draw-1", "draw-3"];
+/// The metric label of each row of `DIFFICULTIES`, in the same order.
+/// Sized by the table, so a new difficulty must be labeled to build.
+const DIFFICULTY_METRICS: [ArcadeDifficulty; DIFFICULTIES.len()] =
+    [ArcadeDifficulty::DrawOne, ArcadeDifficulty::DrawThree];
 
 /// Which destructive action a pending confirmation is armed for. Tracking the
 /// kind keeps the two reset keys distinct: pressing `n` then `r` re-arms for
@@ -48,7 +55,7 @@ impl Suit {
         }
     }
 
-    fn is_red(self) -> bool {
+    pub fn is_red(self) -> bool {
         matches!(self, Suit::Hearts | Suit::Diamonds)
     }
 
@@ -145,6 +152,19 @@ pub struct State {
     pub is_game_over: bool,
     pub scroll_offset: u16,
     pub reset_pending: Option<ResetKind>,
+    /// The win cascade, alive from the moment the last card lands until the
+    /// board is dealt again. It outlives its own last frame: the heap of
+    /// cards stays on screen under the `YOU WON!` card.
+    pub win_anim: Option<WinAnimation>,
+    /// The board's finish has been counted (the cascade shown, the finish
+    /// metric recorded). Not part of a snapshot and not restored by undo:
+    /// a won board undone and replayed is the same win, counted once. A
+    /// snapshot applied won (a reload) starts counted.
+    finish_recorded: bool,
+    /// Where the board was last drawn, written by the render pass so the
+    /// cascade can aim at the same cells. A render mirror, never a rule
+    /// input, which is why it can ride a `Cell` behind `&self`.
+    pub win_view: std::cell::Cell<Viewport>,
     undo_stack: Vec<Snapshot>,
     daily_snapshots: HashMap<String, Snapshot>,
     /// The UTC date `daily_snapshots` was built for. A session that never
@@ -195,6 +215,9 @@ impl State {
             is_game_over: false,
             scroll_offset: 0,
             reset_pending: None,
+            win_anim: None,
+            finish_recorded: false,
+            win_view: std::cell::Cell::new(Viewport::default()),
             undo_stack: Vec::new(),
             daily_snapshots,
             daily_date: today,
@@ -412,6 +435,7 @@ impl State {
             self.tableau = snapshot.tableau;
             self.is_game_over = snapshot.is_game_over;
             self.selection = None;
+            self.win_anim = None;
             self.store_active_snapshot();
             self.save_async();
             true
@@ -544,6 +568,41 @@ impl State {
         self.reset_pending = None;
     }
 
+    /// One frame of the win cascade, driven from `App::tick` at the hot
+    /// cadence. Returns whether the board needs repainting.
+    pub fn tick_win_animation(&mut self) -> bool {
+        let view = self.win_view.get();
+        let Some(anim) = self.win_anim.as_mut() else {
+            return false;
+        };
+        anim.set_viewport(view);
+        anim.advance()
+    }
+
+    /// True while cards are still in the air: the `YOU WON!` card waits for
+    /// this to clear so the cascade is not drawn through it.
+    pub fn win_cascade_running(&self) -> bool {
+        self.win_anim
+            .as_ref()
+            .is_some_and(|anim| !anim.is_finished())
+    }
+
+    /// Any key during the cascade runs it out at once, the way clicking
+    /// always has. Returns whether there was a cascade to cut short, so the
+    /// caller can swallow that key press.
+    pub fn skip_win_animation(&mut self) -> bool {
+        let view = self.win_view.get();
+        let Some(anim) = self.win_anim.as_mut() else {
+            return false;
+        };
+        if anim.is_finished() {
+            return false;
+        }
+        anim.set_viewport(view);
+        anim.skip_to_end();
+        true
+    }
+
     pub fn score(&self) -> usize {
         self.foundations.iter().map(Vec::len).sum()
     }
@@ -573,6 +632,18 @@ impl State {
     pub fn visible_waste(&self) -> &[Card] {
         let count = self.draw_count().min(self.waste.len());
         &self.waste[self.waste.len().saturating_sub(count)..]
+    }
+
+    /// The top of a foundation pile as the board should draw it: while the
+    /// win cascade runs, the cards already in the air have left the pile.
+    pub fn displayed_foundation_top(&self, idx: usize) -> Option<Card> {
+        let pile = self.foundations.get(idx)?;
+        let gone = self
+            .win_anim
+            .as_ref()
+            .map_or(0, |anim| anim.launched_from(idx));
+        let remaining = pile.len().saturating_sub(gone);
+        pile.get(remaining.checked_sub(1)?).copied()
     }
 
     pub fn foundation_top(&self, idx: usize) -> Option<Card> {
@@ -753,8 +824,27 @@ impl State {
         self.save_async();
     }
 
+    /// Tell the dashboard this board ended.
+    fn record_finish(&self, finish: ArcadeFinish) {
+        let mode = match self.mode {
+            Mode::Daily => ArcadeMode::Daily,
+            Mode::Personal => ArcadeMode::Personal,
+        };
+        let difficulty = DIFFICULTY_METRICS[self.selected_difficulty];
+        self.svc.record_finish(mode, difficulty, finish);
+    }
+
     fn check_for_win(&mut self) {
         if self.foundations.iter().all(|pile| pile.len() == 13) {
+            // Cards can be pulled back off a full foundation and replaced, and
+            // the winning move can be undone and replayed, so this fires again
+            // on an already-won board; only the first crossing gets a cascade
+            // and counts as a finish.
+            if !self.finish_recorded {
+                self.finish_recorded = true;
+                self.win_anim = Some(WinAnimation::new(&self.foundations, self.seed));
+                self.record_finish(ArcadeFinish::Won);
+            }
             self.is_game_over = true;
             if self.mode == Mode::Daily {
                 self.svc.record_win_task(
@@ -826,9 +916,11 @@ impl State {
         self.foundations = snapshot.foundations;
         self.tableau = snapshot.tableau;
         self.is_game_over = snapshot.is_game_over;
+        self.finish_recorded = snapshot.is_game_over;
         self.cursor = Focus::Stock;
         self.selection = None;
         self.scroll_offset = 0;
+        self.win_anim = None;
         self.undo_stack.clear();
         self.clamp_cursor();
     }
@@ -998,6 +1090,24 @@ fn tableau_to_top_index(col: usize) -> usize {
     }
 }
 
+pub fn to_playing_card(card: Card) -> PlayingCard {
+    PlayingCard {
+        suit: match card.suit {
+            Suit::Hearts => CardSuit::Hearts,
+            Suit::Diamonds => CardSuit::Diamonds,
+            Suit::Clubs => CardSuit::Clubs,
+            Suit::Spades => CardSuit::Spades,
+        },
+        rank: match card.rank {
+            1 => CardRank::Ace,
+            11 => CardRank::Jack,
+            12 => CardRank::Queen,
+            13 => CardRank::King,
+            n => CardRank::Number(n),
+        },
+    }
+}
+
 #[cfg(test)]
 #[path = "state_test.rs"]
-mod state_test;
+pub(crate) mod state_test;

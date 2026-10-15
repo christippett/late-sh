@@ -14,11 +14,15 @@ pub mod model;
 pub mod model_test;
 pub mod models;
 pub mod nonogram;
+pub mod radio;
 pub mod rate_limit;
 #[cfg(test)]
 mod rate_limit_test;
 pub mod shutdown;
 pub mod telemetry;
+pub mod vocab;
+#[cfg(test)]
+mod vocab_test;
 
 #[cfg(feature = "testing")]
 pub mod test_utils;

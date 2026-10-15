@@ -28,8 +28,8 @@ use crate::app::common::primitives::thousands;
 use crate::app::common::theme;
 use crate::usernames::UsernameLookup;
 
-use super::lobby::SEAT_COUNT;
 use super::state::{Drink, State};
+use super::stools::SEAT_COUNT;
 
 /// The most lines the bar keeps on the wall, whatever the height.
 const MAX_LINES: usize = 10;
@@ -88,6 +88,7 @@ fn draw_bar(frame: &mut Frame, area: Rect, view: &NightcapView<'_>) {
         tab,
         _gap_c,
         lines,
+        notice,
         footer,
     ] = Layout::vertical([
         Constraint::Length(2),
@@ -98,6 +99,7 @@ fn draw_bar(frame: &mut Frame, area: Rect, view: &NightcapView<'_>) {
         Constraint::Length(TAB_BOARD_ROWS),
         Constraint::Length(1),
         Constraint::Fill(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -122,6 +124,7 @@ fn draw_bar(frame: &mut Frame, area: Rect, view: &NightcapView<'_>) {
     draw_seats(frame, seats, view);
     draw_tab_board(frame, tab, view);
     draw_lines(frame, lines, view);
+    draw_notice(frame, notice, view.state);
     draw_footer(frame, footer, view.state);
 }
 
@@ -161,36 +164,33 @@ fn draw_tv(frame: &mut Frame, area: Rect, view: &NightcapView<'_>) {
     );
 }
 
-/// The tab board: who has bought the house the most rounds, all time.
+/// The tab board: who has ordered the most drinks here, all time.
 fn draw_tab_board(frame: &mut Frame, area: Rect, view: &NightcapView<'_>) {
     let dim = Style::default().fg(theme::TEXT_DIM());
     let faint = Style::default().fg(theme::TEXT_FAINT());
-    let mut lines = vec![Line::from(Span::styled("the tab · rounds bought", faint))];
+    let mut lines = vec![Line::from(Span::styled("the tab · drinks ordered", faint))];
     let tab = &view.state.wall().tab;
     if tab.is_empty() {
         lines.push(Line::from(Span::styled(
-            "nobody has bought the stools a round yet.",
+            "nobody has ordered a drink here yet.",
             Style::default()
                 .fg(theme::TEXT_FAINT())
                 .add_modifier(Modifier::ITALIC),
         )));
     }
-    for (idx, buyer) in tab.iter().enumerate() {
-        let rounds = if buyer.rounds == 1 { "round" } else { "rounds" };
+    for (idx, regular) in tab.iter().enumerate() {
+        let drinks = if regular.drinks == 1 {
+            "drink"
+        } else {
+            "drinks"
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", idx + 1), faint),
             Span::styled(
-                buyer.username.clone(),
+                regular.username.clone(),
                 Style::default().fg(theme::TEXT_BRIGHT()),
             ),
-            Span::styled(
-                format!(
-                    "  {} {rounds}  {} chips",
-                    buyer.rounds,
-                    thousands(buyer.chips)
-                ),
-                dim,
-            ),
+            Span::styled(format!("  {} {drinks}", thousands(regular.drinks)), dim),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);
@@ -370,6 +370,25 @@ fn age_styles(age: chrono::Duration) -> (Style, Style) {
     }
 }
 
+/// What the house last said to this patron, on its own row above the keys.
+/// It sits over the hints rather than in place of them: the line after a
+/// round is the one a patron reads while looking for the key that carves a
+/// stool, and taking the keys away to say it leaves them stuck.
+fn draw_notice(frame: &mut Frame, area: Rect, state: &State) {
+    let Some(message) = &state.last_message else {
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            message.clone(),
+            Style::default()
+                .fg(theme::AMBER())
+                .add_modifier(Modifier::ITALIC),
+        ))),
+        area,
+    );
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, state: &State) {
     let key = Style::default().fg(theme::AMBER_DIM());
     let hint = Style::default().fg(theme::TEXT_DIM());
@@ -388,22 +407,26 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &State) {
         for (idx, drink) in Drink::MENU.iter().enumerate() {
             spans.push(Span::styled(format!("{} ", idx + 1), key));
             spans.push(Span::styled(
-                format!("{} {}  ", drink.name(), thousands(drink.price())),
+                format!("{} {}", drink.name(), thousands(drink.price())),
                 hint,
             ));
+            // Only the house measure comes off a round, so the drinks a
+            // patron is holding are counted against the one pour they pay
+            // for (`Drink::on_the_round`).
+            match (drink.on_the_round(), state.free_drinks()) {
+                (true, waiting) if waiting > 0 => spans.push(Span::styled(
+                    format!(" (free x{waiting})"),
+                    Style::default().fg(theme::AMBER()),
+                )),
+                _ => {}
+            }
+            spans.push(Span::raw("  "));
         }
         spans.push(Span::styled("r", key));
         spans.push(Span::styled(" a round for the stools  ", hint));
         spans.push(Span::styled("d", key));
         spans.push(Span::styled(" close", hint));
         spans
-    } else if let Some(message) = &state.last_message {
-        vec![Span::styled(
-            message.clone(),
-            Style::default()
-                .fg(theme::AMBER())
-                .add_modifier(Modifier::ITALIC),
-        )]
     } else {
         vec![
             Span::styled("1-6", key),

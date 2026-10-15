@@ -1,4 +1,6 @@
-use crate::app::{common::primitives::Banner, state::App};
+use uuid::Uuid;
+
+use crate::app::{chat::state::RoomSlot, common::primitives::Banner, state::App};
 
 pub fn handle_composer_input(app: &mut App, byte: u8) {
     match byte {
@@ -65,6 +67,15 @@ pub fn handle_byte(app: &mut App, byte: u8) -> bool {
             app.chat.news.delete_selected();
             true
         }
+        // The live strip's `r`, from the feed: reply in #lounge quoting the
+        // selected story, and take the user there to write it.
+        b'r' | b'R' => {
+            let Some(article_id) = app.chat.news.selected_item().map(|item| item.article.id) else {
+                return true;
+            };
+            reply_in_lounge(app, article_id);
+            true
+        }
         b'/' => {
             app.chat.news.toggle_mine_only();
             let banner = if app.chat.news.mine_only() {
@@ -76,5 +87,23 @@ pub fn handle_byte(app: &mut App, byte: u8) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// Reply in #lounge quoting the article, with #lounge selected so the
+/// composer is where the user lands. The News feed's `r` and the article
+/// modal's (`app/input.rs`) both come through here. Returns whether the
+/// reply started in #lounge.
+pub fn reply_in_lounge(app: &mut App, article_id: Uuid) -> bool {
+    if !app.chat.begin_reply_to_article(article_id) {
+        return false;
+    }
+    match app.chat.lounge_room_id() {
+        Some(lounge_id) => {
+            app.chat.select_room_slot(RoomSlot::Room(lounge_id));
+            app.sync_visible_chat_room();
+            true
+        }
+        None => false,
     }
 }

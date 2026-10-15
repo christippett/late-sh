@@ -79,6 +79,14 @@ impl ProfileState {
         added
     }
 
+    /// Flip whether this player sees their watchers' chat under a running
+    /// door game. Returns the new value.
+    pub fn toggle_show_watch_chat(&mut self) -> bool {
+        self.profile.show_watch_chat ^= true;
+        self.save_profile();
+        self.profile.show_watch_chat
+    }
+
     pub fn move_favorite_room(&mut self, room_id: Uuid, delta: isize) -> bool {
         let Some(index) = self
             .profile
@@ -104,6 +112,14 @@ impl ProfileState {
     pub fn set_device_rails(&self, fingerprint: String, layout: KeyLayout) {
         self.profile_service
             .set_key_layout(self.user_id, fingerprint, layout);
+    }
+
+    /// Store whether this device shows the Artboard content disclaimer. Fire
+    /// and forget, and per device for the same reason the rails are: it does
+    /// not touch the account profile.
+    pub fn set_device_artboard_disclaimer(&self, fingerprint: String, enabled: bool) {
+        self.profile_service
+            .set_key_artboard_disclaimer(self.user_id, fingerprint, enabled);
     }
 
     /// Persist when this device's session went quiet before ending, fire and
@@ -179,7 +195,7 @@ impl ProfileState {
     }
 }
 
-fn profile_params_from_profile(profile: &Profile) -> ProfileParams {
+pub(crate) fn profile_params_from_profile(profile: &Profile) -> ProfileParams {
     ProfileParams {
         username: profile.username.clone(),
         bio: profile.bio.clone(),
@@ -204,12 +220,18 @@ fn profile_params_from_profile(profile: &Profile) -> ProfileParams {
         show_right_sidebar: profile.show_right_sidebar,
         right_sidebar_mode: profile.right_sidebar_mode,
         right_sidebar_components: profile.right_sidebar_components.clone(),
+        statusline_components: profile.statusline_components.clone(),
         show_room_list_sidebar: profile.show_room_list_sidebar,
         room_list_mode: profile.room_list_mode,
         keep_composer_focused: profile.keep_composer_focused,
         start_with_music_muted: profile.start_with_music_muted,
         landing_page: profile.landing_page,
         paper_at_login: profile.paper_at_login,
+        screensaver: profile.screensaver,
+        show_watch_chat: profile.show_watch_chat,
+        artboard_disclaimer: profile.artboard_disclaimer,
+        terminal_images: profile.terminal_images,
+        hidden_award_categories: profile.hidden_award_categories.clone(),
         show_flag_fallback: profile.show_flag_fallback,
         translate_to: profile.translate_to,
         auto_translate: profile.auto_translate,

@@ -12,9 +12,8 @@ use crate::app::input::{MouseButton, MouseEvent, MouseEventKind, ParsedInput};
 
 use super::state::{Focus, HangFlow, RailActivation, RailRow};
 
-/// What the page must do after a gallery key: nothing, or one of the rail
-/// actions that need the page (the live board, the ban gate, the archive
-/// lists).
+/// What the page must do after a gallery key: nothing, or an action that needs
+/// the app (the live board, hang gate, or archives).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GalleryAction {
     Ignored,

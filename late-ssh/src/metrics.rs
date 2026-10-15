@@ -1,21 +1,44 @@
 use late_core::models::article::NewsShareReward;
 use late_core::models::chat_message_gild::GildTier;
-use late_core::models::leaderboard::DoorGame;
+use late_core::models::chat_room::WatchDoor;
+use late_core::models::leaderboard::{DailyPuzzle, DoorGame};
 use late_core::models::media_queue_item::SongQueueReward;
 
 use crate::app::activity::event::ActivityGame;
 use crate::app::arcade::share::ShareCardKind;
 use crate::app::arcade::sliding_puzzle::svc::SlidingPuzzleArtLoad;
+use crate::app::audio::radio_meta::polled::PolledFeed;
+use crate::app::audio::radio_meta::svc::PollOutcome;
+use crate::app::audio::svc::ThumbnailFetch;
 use crate::app::bonsai::state::BonsaiAction;
 use crate::app::bonsai::svc::BonsaiActionResult;
+use crate::app::calendar::svc::{CalendarAnnouncement, CalendarOp, CalendarWrite};
 use crate::app::chat::news::svc::XMediaLookup;
 use crate::app::chat::svc::GildRefusal;
-use crate::app::clubhouse::nightcap::svc::NightcapOrderResult;
+use crate::app::clubhouse::nightcap::svc::{NightcapHouseFailure, NightcapOrderResult};
+use crate::app::common::primitives::Screen;
 use crate::app::crown::svc::CrownRefusal;
 use crate::app::deadchannel::haunt::state::GateVerdict;
-use crate::app::games::chips::svc::RoundRefusal;
-use crate::app::lobby::daily::svc::{DailyWinPayout, PoolShotOutcome};
-use crate::app::pot::svc::PotRefusal;
+use crate::app::door::zork::protocol::{Action as ZorkAction, Edition as ZorkEdition};
+use crate::app::games::chips::svc::{GiftDrinkRefusal, RoundRefusal};
+use crate::app::leaderboard::svc::AwardAnnouncementOutcome;
+use crate::app::live::input::Origin as LiveOrigin;
+use crate::app::lobby::daily::svc::{DailyWinPayout, PoolShotOutcome, SnapshotRowError};
+use crate::app::pot::svc::{PotRefusal, PotReminderOutcome};
+use crate::app::referral::svc::{NewcomerMinuteResult, ReferralAttachOutcome, ReferralSettlement};
+use crate::ircd::conn::{IrcHistoryOutcome, IrcHistoryRequest};
+use crate::pg_listener::Refresh;
+use late_core::models::calendar::CalendarRefusalKind;
+use late_core::models::referral::ReferralSource;
+
+/// What put the away screensaver up (`App::sync_away`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreensaverTrigger {
+    /// Thirty quiet minutes (`common::away::AWAY_AFTER`).
+    Idle,
+    /// `/brb`.
+    Brb,
+}
 
 /// Why the render loop drew a frame. The loop can only distinguish its two
 /// wake sources; event-driven renders currently ride the world tick, so they
@@ -71,18 +94,61 @@ pub enum PaperPrintResult {
     Failed,
 }
 
-/// How a request to open the paper resolved. `Login` and `Command` are the
-/// two ways a reader got it; the rest are why they did not.
+/// How a request to open the paper resolved. `Login`, `Command`, and
+/// `Browse` (`←`/`→` in the open paper) are the ways a reader got it; the
+/// rest are why they did not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaperOpenResult {
     Login,
     Command,
+    Browse,
     /// Nothing printed for today's edition.
     Empty,
+    /// `/paper YYYY-MM-DD` named an edition the press never printed.
+    NotPrinted,
     /// This account's login pop for the edition was already claimed.
     AlreadyShown,
-    /// The paper's kill switch is off, or AI is unconfigured here.
-    Unavailable,
+    Failed,
+}
+
+/// How one source's fetch in the nightly job press (`app/jobs`) went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobsFetchResult {
+    Fetched,
+    Failed,
+    /// One item of a source (an HN comment, a Jobicy tag) that failed and
+    /// was skipped; the rest of the source still lands.
+    ItemSkipped,
+}
+
+/// How one posting's model read ended. Every variant but `Failed` settles
+/// the row; `Failed` keeps it pending for the next night.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobsReadResult {
+    Queued,
+    Active,
+    Dropped,
+    Dead,
+    Failed,
+}
+
+/// How a replica's check of the day's press run ended. `Ran` is the one
+/// that spent the calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobsPressResult {
+    Ran,
+    /// Another replica holds or held the day's claim; nothing spent.
+    Lost,
+    Failed,
+}
+
+/// How a person's own write on the Jobs shelf ended: a posting saved, one
+/// taken down, refused at the per-person cap, or failed in the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobsPostResult {
+    Posted,
+    Retracted,
+    AtCap,
     Failed,
 }
 
@@ -140,6 +206,238 @@ pub enum FirstContactBeat {
     RunnerCreated,
 }
 
+/// One fight command settling on the runner row (`deadchannel/fight`).
+/// `Refused` is a command the row turned down (no rations, signal down,
+/// the armorer's or patch's no); `Outfitted` is a piece bought at the
+/// armorer; `Patched` is the signal bought back at patch; `SteppedDown`
+/// is a fight started against the glyph a level down; `Deposited` and
+/// `Withdrew` are the locker, `Borrowed` and `Repaid` the bits machine,
+/// `Reset` the step off the ledge; `Failed` is the write not landing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FightBeat {
+    Started,
+    SteppedDown,
+    /// A step onto a bright glyph's node.
+    Bright,
+    Resumed,
+    /// A card played, the fight still on.
+    Played,
+    /// A turn ended, both standing.
+    Round,
+    /// A card drafted into the deck.
+    Drafted,
+    /// A rest on the road: the static out of the deck.
+    Cleared,
+    /// A cache on the road taken.
+    Cached,
+    Won,
+    /// The Old Signal put down: a mark and the reset.
+    Slain,
+    Lost,
+    Escaped,
+    Outfitted,
+    Patched,
+    Deposited,
+    Withdrew,
+    Borrowed,
+    Repaid,
+    Reset,
+    /// A glass poured at Dead Air.
+    Drank,
+    /// A piece bought off the blade cart.
+    Carted,
+    /// A draft inked at INK.
+    Inked,
+    /// A lounge glyph's leavings onto the sheet (`deadchannel/lounge`).
+    Pocketed,
+    /// A step onto the crossing: a sleeper on the row.
+    Crossed,
+    /// The sleeper's answer: the one who crossed them on the row.
+    Answered,
+    /// A rival put down.
+    Ambushed,
+    /// The signal dropped to a rival.
+    Downed,
+    Refused,
+    Failed,
+    /// The lookout beside an answer or a reload did not read; the
+    /// answer stood, the session got an empty lookout.
+    LookoutFailed,
+}
+
+/// One beat of the lounge spawns (`deadchannel/lounge`): a spawn landed,
+/// a hit on it, it put down, it slipped away; a hitter paid, one with no
+/// standing runner left unpaid, a pay that erred; a hit the row turned
+/// down (already hit, nothing live, signal down), a hit that did not land;
+/// a row that moved but could not be announced to the replicas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoungeBeat {
+    Spawned,
+    Hit,
+    Slain,
+    Slipped,
+    Paid,
+    PayLeft,
+    PayFailed,
+    HitRefused,
+    HitFailed,
+    NotifyFailed,
+}
+
+/// The Old Signal's chips after a kill (`fight/svc.rs::pay_mark`): `Paid`
+/// landed, `InsideMonth` is the 30-day gate refusing a second mark, `Failed`
+/// is the grant erroring, the debt left on the row for the next touch to
+/// retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldSignalPayout {
+    Paid,
+    InsideMonth,
+    Failed,
+}
+
+/// A look written at the tailor's mirror (`app/deadchannel/tailor`):
+/// `Worn` landed, `NoRunner` found no standing runner to dress, `Failed`
+/// is the write not landing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailorBeat {
+    Worn,
+    NoRunner,
+    Failed,
+}
+
+/// What the presence wire did (`app/presence`): `Published` a notify
+/// sent, `PublishFailed` one that did not land (the next heartbeat carries
+/// it again), `Heard` another replica's batch folded in, `Rejected` a
+/// payload that failed to parse, `Expired` a remote session dropped
+/// because its replica went quiet (a dead replica, or a leaver missed
+/// across a LISTEN reconnect).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceWire {
+    Published,
+    PublishFailed,
+    Heard,
+    Rejected,
+    Expired,
+}
+
+/// Which presence records a replica counts (`app/presence`): `Local` its
+/// own sessions, `All` every live record it holds, its own and every other
+/// replica's. `All` should read the same on every replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceScope {
+    Local,
+    All,
+}
+
+/// A stage of a session's start, from TCP accept to the first frame on
+/// the user's screen. `Total` is the whole span; the other three add up
+/// to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStartStage {
+    /// Accept to key accepted: SSH handshake plus the user lookup.
+    Auth,
+    /// Key accepted to the `App` built: channel and pty requests plus every
+    /// preload in `pty_request`.
+    Bootstrap,
+    /// `App` built to the first frame written to the channel.
+    FirstFrame,
+    Total,
+}
+
+/// Whether the session's account was created by this connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionUser {
+    New,
+    Returning,
+}
+
+/// Which board of a daily puzzle ended: the shared daily or a personal one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArcadeMode {
+    Daily,
+    Personal,
+}
+
+/// The difficulty of a finished Arcade board. `Single` is a game with one
+/// board a day and no difficulty (Le Word, Rubik's Cube).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArcadeDifficulty {
+    Easy,
+    Medium,
+    Hard,
+    DrawOne,
+    DrawThree,
+    Single,
+}
+
+/// How an Arcade board ended. Only Le Word (out of guesses) and
+/// Minesweeper (out of lives) can be lost; the rest end solved or not at
+/// all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArcadeFinish {
+    Won,
+    Lost,
+}
+
+/// Whether a session's second of attention had a key press behind it
+/// recently (`Active`) or is a terminal left open (`Idle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Active,
+    Idle,
+}
+
+/// Where inside a screen a session's attention landed. Most screens are one
+/// place (`Whole`); Home splits by what the chat pane shows, the Arcade and
+/// the House Table by open game, Profiles by shelf, the Artboard by what
+/// fills the board area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// A one-place screen, the Arcade lobby, the House Table with no table
+    /// open, a Home room not loaded yet, or an Artboard not yet joined.
+    Whole,
+    Home(HomeRoom),
+    /// The open Arcade board or House Table game.
+    Game(ActivityGame),
+    PeopleShelf,
+    JobsShelf,
+    ArtboardCanvas,
+    /// The gallery pane (a section's list or one piece) over the board.
+    ArtboardGallery,
+}
+
+/// What fills Home: one kind of chat room or a synthetic rail entry. A kind,
+/// never a room id, so the label set stays closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeRoom {
+    /// #lounge, drawn as the Home card.
+    Lounge,
+    Language,
+    PublicTopic,
+    PrivateTopic,
+    Dm,
+    Deadchannel,
+    /// A room whose kind has no name here yet.
+    OtherRoom,
+    Feeds,
+    News,
+    /// Any cyberspace entry: the feed, its notifications, a pinned room or
+    /// C-Mail conversation.
+    Cyberspace,
+    Notifications,
+    Discover,
+    Showcase,
+    Work,
+}
+
+/// How one attempt of a notify-driven re-read (`pg_listener::read_until_ok`)
+/// ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    Ok,
+    Failed,
+}
+
 /// A runner going through the door after the ladder is done. Leaving keeps
 /// the character (the row stays, `left_at` is stamped), so the two sides
 /// are one counter: the gap between them is how many runners are standing.
@@ -185,6 +483,76 @@ pub enum SshRejectReason {
     GlobalLimit,
 }
 
+/// How a viewer's watch stream of a live door game ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorWatchOutcome {
+    /// The host closed the stream: the game ended, or was never live.
+    Closed,
+    /// The viewer ended the watch: another rail row, leaving the hub with a
+    /// preview, the off-screen window running out.
+    Left,
+    /// Connect, auth, or a broken frame stream.
+    Failed,
+}
+
+/// How one Zork play session (one interpreter on the `late-zork` host)
+/// ended, as the client's tick saw it. The exit statuses are the host's
+/// contract (`door/zork/CONTEXT.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZorkSessionEnd {
+    /// The player quit the story (exit 0).
+    Quit,
+    /// A checkpointed return to the menus (exit 20): RESTORE, or the save
+    /// half of an edition switch.
+    Returned,
+    /// The selected save was invalid or unavailable (exit 21).
+    SaveRejected,
+    /// The host refused the launch for now (exit 75): another session of
+    /// this account holds the game, or the host is shutting down.
+    Busy,
+    /// Any other exit status, or the channel closing without one: the
+    /// interpreter or the host bridge broke.
+    Crashed,
+    /// Connect, auth, or the launch request failed, or the stream broke.
+    ConnectFailed,
+    /// Twenty minutes without game input; the client closed the session.
+    Idle,
+}
+
+/// How a switch away from a live Zork game (another edition, a manual load,
+/// a new game) resolved. The old game must checkpoint and exit before the
+/// next one starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZorkSwitchResult {
+    /// The old game checkpointed and the next one launched.
+    Switched,
+    /// The old game closed without a successful checkpoint exit.
+    SaveFailed,
+    /// No exit within the return timeout; the old game stays open.
+    TimedOut,
+}
+
+/// How a read of the account's six Zork save slots (the menu's metadata,
+/// its own `list` request) resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZorkCatalogueRead {
+    Read,
+    Failed,
+}
+
+/// What F3 did on a player's own Zork game: type the newest command a
+/// watcher suggested into the story's prompt, or nothing, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZorkSuggestion {
+    /// The suggestion went onto the empty prompt line.
+    Typed,
+    /// The story was not at an empty prompt (the player was typing, a
+    /// confirmation or pagination was up), so nothing was typed.
+    NotAtPrompt,
+    /// No fresh suggestion was waiting.
+    NoneWaiting,
+}
+
 /// The band count a paired CLI's `viz` frame arrived with. CLIs from before
 /// the 16-band analyzer send 8, which the pair socket stretches to 16.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,25 +563,47 @@ pub enum VizWireBands {
 
 #[cfg(feature = "otel")]
 mod inner {
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
+
+    use late_core::models::user::{AsciiPiece, AsciiSelection};
 
     use opentelemetry::{
         KeyValue, global,
-        metrics::{Counter, UpDownCounter},
+        metrics::{Counter, Gauge, Histogram, ObservableGauge, UpDownCounter},
     };
+    use tokio::sync::Semaphore;
 
+    use crate::app::activity::event::GameFamily;
+
+    use super::HomeRoom;
+    use super::ScreensaverTrigger;
     use super::ShareCardKind;
     use super::SlidingPuzzleArtLoad;
     use super::XMediaLookup;
     use super::{
-        ActivityGame, BioScreenOutcome, CrownRefusal, DailyWinPayout, DoorGame, FirstContactBeat,
-        GalleryApplauseResult, GalleryHangResult, GalleryTakeDownResult, GateVerdict, GildRefusal,
-        GildTier, NewsShareReward, NightcapOrderResult, OnlineTimeFlushResult, PaperOpenResult,
-        PaperPrintResult, PoolShotOutcome, PotRefusal, RenderReason, RoundRefusal, RunnerDoor,
-        SongQueueReward, SshRejectReason, SummaryResult, TranslationResult, VizWireBands,
+        ActivityGame, ArcadeDifficulty, ArcadeFinish, ArcadeMode, AwardAnnouncementOutcome,
+        BioScreenOutcome, CrownRefusal, DailyPuzzle, DailyWinPayout, DoorGame, DoorWatchOutcome,
+        FightBeat, FirstContactBeat, GalleryApplauseResult, GalleryHangResult,
+        GalleryTakeDownResult, GateVerdict, GiftDrinkRefusal, GildRefusal, GildTier,
+        JobsFetchResult, JobsPostResult, JobsPressResult, JobsReadResult, LoungeBeat,
+        NewsShareReward, NightcapHouseFailure, NightcapOrderResult, OldSignalPayout,
+        OnlineTimeFlushResult, PaperOpenResult, PaperPrintResult, Place, PoolShotOutcome,
+        PotRefusal, PotReminderOutcome, Presence, PresenceScope, PresenceWire, Refresh,
+        RefreshOutcome, RenderReason, RoundRefusal, RunnerDoor, Screen, SessionStartStage,
+        SessionUser, SnapshotRowError, SongQueueReward, SshRejectReason, SummaryResult, TailorBeat,
+        ThumbnailFetch, TranslationResult, VizWireBands, WatchDoor,
     };
     use super::{BonsaiAction, BonsaiActionResult};
+    use super::{CalendarAnnouncement, CalendarOp, CalendarRefusalKind, CalendarWrite, LiveOrigin};
+    use super::{IrcHistoryOutcome, IrcHistoryRequest};
+    use super::{NewcomerMinuteResult, ReferralAttachOutcome, ReferralSettlement, ReferralSource};
+    use super::{PollOutcome, PolledFeed};
+    use super::{
+        ZorkAction, ZorkCatalogueRead, ZorkEdition, ZorkSessionEnd, ZorkSuggestion,
+        ZorkSwitchResult,
+    };
     use crate::app::bonsai::state::BranchAction;
+    use crate::app::referral::state::AttachRefusal;
 
     fn meter() -> opentelemetry::metrics::Meter {
         global::meter("late-ssh")
@@ -433,6 +823,7 @@ mod inner {
         match refusal {
             CrownRefusal::AlreadyYours => "already_yours",
             CrownRefusal::InsufficientChips { .. } => "insufficient_chips",
+            CrownRefusal::BidTooLow { .. } => "bid_too_low",
         }
     }
 
@@ -500,6 +891,46 @@ mod inner {
             RoundRefusal::AllHolding => "all_holding",
             RoundRefusal::InsufficientChips { .. } => "insufficient_chips",
         }
+    }
+
+    fn gift_drink_refusal_label(refusal: GiftDrinkRefusal) -> &'static str {
+        match refusal {
+            GiftDrinkRefusal::UnknownRecipient => "unknown_recipient",
+            GiftDrinkRefusal::SelfGift => "self_gift",
+            GiftDrinkRefusal::BotRecipient => "bot_recipient",
+            GiftDrinkRefusal::AllHolding => "all_holding",
+            GiftDrinkRefusal::InsufficientChips => "insufficient_chips",
+        }
+    }
+
+    fn gift_drinks_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_gift_drinks_total")
+                .with_description("Drinks left on one named patron's tab that settled")
+                .build()
+        })
+    }
+
+    fn gift_drink_chips_burned_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_gift_drink_chips_burned_total")
+                .with_description("Chips destroyed by gift drinks (the whole price)")
+                .build()
+        })
+    }
+
+    fn gift_drinks_refused_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_gift_drinks_refused_total")
+                .with_description("Gift drinks refused, by reason (none were charged)")
+                .build()
+        })
     }
 
     fn rounds_total() -> &'static Counter<u64> {
@@ -573,6 +1004,25 @@ mod inner {
         })
     }
 
+    fn nightcap_house_failure_label(failure: NightcapHouseFailure) -> &'static str {
+        match failure {
+            NightcapHouseFailure::CreditCount => "credit_count",
+            NightcapHouseFailure::HouseLine => "house_line",
+        }
+    }
+
+    fn nightcap_house_failures_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_nightcap_house_failures_total")
+                .with_description(
+                    "Nightcap off-thread work that failed (a stale free-drink count, a house line never posted), by which",
+                )
+                .build()
+        })
+    }
+
     fn pot_refusal_label(refusal: PotRefusal) -> &'static str {
         match refusal {
             PotRefusal::Closed => "closed",
@@ -641,6 +1091,209 @@ mod inner {
         })
     }
 
+    fn pot_reminder_label(outcome: PotReminderOutcome) -> &'static str {
+        match outcome {
+            PotReminderOutcome::Posted => "posted",
+            PotReminderOutcome::Failed => "failed",
+        }
+    }
+
+    fn award_announcement_label(outcome: AwardAnnouncementOutcome) -> &'static str {
+        match outcome {
+            AwardAnnouncementOutcome::Posted => "posted",
+            AwardAnnouncementOutcome::ClaimFailed => "claim_failed",
+            AwardAnnouncementOutcome::PostFailed => "post_failed",
+        }
+    }
+
+    fn award_announcements_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_award_announcements_total")
+                .with_description(
+                    "The monthly award roll in #lounge, by outcome; a month with no posted roll is a rollover nobody heard about",
+                )
+                .build()
+        })
+    }
+
+    fn referral_source_label(source: ReferralSource) -> &'static str {
+        match source {
+            ReferralSource::Ssh => "ssh",
+            ReferralSource::Settings => "settings",
+        }
+    }
+
+    fn referral_attach_label(outcome: ReferralAttachOutcome) -> &'static str {
+        match outcome {
+            ReferralAttachOutcome::Attached => "attached",
+            ReferralAttachOutcome::Refused(AttachRefusal::UnknownCode) => "unknown_code",
+            ReferralAttachOutcome::Refused(AttachRefusal::OwnCode) => "own_code",
+            ReferralAttachOutcome::Refused(AttachRefusal::WindowClosed) => "window_closed",
+            ReferralAttachOutcome::Refused(AttachRefusal::InviterNewer) => "inviter_newer",
+            ReferralAttachOutcome::Refused(AttachRefusal::AlreadyInvited) => "already_invited",
+            ReferralAttachOutcome::Failed => "failed",
+        }
+    }
+
+    fn referral_settlement_label(settlement: ReferralSettlement) -> &'static str {
+        match settlement {
+            ReferralSettlement::Qualified => "qualified",
+            ReferralSettlement::Expired => "expired",
+            ReferralSettlement::Paid => "paid",
+            ReferralSettlement::Deferred => "deferred",
+            ReferralSettlement::Failed => "failed",
+        }
+    }
+
+    fn newcomer_minute_label(result: NewcomerMinuteResult) -> &'static str {
+        match result {
+            NewcomerMinuteResult::Counted => "counted",
+            NewcomerMinuteResult::AlreadyCounted => "already_counted",
+            NewcomerMinuteResult::Failed => "failed",
+        }
+    }
+
+    fn referral_attaches_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_referral_attaches_total")
+                .with_description("Invite codes offered by new accounts, by source and outcome")
+                .build()
+        })
+    }
+
+    fn referral_settlements_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_referral_settlements_total")
+                .with_description(
+                    "Referral status moves made by the sweeper, by outcome; each paid one minted the reward and the welcome bonus, and deferred is a payout the monthly cap stopped",
+                )
+                .build()
+        })
+    }
+
+    fn newcomer_minutes_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_newcomer_minutes_total")
+                .with_description(
+                    "Active minutes reported by young accounts' sessions, by result; already_counted is a second session typing in the same minute",
+                )
+                .build()
+        })
+    }
+
+    fn pot_reminders_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_pot_reminders_total")
+                .with_description(
+                    "The pot's last call in #lounge, by outcome; a quiet week with no posted line is a reminder that never fired",
+                )
+                .build()
+        })
+    }
+
+    fn calendar_write_label(write: CalendarWrite) -> &'static str {
+        match write {
+            CalendarWrite::BoardPosted => "board_posted",
+            CalendarWrite::PersonalPosted => "personal_posted",
+            CalendarWrite::Edited => "edited",
+            CalendarWrite::Deleted => "deleted",
+            CalendarWrite::StaffDeleted => "staff_deleted",
+            CalendarWrite::RsvpIn => "rsvp_in",
+            CalendarWrite::RsvpOut => "rsvp_out",
+        }
+    }
+
+    fn calendar_op_label(op: CalendarOp) -> &'static str {
+        match op {
+            CalendarOp::Load => "load",
+            CalendarOp::Open => "open",
+            CalendarOp::Save => "save",
+            CalendarOp::Delete => "delete",
+            CalendarOp::Rsvp => "rsvp",
+            CalendarOp::Announce => "announce",
+        }
+    }
+
+    fn calendar_announcement_label(announcement: CalendarAnnouncement) -> &'static str {
+        match announcement {
+            CalendarAnnouncement::Posted => "posted",
+            CalendarAnnouncement::Starting => "starting",
+        }
+    }
+
+    fn live_origin_label(origin: LiveOrigin) -> &'static str {
+        match origin {
+            LiveOrigin::Strip => "strip",
+            LiveOrigin::Panel => "panel",
+        }
+    }
+
+    fn calendar_writes_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_calendar_writes_total")
+                .with_description(
+                    "Settled writes to the events board and personal calendars, by what the write was",
+                )
+                .build()
+        })
+    }
+
+    fn calendar_refusals_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_calendar_refusals_total")
+                .with_description("Calendar writes refused, by the rule that refused them")
+                .build()
+        })
+    }
+
+    fn calendar_failures_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_calendar_failures_total")
+                .with_description("Calendar operations that failed in the database, by operation")
+                .build()
+        })
+    }
+
+    fn calendar_announcements_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_calendar_announcements_total")
+                .with_description(
+                    "Board lines handed to #lounge: a post, or a start claimed by this replica",
+                )
+                .build()
+        })
+    }
+
+    fn calendar_opens_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_calendar_opens_total")
+                .with_description(
+                    "Board events opened from the live strip or the Live panel, by which surface brought the viewer",
+                )
+                .build()
+        })
+    }
+
     fn chat_gilds_total() -> &'static Counter<u64> {
         static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
         METRIC.get_or_init(|| {
@@ -668,6 +1321,30 @@ mod inner {
                 .u64_counter("late_ssh_daily_win_payouts_total")
                 .with_description(
                     "Daily correspondence match wins by what the chips did (paid, or refused by a lobby gate)",
+                )
+                .build()
+        })
+    }
+
+    fn daily_snapshot_rows_rejected_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_daily_snapshot_rows_rejected_total")
+                .with_description(
+                    "Daily match rows left out of the lobby snapshot, by reason, counted once per replica when a row first goes missing. `unknown_game` is expected during a rolling deploy that adds a game; anything else is a corrupt row or a build that cannot read what another wrote",
+                )
+                .build()
+        })
+    }
+
+    fn irc_history_requests_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_irc_history_requests_total")
+                .with_description(
+                    "IRC history reads by who asked (a CHATHISTORY command, or the automatic replay after JOIN) and how they resolved. `failed` is a database error; `rate_limited`, `invalid_request`, `invalid_target`, and `invalid_reference` are refusals a client loop would repeat",
                 )
                 .build()
         })
@@ -717,6 +1394,28 @@ mod inner {
         })
     }
 
+    fn radio_meta_polls_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_radio_meta_polls_total")
+                .with_description("Now-playing polls of third-party radio providers")
+                .build()
+        })
+    }
+
+    fn booth_thumbnails_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_booth_thumbnails_total")
+                .with_description(
+                    "YouTube thumbnail fetches for the live strip, once per track per replica",
+                )
+                .build()
+        })
+    }
+
     fn songs_queued_total() -> &'static Counter<u64> {
         static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
         METRIC.get_or_init(|| {
@@ -742,7 +1441,62 @@ mod inner {
         METRIC.get_or_init(|| {
             meter()
                 .u64_counter("late_ssh_game_wins_total")
-                .with_description("Games won by game name")
+                .with_description("Games won by game name and family (Lateania counts mob kills)")
+                .build()
+        })
+    }
+
+    fn pg_refresh_seconds() -> &'static Histogram<f64> {
+        static METRIC: OnceLock<Histogram<f64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .f64_histogram("late_ssh_pg_refresh_seconds")
+                .with_description(
+                    "Notify-driven re-reads of shared state, one attempt each, by domain and outcome",
+                )
+                .with_unit("s")
+                .with_boundaries(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0])
+                .build()
+        })
+    }
+
+    fn session_start_seconds() -> &'static Histogram<f64> {
+        static METRIC: OnceLock<Histogram<f64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .f64_histogram("late_ssh_session_start_seconds")
+                .with_description(
+                    "Time from TCP accept to the first frame on screen, by stage and new or returning user",
+                )
+                .with_unit("s")
+                .with_boundaries(vec![
+                    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 60.0,
+                ])
+                .build()
+        })
+    }
+
+    fn arcade_finishes_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_arcade_finishes_total")
+                .with_description(
+                    "Arcade daily-puzzle boards ended on a session, by game, mode, difficulty and finish",
+                )
+                .build()
+        })
+    }
+
+    fn attention_seconds_total() -> &'static Counter<f64> {
+        static METRIC: OnceLock<Counter<f64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .f64_counter("late_ssh_attention_seconds_total")
+                .with_description(
+                    "Session seconds spent per screen and place inside it, split by recent input",
+                )
+                .with_unit("s")
                 .build()
         })
     }
@@ -753,6 +1507,70 @@ mod inner {
             meter()
                 .u64_counter("late_ssh_first_contact_beats_total")
                 .with_description("First-contact ladder beats delivered, by beat")
+                .build()
+        })
+    }
+
+    fn deadchannel_fights_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_deadchannel_fights_total")
+                .with_description("deadchannel fight commands settled on the runner row, by beat")
+                .build()
+        })
+    }
+
+    fn deadchannel_old_signal_payouts_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_deadchannel_old_signal_payouts_total")
+                .with_description(
+                    "Old Signal kills by what the chips did (paid, refused by the month's gate, or the grant failing)",
+                )
+                .build()
+        })
+    }
+
+    fn presence_records() -> &'static Gauge<u64> {
+        static METRIC: OnceLock<Gauge<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_gauge("late_ssh_presence_records")
+                .with_description(
+                    "presence records a replica holds, its own sessions (local) or every one (all)",
+                )
+                .build()
+        })
+    }
+
+    fn presence_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_presence_total")
+                .with_description("presence (tavern, stools, street) on the wire, by beat")
+                .build()
+        })
+    }
+
+    fn deadchannel_tailor_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_deadchannel_tailor_total")
+                .with_description("deadchannel looks written at the tailor's mirror, by beat")
+                .build()
+        })
+    }
+
+    fn deadchannel_lounge_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_deadchannel_lounge_total")
+                .with_description("deadchannel lounge spawns, hits, and pay, by beat")
                 .build()
         })
     }
@@ -783,7 +1601,7 @@ mod inner {
             meter()
                 .u64_counter("late_ssh_first_contact_gate_total")
                 .with_description(
-                    "First-contact eligibility gate evaluations at connect (one per session, not per person), by verdict and audience",
+                    "First-contact eligibility gate evaluations at connect (one per session, not per person), by verdict",
                 )
                 .build()
         })
@@ -839,6 +1657,120 @@ mod inner {
         runner_door_total().add(1, &[KeyValue::new("direction", runner_door_label(door))]);
     }
 
+    fn fight_beat_label(beat: FightBeat) -> &'static str {
+        match beat {
+            FightBeat::Started => "started",
+            FightBeat::SteppedDown => "stepped_down",
+            FightBeat::Bright => "bright",
+            FightBeat::Resumed => "resumed",
+            FightBeat::Played => "played",
+            FightBeat::Round => "round",
+            FightBeat::Drafted => "drafted",
+            FightBeat::Cleared => "cleared",
+            FightBeat::Cached => "cached",
+            FightBeat::Won => "won",
+            FightBeat::Slain => "slain",
+            FightBeat::Lost => "lost",
+            FightBeat::Escaped => "escaped",
+            FightBeat::Outfitted => "outfitted",
+            FightBeat::Patched => "patched",
+            FightBeat::Deposited => "deposited",
+            FightBeat::Withdrew => "withdrew",
+            FightBeat::Borrowed => "borrowed",
+            FightBeat::Repaid => "repaid",
+            FightBeat::Drank => "drank",
+            FightBeat::Carted => "carted",
+            FightBeat::Inked => "inked",
+            FightBeat::Pocketed => "pocketed",
+            FightBeat::Crossed => "crossed",
+            FightBeat::Answered => "answered",
+            FightBeat::Ambushed => "ambushed",
+            FightBeat::Downed => "downed",
+            FightBeat::Reset => "reset",
+            FightBeat::Refused => "refused",
+            FightBeat::Failed => "failed",
+            FightBeat::LookoutFailed => "lookout_failed",
+        }
+    }
+
+    fn tailor_beat_label(beat: TailorBeat) -> &'static str {
+        match beat {
+            TailorBeat::Worn => "worn",
+            TailorBeat::NoRunner => "no_runner",
+            TailorBeat::Failed => "failed",
+        }
+    }
+
+    pub fn record_deadchannel_tailor(beat: TailorBeat) {
+        deadchannel_tailor_total().add(1, &[KeyValue::new("beat", tailor_beat_label(beat))]);
+    }
+
+    fn lounge_beat_label(beat: LoungeBeat) -> &'static str {
+        match beat {
+            LoungeBeat::Spawned => "spawned",
+            LoungeBeat::Hit => "hit",
+            LoungeBeat::Slain => "slain",
+            LoungeBeat::Slipped => "slipped",
+            LoungeBeat::Paid => "paid",
+            LoungeBeat::PayLeft => "pay_left",
+            LoungeBeat::PayFailed => "pay_failed",
+            LoungeBeat::HitRefused => "hit_refused",
+            LoungeBeat::HitFailed => "hit_failed",
+            LoungeBeat::NotifyFailed => "notify_failed",
+        }
+    }
+
+    pub fn record_deadchannel_lounge(beat: LoungeBeat) {
+        deadchannel_lounge_total().add(1, &[KeyValue::new("beat", lounge_beat_label(beat))]);
+    }
+
+    fn presence_wire_label(beat: PresenceWire) -> &'static str {
+        match beat {
+            PresenceWire::Published => "published",
+            PresenceWire::PublishFailed => "publish_failed",
+            PresenceWire::Heard => "heard",
+            PresenceWire::Rejected => "rejected",
+            PresenceWire::Expired => "expired",
+        }
+    }
+
+    pub fn record_presence(beat: PresenceWire) {
+        presence_total().add(1, &[KeyValue::new("beat", presence_wire_label(beat))]);
+    }
+
+    fn presence_scope_label(scope: PresenceScope) -> &'static str {
+        match scope {
+            PresenceScope::Local => "local",
+            PresenceScope::All => "all",
+        }
+    }
+
+    pub fn record_presence_records(scope: PresenceScope, count: usize) {
+        presence_records().record(
+            count as u64,
+            &[KeyValue::new("scope", presence_scope_label(scope))],
+        );
+    }
+
+    pub fn record_deadchannel_fight(beat: FightBeat) {
+        deadchannel_fights_total().add(1, &[KeyValue::new("beat", fight_beat_label(beat))]);
+    }
+
+    fn old_signal_payout_label(payout: OldSignalPayout) -> &'static str {
+        match payout {
+            OldSignalPayout::Paid => "paid",
+            OldSignalPayout::InsideMonth => "inside_month",
+            OldSignalPayout::Failed => "failed",
+        }
+    }
+
+    pub fn record_deadchannel_old_signal_payout(payout: OldSignalPayout) {
+        deadchannel_old_signal_payouts_total().add(
+            1,
+            &[KeyValue::new("outcome", old_signal_payout_label(payout))],
+        );
+    }
+
     pub fn record_first_contact_bio_screen(outcome: BioScreenOutcome) {
         first_contact_bio_screens_total().add(
             1,
@@ -846,16 +1778,15 @@ mod inner {
         );
     }
 
-    /// One gate evaluation at connect. `staff` splits admins and
-    /// moderators (haunted while the fuse is unlit) from everyone else.
-    pub fn record_first_contact_gate(verdict: GateVerdict, staff: bool) {
-        let audience = if staff { "staff" } else { "public" };
+    /// One gate evaluation at connect. Only staff (admins and moderators)
+    /// reach the gate, so the verdict is the whole label set.
+    pub fn record_first_contact_gate(verdict: GateVerdict) {
         first_contact_gate_total().add(
             1,
-            &[
-                KeyValue::new("verdict", first_contact_gate_verdict_label(verdict)),
-                KeyValue::new("audience", audience),
-            ],
+            &[KeyValue::new(
+                "verdict",
+                first_contact_gate_verdict_label(verdict),
+            )],
         );
     }
 
@@ -962,8 +1893,280 @@ mod inner {
         chat_messages_edited_total().add(1, &[]);
     }
 
+    fn game_family_label(family: GameFamily) -> &'static str {
+        match family {
+            GameFamily::ArcadeDaily => "arcade_daily",
+            GameFamily::ArcadeScore => "arcade_score",
+            GameFamily::Door => "door",
+            GameFamily::Lateania => "lateania",
+            GameFamily::Table => "table",
+            GameFamily::Match => "match",
+        }
+    }
+
     pub fn record_game_win(game: ActivityGame) {
-        game_wins_total().add(1, &[KeyValue::new("game", game_label(game))]);
+        game_wins_total().add(
+            1,
+            &[
+                KeyValue::new("game", game_label(game)),
+                KeyValue::new("family", game_family_label(game.family())),
+            ],
+        );
+    }
+
+    fn session_start_stage_label(stage: SessionStartStage) -> &'static str {
+        match stage {
+            SessionStartStage::Auth => "auth",
+            SessionStartStage::Bootstrap => "bootstrap",
+            SessionStartStage::FirstFrame => "first_frame",
+            SessionStartStage::Total => "total",
+        }
+    }
+
+    fn session_user_label(user: SessionUser) -> &'static str {
+        match user {
+            SessionUser::New => "new",
+            SessionUser::Returning => "returning",
+        }
+    }
+
+    pub fn record_session_start(stage: SessionStartStage, user: SessionUser, seconds: f64) {
+        session_start_seconds().record(
+            seconds,
+            &[
+                KeyValue::new("stage", session_start_stage_label(stage)),
+                KeyValue::new("user", session_user_label(user)),
+            ],
+        );
+    }
+
+    fn refresh_label(refresh: Refresh) -> &'static str {
+        match refresh {
+            Refresh::RunnerLooks => "runner_looks",
+            Refresh::LoungeSpawn => "lounge_spawn",
+            Refresh::CrownHolder => "crown_holder",
+            Refresh::DailyMatches => "daily_matches",
+            Refresh::Pot => "pot",
+            Refresh::Articles => "articles",
+            Refresh::ActiveQuestBoards => "active_quest_boards",
+            Refresh::ShopFlairDirectory => "shop_flair_directory",
+            Refresh::CalendarNotices => "calendar_notices",
+        }
+    }
+
+    fn refresh_outcome_label(outcome: RefreshOutcome) -> &'static str {
+        match outcome {
+            RefreshOutcome::Ok => "ok",
+            RefreshOutcome::Failed => "failed",
+        }
+    }
+
+    pub fn record_pg_refresh(refresh: Refresh, outcome: RefreshOutcome, seconds: f64) {
+        pg_refresh_seconds().record(
+            seconds,
+            &[
+                KeyValue::new("domain", refresh_label(refresh)),
+                KeyValue::new("outcome", refresh_outcome_label(outcome)),
+            ],
+        );
+    }
+
+    /// Report how many of chat's read permits are held on every metric
+    /// export. At `total` every room-tail and discover load queues behind
+    /// the semaphore. Call once per process.
+    pub fn observe_chat_read_permits(permits: Arc<Semaphore>, total: usize) {
+        static GAUGE: OnceLock<ObservableGauge<u64>> = OnceLock::new();
+        GAUGE.get_or_init(|| {
+            meter()
+                .u64_observable_gauge("late_ssh_chat_read_permits_in_use")
+                .with_description("Chat read permits held, out of the semaphore's fixed total")
+                .with_callback(move |observer| {
+                    let held = total.saturating_sub(permits.available_permits()) as u64;
+                    observer.observe(held, &[]);
+                })
+                .build()
+        });
+    }
+
+    fn arcade_mode_label(mode: ArcadeMode) -> &'static str {
+        match mode {
+            ArcadeMode::Daily => "daily",
+            ArcadeMode::Personal => "personal",
+        }
+    }
+
+    fn arcade_difficulty_label(difficulty: ArcadeDifficulty) -> &'static str {
+        match difficulty {
+            ArcadeDifficulty::Easy => "easy",
+            ArcadeDifficulty::Medium => "medium",
+            ArcadeDifficulty::Hard => "hard",
+            ArcadeDifficulty::DrawOne => "draw_1",
+            ArcadeDifficulty::DrawThree => "draw_3",
+            ArcadeDifficulty::Single => "single",
+        }
+    }
+
+    fn arcade_finish_label(finish: ArcadeFinish) -> &'static str {
+        match finish {
+            ArcadeFinish::Won => "won",
+            ArcadeFinish::Lost => "lost",
+        }
+    }
+
+    pub fn record_arcade_finish(
+        puzzle: DailyPuzzle,
+        mode: ArcadeMode,
+        difficulty: ArcadeDifficulty,
+        finish: ArcadeFinish,
+    ) {
+        // `DailyPuzzle::key` is the roster's own exhaustive label map.
+        arcade_finishes_total().add(
+            1,
+            &[
+                KeyValue::new("game", puzzle.key()),
+                KeyValue::new("mode", arcade_mode_label(mode)),
+                KeyValue::new("difficulty", arcade_difficulty_label(difficulty)),
+                KeyValue::new("finish", arcade_finish_label(finish)),
+            ],
+        );
+    }
+
+    fn screen_label(screen: Screen) -> &'static str {
+        match screen {
+            Screen::Dashboard => "dashboard",
+            Screen::Arcade => "arcade",
+            Screen::Games => "games",
+            Screen::Lateania => "lateania",
+            Screen::Rebels => "rebels",
+            Screen::Nethack => "nethack",
+            Screen::Dcss => "dcss",
+            Screen::Brogue => "brogue",
+            Screen::Dopewars => "dopewars",
+            Screen::Bashquest => "bashquest",
+            Screen::Codekeep => "codekeep",
+            Screen::Zork => "zork",
+            Screen::Usurper => "usurper",
+            Screen::GreenDragon => "greendragon",
+            Screen::Darkroom => "darkroom",
+            Screen::Artboard => "artboard",
+            Screen::Profiles => "profiles",
+            Screen::Leaderboard => "leaderboard",
+            Screen::Calendars => "calendars",
+            Screen::Clubhouse => "clubhouse",
+            Screen::Nightcap => "nightcap",
+            Screen::City => "city",
+            Screen::Zen => "zen",
+            Screen::DailyMatch => "daily_match",
+            Screen::HouseTable => "house_table",
+            Screen::Scratchpad => "scratchpad",
+        }
+    }
+
+    fn presence_label(presence: Presence) -> &'static str {
+        match presence {
+            Presence::Active => "active",
+            Presence::Idle => "idle",
+        }
+    }
+
+    fn home_room_label(room: HomeRoom) -> &'static str {
+        match room {
+            HomeRoom::Lounge => "lounge",
+            HomeRoom::Language => "language",
+            HomeRoom::PublicTopic => "topic_public",
+            HomeRoom::PrivateTopic => "topic_private",
+            HomeRoom::Dm => "dm",
+            HomeRoom::Deadchannel => "deadchannel",
+            HomeRoom::OtherRoom => "other_room",
+            HomeRoom::Feeds => "feeds",
+            HomeRoom::News => "news",
+            HomeRoom::Cyberspace => "cyberspace",
+            HomeRoom::Notifications => "notifications",
+            HomeRoom::Discover => "discover",
+            HomeRoom::Showcase => "showcase",
+            HomeRoom::Work => "work",
+        }
+    }
+
+    fn place_label(place: Place) -> &'static str {
+        match place {
+            Place::Whole => "none",
+            Place::Home(room) => home_room_label(room),
+            Place::Game(game) => game_label(game),
+            Place::PeopleShelf => "people",
+            Place::JobsShelf => "jobs",
+            Place::ArtboardCanvas => "canvas",
+            Place::ArtboardGallery => "gallery",
+        }
+    }
+
+    pub fn record_attention(screen: Screen, place: Place, presence: Presence, seconds: f64) {
+        attention_seconds_total().add(
+            seconds,
+            &[
+                KeyValue::new("screen", screen_label(screen)),
+                KeyValue::new("place", place_label(place)),
+                KeyValue::new("presence", presence_label(presence)),
+            ],
+        );
+    }
+
+    fn place_visits_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_place_visits_total")
+                .with_description(
+                    "Arrivals on a screen (and place inside it), sampled on the 1Hz attention edge",
+                )
+                .build()
+        })
+    }
+
+    pub fn record_place_visit(screen: Screen, place: Place) {
+        place_visits_total().add(
+            1,
+            &[
+                KeyValue::new("screen", screen_label(screen)),
+                KeyValue::new("place", place_label(place)),
+            ],
+        );
+    }
+
+    fn screensavers_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_screensavers_total")
+                .with_description(
+                    "Away screensavers put up, by what put them up, the selection mode and the piece",
+                )
+                .build()
+        })
+    }
+
+    pub fn record_screensaver(
+        trigger: ScreensaverTrigger,
+        selection: AsciiSelection,
+        piece: AsciiPiece,
+    ) {
+        let trigger = match trigger {
+            ScreensaverTrigger::Idle => "idle",
+            ScreensaverTrigger::Brb => "brb",
+        };
+        let selection = match selection {
+            AsciiSelection::Piece(_) => "fixed",
+            AsciiSelection::Random => "random",
+            AsciiSelection::Randomer => "randomer",
+        };
+        screensavers_total().add(
+            1,
+            &[
+                KeyValue::new("trigger", trigger),
+                KeyValue::new("selection", selection),
+                KeyValue::new("piece", piece.as_str()),
+            ],
+        );
     }
 
     fn share_cards_total() -> &'static Counter<u64> {
@@ -986,6 +2189,7 @@ mod inner {
             ShareCardKind::RubiksCube => "rubiks_cube",
             ShareCardKind::SlidingPuzzle => "sliding_puzzle",
             ShareCardKind::Day => "day",
+            ShareCardKind::Road => "road",
         }
     }
 
@@ -1038,6 +2242,53 @@ mod inner {
         daily_win_payouts_total().add(
             1,
             &[KeyValue::new("outcome", daily_win_payout_label(payout))],
+        );
+    }
+
+    fn daily_snapshot_row_rejected_label(error: &SnapshotRowError) -> &'static str {
+        match error {
+            SnapshotRowError::UnknownGame(_) => "unknown_game",
+            SnapshotRowError::NoOpponent => "no_opponent",
+            SnapshotRowError::UnknownResult(_) => "unknown_result",
+            SnapshotRowError::UnreadableState(_) => "unreadable_state",
+        }
+    }
+
+    pub fn record_daily_snapshot_row_rejected(error: &SnapshotRowError) {
+        daily_snapshot_rows_rejected_total().add(
+            1,
+            &[KeyValue::new(
+                "reason",
+                daily_snapshot_row_rejected_label(error),
+            )],
+        );
+    }
+
+    fn irc_history_request_label(request: IrcHistoryRequest) -> &'static str {
+        match request {
+            IrcHistoryRequest::Explicit => "explicit",
+            IrcHistoryRequest::JoinReplay => "join_replay",
+        }
+    }
+
+    fn irc_history_outcome_label(outcome: IrcHistoryOutcome) -> &'static str {
+        match outcome {
+            IrcHistoryOutcome::Served => "served",
+            IrcHistoryOutcome::RateLimited => "rate_limited",
+            IrcHistoryOutcome::InvalidRequest => "invalid_request",
+            IrcHistoryOutcome::InvalidTarget => "invalid_target",
+            IrcHistoryOutcome::InvalidReference => "invalid_reference",
+            IrcHistoryOutcome::Failed => "failed",
+        }
+    }
+
+    pub fn record_irc_history(request: IrcHistoryRequest, outcome: IrcHistoryOutcome) {
+        irc_history_requests_total().add(
+            1,
+            &[
+                KeyValue::new("request", irc_history_request_label(request)),
+                KeyValue::new("outcome", irc_history_outcome_label(outcome)),
+            ],
         );
     }
 
@@ -1106,6 +2357,48 @@ mod inner {
         }
     }
 
+    fn thumbnail_fetch_label(outcome: ThumbnailFetch) -> &'static str {
+        match outcome {
+            ThumbnailFetch::Fetched => "fetched",
+            ThumbnailFetch::Failed => "failed",
+        }
+    }
+
+    pub fn record_radio_meta_poll(feed: PolledFeed, outcome: PollOutcome) {
+        let feed = match feed {
+            PolledFeed::Plaza => "plaza",
+            PolledFeed::CodeRadio => "coderadio",
+            PolledFeed::ParadiseMain => "paradise_main",
+            PolledFeed::ParadiseMellow => "paradise_mellow",
+            PolledFeed::ParadiseRock => "paradise_rock",
+            PolledFeed::ParadiseGlobe => "paradise_globe",
+            PolledFeed::ParadiseBeyond => "paradise_beyond",
+            PolledFeed::ParadiseKfat => "paradise_kfat",
+            PolledFeed::FipJazz => "fip_jazz",
+            PolledFeed::SwissJazz => "swiss_jazz",
+            PolledFeed::SwissClassic => "swiss_classic",
+        };
+        let outcome = match outcome {
+            PollOutcome::Updated => "updated",
+            PollOutcome::NoTrack => "no_track",
+            PollOutcome::Failed => "failed",
+        };
+        radio_meta_polls_total().add(
+            1,
+            &[
+                KeyValue::new("feed", feed),
+                KeyValue::new("outcome", outcome),
+            ],
+        );
+    }
+
+    pub fn record_booth_thumbnail(outcome: ThumbnailFetch) {
+        booth_thumbnails_total().add(
+            1,
+            &[KeyValue::new("outcome", thumbnail_fetch_label(outcome))],
+        );
+    }
+
     pub fn record_song_queued(reward: SongQueueReward) {
         songs_queued_total().add(
             1,
@@ -1157,6 +2450,21 @@ mod inner {
         rounds_refused_total().add(1, &[KeyValue::new("reason", round_refusal_label(refusal))]);
     }
 
+    /// A settled gift drink: one credit, its price burned whole. The pour
+    /// itself counts under `record_round_drink_cashed` when the recipient
+    /// orders, like any other credit.
+    pub fn record_gift_drink_bought(chips: i64) {
+        gift_drinks_total().add(1, &[]);
+        gift_drink_chips_burned_total().add(chips.max(0) as u64, &[]);
+    }
+
+    pub fn record_gift_drink_refused(refusal: GiftDrinkRefusal) {
+        gift_drinks_refused_total().add(
+            1,
+            &[KeyValue::new("reason", gift_drink_refusal_label(refusal))],
+        );
+    }
+
     /// A pour ordered off the Nightcap menu (rounds count under
     /// `record_round_bought`, whichever bar they were bought at).
     pub fn record_nightcap_order(result: NightcapOrderResult) {
@@ -1166,6 +2474,16 @@ mod inner {
     /// A patron walked up and drank a credit somebody else paid for.
     pub fn record_round_drink_cashed() {
         round_drinks_cashed_total().add(1, &[]);
+    }
+
+    /// The house's off-thread work at the Nightcap failed. Orders are counted
+    /// under `record_nightcap_order`; this is what a healthy order counter
+    /// cannot see: a quiet bar or a stale menu.
+    pub fn record_nightcap_house_failure(failure: NightcapHouseFailure) {
+        nightcap_house_failures_total().add(
+            1,
+            &[KeyValue::new("work", nightcap_house_failure_label(failure))],
+        );
     }
 
     /// A settled buy. Two counters, because the burn is only visible as the
@@ -1186,6 +2504,77 @@ mod inner {
         pot_draws_total().add(1, &[]);
         pot_tickets_drawn_total().add(tickets.max(0) as u64, &[]);
         pot_chips_out_total().add(payout.max(0) as u64, &[]);
+    }
+
+    /// The sweep's reminder arm. Only the claims that happened or errored
+    /// count; a sweep with no pot in its window is silence, not an outcome.
+    pub fn record_pot_reminder(outcome: PotReminderOutcome) {
+        pot_reminders_total().add(1, &[KeyValue::new("outcome", pot_reminder_label(outcome))]);
+    }
+
+    pub fn record_calendar_write(write: CalendarWrite) {
+        calendar_writes_total().add(1, &[KeyValue::new("write", calendar_write_label(write))]);
+    }
+
+    pub fn record_calendar_refusal(kind: CalendarRefusalKind) {
+        calendar_refusals_total().add(
+            1,
+            &[KeyValue::new(
+                "reason",
+                crate::app::calendar::svc::refusal_label(kind),
+            )],
+        );
+    }
+
+    pub fn record_calendar_failure(op: CalendarOp) {
+        calendar_failures_total().add(1, &[KeyValue::new("op", calendar_op_label(op))]);
+    }
+
+    pub fn record_calendar_announcement(announcement: CalendarAnnouncement) {
+        calendar_announcements_total().add(
+            1,
+            &[KeyValue::new(
+                "line",
+                calendar_announcement_label(announcement),
+            )],
+        );
+    }
+
+    pub fn record_calendar_open(origin: LiveOrigin) {
+        calendar_opens_total().add(1, &[KeyValue::new("from", live_origin_label(origin))]);
+    }
+
+    pub fn record_referral_attach(source: ReferralSource, outcome: ReferralAttachOutcome) {
+        referral_attaches_total().add(
+            1,
+            &[
+                KeyValue::new("source", referral_source_label(source)),
+                KeyValue::new("outcome", referral_attach_label(outcome)),
+            ],
+        );
+    }
+
+    pub fn record_referral_settlement(settlement: ReferralSettlement) {
+        referral_settlements_total().add(
+            1,
+            &[KeyValue::new(
+                "outcome",
+                referral_settlement_label(settlement),
+            )],
+        );
+    }
+
+    pub fn record_newcomer_minute(result: NewcomerMinuteResult) {
+        newcomer_minutes_total().add(1, &[KeyValue::new("result", newcomer_minute_label(result))]);
+    }
+
+    /// The award loop's roll arm. Only claims that happened or errored count;
+    /// a pass whose month was already announced is silence, not an outcome.
+    pub fn record_award_announcement(outcome: AwardAnnouncementOutcome) {
+        award_announcements_total().add(
+            1,
+            &[KeyValue::new("outcome", award_announcement_label(outcome))],
+        );
     }
 
     fn translation_result_label(result: TranslationResult) -> &'static str {
@@ -1272,9 +2661,10 @@ mod inner {
         match result {
             PaperOpenResult::Login => "login",
             PaperOpenResult::Command => "command",
+            PaperOpenResult::Browse => "browse",
             PaperOpenResult::Empty => "empty",
+            PaperOpenResult::NotPrinted => "not_printed",
             PaperOpenResult::AlreadyShown => "already_shown",
-            PaperOpenResult::Unavailable => "unavailable",
             PaperOpenResult::Failed => "failed",
         }
     }
@@ -1293,6 +2683,129 @@ mod inner {
         paper_opens_total().add(
             1,
             &[KeyValue::new("result", paper_open_result_label(result))],
+        );
+    }
+
+    fn jobs_fetch_result_label(result: JobsFetchResult) -> &'static str {
+        match result {
+            JobsFetchResult::Fetched => "fetched",
+            JobsFetchResult::Failed => "failed",
+            JobsFetchResult::ItemSkipped => "item_skipped",
+        }
+    }
+
+    fn jobs_fetches_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_jobs_fetches_total")
+                .with_description("Job feed source fetches by source and result")
+                .build()
+        })
+    }
+
+    pub fn record_jobs_fetch(
+        source: late_core::models::job_posting::JobSource,
+        result: JobsFetchResult,
+    ) {
+        jobs_fetches_total().add(
+            1,
+            &[
+                KeyValue::new("source", source.as_str()),
+                KeyValue::new("result", jobs_fetch_result_label(result)),
+            ],
+        );
+    }
+
+    fn jobs_read_result_label(result: JobsReadResult) -> &'static str {
+        match result {
+            JobsReadResult::Queued => "queued",
+            JobsReadResult::Active => "active",
+            JobsReadResult::Dropped => "dropped",
+            JobsReadResult::Dead => "dead",
+            JobsReadResult::Failed => "failed",
+        }
+    }
+
+    fn jobs_reads_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_jobs_reads_total")
+                .with_description("Job postings read by the model, by how the row settled")
+                .build()
+        })
+    }
+
+    pub fn record_jobs_read(result: JobsReadResult) {
+        jobs_reads_total().add(
+            1,
+            &[KeyValue::new("result", jobs_read_result_label(result))],
+        );
+    }
+
+    fn jobs_press_result_label(result: JobsPressResult) -> &'static str {
+        match result {
+            JobsPressResult::Ran => "ran",
+            JobsPressResult::Lost => "lost",
+            JobsPressResult::Failed => "failed",
+        }
+    }
+
+    fn jobs_press_runs_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_jobs_press_runs_total")
+                .with_description("Nightly job press runs by result")
+                .build()
+        })
+    }
+
+    pub fn record_jobs_press(result: JobsPressResult) {
+        jobs_press_runs_total().add(
+            1,
+            &[KeyValue::new("result", jobs_press_result_label(result))],
+        );
+    }
+
+    fn jobs_released_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_jobs_released_total")
+                .with_description("HN job postings released onto the shelf by the drip")
+                .build()
+        })
+    }
+
+    pub fn record_jobs_released(count: usize) {
+        jobs_released_total().add(count as u64, &[]);
+    }
+
+    fn jobs_post_result_label(result: JobsPostResult) -> &'static str {
+        match result {
+            JobsPostResult::Posted => "posted",
+            JobsPostResult::Retracted => "retracted",
+            JobsPostResult::AtCap => "at_cap",
+            JobsPostResult::Failed => "failed",
+        }
+    }
+
+    fn jobs_posts_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_jobs_posts_total")
+                .with_description("Job postings written or taken down on the shelf by result")
+                .build()
+        })
+    }
+
+    pub fn record_jobs_post(result: JobsPostResult) {
+        jobs_posts_total().add(
+            1,
+            &[KeyValue::new("result", jobs_post_result_label(result))],
         );
     }
 
@@ -1363,6 +2876,22 @@ mod inner {
         );
     }
 
+    fn gallery_splash_queue_depth() -> &'static Gauge<u64> {
+        static METRIC: OnceLock<Gauge<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_gauge("late_ssh_artboard_gallery_splash_queue_depth")
+                .with_description(
+                    "Artboard gallery pieces still waiting for a day on the splash wall",
+                )
+                .build()
+        })
+    }
+
+    pub fn record_gallery_splash_queue_depth(depth: i64) {
+        gallery_splash_queue_depth().record(depth as u64, &[]);
+    }
+
     fn gallery_applause_total() -> &'static Counter<u64> {
         static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
         METRIC.get_or_init(|| {
@@ -1416,6 +2945,197 @@ mod inner {
         door_ingest_session_failures_total().add(1, &[KeyValue::new("game", game.key())]);
     }
 
+    fn door_watch_outcome_label(outcome: DoorWatchOutcome) -> &'static str {
+        match outcome {
+            DoorWatchOutcome::Closed => "closed",
+            DoorWatchOutcome::Left => "left",
+            DoorWatchOutcome::Failed => "failed",
+        }
+    }
+
+    fn door_watch_streams_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_door_watch_streams_total")
+                .with_description(
+                    "Viewer watch streams of a live door game, by game and how they ended",
+                )
+                .build()
+        })
+    }
+
+    fn door_watch_roster_failures_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_door_watch_roster_failures_total")
+                .with_description(
+                    "Door live-game roster stream failures (connect or mid-stream) before a retry, by game",
+                )
+                .build()
+        })
+    }
+
+    pub fn record_door_watch_stream(game: WatchDoor, outcome: DoorWatchOutcome) {
+        door_watch_streams_total().add(
+            1,
+            &[
+                KeyValue::new("game", game.key()),
+                KeyValue::new("outcome", door_watch_outcome_label(outcome)),
+            ],
+        );
+    }
+
+    pub fn record_door_watch_roster_failure(game: WatchDoor) {
+        door_watch_roster_failures_total().add(1, &[KeyValue::new("game", game.key())]);
+    }
+
+    fn door_watch_chat_room_failures_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_door_watch_chat_room_failures_total")
+                .with_description(
+                    "Failures to resolve a player's watch-chat room (the lookup or its first create), by game",
+                )
+                .build()
+        })
+    }
+
+    pub fn record_door_watch_chat_room_failure(game: WatchDoor) {
+        door_watch_chat_room_failures_total().add(1, &[KeyValue::new("game", game.key())]);
+    }
+
+    fn zork_launches_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_zork_launches_total")
+                .with_description(
+                    "Zork play sessions started, by edition and what they loaded (auto, manual, new)",
+                )
+                .build()
+        })
+    }
+
+    pub fn record_zork_launch(edition: ZorkEdition, action: ZorkAction) {
+        // `Edition::key` and `Action::mode` are the wire protocol's own
+        // exhaustive label maps.
+        zork_launches_total().add(
+            1,
+            &[
+                KeyValue::new("edition", edition.key()),
+                KeyValue::new("action", action.mode()),
+            ],
+        );
+    }
+
+    fn zork_session_end_label(end: ZorkSessionEnd) -> &'static str {
+        match end {
+            ZorkSessionEnd::Quit => "quit",
+            ZorkSessionEnd::Returned => "returned",
+            ZorkSessionEnd::SaveRejected => "save_rejected",
+            ZorkSessionEnd::Busy => "busy",
+            ZorkSessionEnd::Crashed => "crashed",
+            ZorkSessionEnd::ConnectFailed => "connect_failed",
+            ZorkSessionEnd::Idle => "idle",
+        }
+    }
+
+    fn zork_session_ends_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_zork_session_ends_total")
+                .with_description("Zork play sessions ended, by edition and how they ended")
+                .build()
+        })
+    }
+
+    pub fn record_zork_session_end(edition: ZorkEdition, end: ZorkSessionEnd) {
+        zork_session_ends_total().add(
+            1,
+            &[
+                KeyValue::new("edition", edition.key()),
+                KeyValue::new("end", zork_session_end_label(end)),
+            ],
+        );
+    }
+
+    fn zork_switch_result_label(result: ZorkSwitchResult) -> &'static str {
+        match result {
+            ZorkSwitchResult::Switched => "switched",
+            ZorkSwitchResult::SaveFailed => "save_failed",
+            ZorkSwitchResult::TimedOut => "timed_out",
+        }
+    }
+
+    fn zork_switches_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_zork_switches_total")
+                .with_description(
+                    "Switches away from a live Zork game (edition, manual load, new game), by result",
+                )
+                .build()
+        })
+    }
+
+    pub fn record_zork_switch(result: ZorkSwitchResult) {
+        zork_switches_total().add(
+            1,
+            &[KeyValue::new("result", zork_switch_result_label(result))],
+        );
+    }
+
+    fn zork_catalogue_read_label(result: ZorkCatalogueRead) -> &'static str {
+        match result {
+            ZorkCatalogueRead::Read => "read",
+            ZorkCatalogueRead::Failed => "failed",
+        }
+    }
+
+    fn zork_catalogue_reads_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_zork_catalogue_reads_total")
+                .with_description("Zork save-slot catalogue reads for the menus, by result")
+                .build()
+        })
+    }
+
+    pub fn record_zork_catalogue_read(result: ZorkCatalogueRead) {
+        zork_catalogue_reads_total().add(
+            1,
+            &[KeyValue::new("result", zork_catalogue_read_label(result))],
+        );
+    }
+
+    fn zork_suggestion_label(result: ZorkSuggestion) -> &'static str {
+        match result {
+            ZorkSuggestion::Typed => "typed",
+            ZorkSuggestion::NotAtPrompt => "not_at_prompt",
+            ZorkSuggestion::NoneWaiting => "none_waiting",
+        }
+    }
+
+    fn zork_suggestions_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_zork_suggestions_total")
+                .with_description("F3 presses on a player's own Zork game, by what they typed")
+                .build()
+        })
+    }
+
+    pub fn record_zork_suggestion(result: ZorkSuggestion) {
+        zork_suggestions_total().add(1, &[KeyValue::new("result", zork_suggestion_label(result))]);
+    }
+
     fn online_time_flush_result_label(result: OnlineTimeFlushResult) -> &'static str {
         match result {
             OnlineTimeFlushResult::Flushed => "flushed",
@@ -1448,24 +3168,47 @@ mod inner {
 
 #[cfg(not(feature = "otel"))]
 mod inner {
+    use late_core::models::user::{AsciiPiece, AsciiSelection};
+
+    use super::ScreensaverTrigger;
     use super::ShareCardKind;
     use super::SlidingPuzzleArtLoad;
     use super::XMediaLookup;
     use super::{
-        ActivityGame, BioScreenOutcome, CrownRefusal, DailyWinPayout, DoorGame, FirstContactBeat,
-        GalleryApplauseResult, GalleryHangResult, GalleryTakeDownResult, GateVerdict, GildRefusal,
-        GildTier, NewsShareReward, NightcapOrderResult, OnlineTimeFlushResult, PaperOpenResult,
-        PaperPrintResult, PoolShotOutcome, PotRefusal, RenderReason, RoundRefusal, RunnerDoor,
-        SongQueueReward, SshRejectReason, SummaryResult, TranslationResult, VizWireBands,
+        ActivityGame, ArcadeDifficulty, ArcadeFinish, ArcadeMode, AwardAnnouncementOutcome,
+        BioScreenOutcome, CrownRefusal, DailyPuzzle, DailyWinPayout, DoorGame, DoorWatchOutcome,
+        FightBeat, FirstContactBeat, GalleryApplauseResult, GalleryHangResult,
+        GalleryTakeDownResult, GateVerdict, GiftDrinkRefusal, GildRefusal, GildTier,
+        JobsFetchResult, JobsPostResult, JobsPressResult, JobsReadResult, LoungeBeat,
+        NewsShareReward, NightcapHouseFailure, NightcapOrderResult, OldSignalPayout,
+        OnlineTimeFlushResult, PaperOpenResult, PaperPrintResult, Place, PoolShotOutcome,
+        PotRefusal, PotReminderOutcome, Presence, PresenceScope, PresenceWire, Refresh,
+        RefreshOutcome, RenderReason, RoundRefusal, RunnerDoor, Screen, SessionStartStage,
+        SessionUser, SnapshotRowError, SongQueueReward, SshRejectReason, SummaryResult, TailorBeat,
+        ThumbnailFetch, TranslationResult, VizWireBands, WatchDoor,
     };
     use super::{BonsaiAction, BonsaiActionResult};
+    use super::{CalendarAnnouncement, CalendarOp, CalendarRefusalKind, CalendarWrite, LiveOrigin};
+    use super::{IrcHistoryOutcome, IrcHistoryRequest};
+    use super::{NewcomerMinuteResult, ReferralAttachOutcome, ReferralSettlement, ReferralSource};
+    use super::{PollOutcome, PolledFeed};
+    use super::{
+        ZorkAction, ZorkCatalogueRead, ZorkEdition, ZorkSessionEnd, ZorkSuggestion,
+        ZorkSwitchResult,
+    };
 
     pub fn record_ssh_connection() {}
     pub fn record_ssh_connection_rejected(_reason: SshRejectReason) {}
     pub fn record_first_contact_beat(_beat: FirstContactBeat) {}
+    pub fn record_deadchannel_fight(_beat: FightBeat) {}
+    pub fn record_deadchannel_old_signal_payout(_payout: OldSignalPayout) {}
+    pub fn record_deadchannel_tailor(_beat: TailorBeat) {}
+    pub fn record_deadchannel_lounge(_beat: LoungeBeat) {}
+    pub fn record_presence(_beat: PresenceWire) {}
+    pub fn record_presence_records(_scope: PresenceScope, _count: usize) {}
     pub fn record_runner_door(_door: RunnerDoor) {}
     pub fn record_first_contact_bio_screen(_outcome: BioScreenOutcome) {}
-    pub fn record_first_contact_gate(_verdict: GateVerdict, _staff: bool) {}
+    pub fn record_first_contact_gate(_verdict: GateVerdict) {}
     pub fn record_render(_reason: RenderReason) {}
     pub fn record_render_skipped_clean() {}
     pub fn add_ssh_session(_delta: i64) {}
@@ -1480,13 +3223,39 @@ mod inner {
     pub fn record_chat_message_sent() {}
     pub fn record_chat_message_edited() {}
     pub fn record_game_win(_game: ActivityGame) {}
+    pub fn record_session_start(_stage: SessionStartStage, _user: SessionUser, _seconds: f64) {}
+    pub fn record_pg_refresh(_refresh: Refresh, _outcome: RefreshOutcome, _seconds: f64) {}
+    pub fn observe_chat_read_permits(
+        _permits: std::sync::Arc<tokio::sync::Semaphore>,
+        _total: usize,
+    ) {
+    }
+    pub fn record_arcade_finish(
+        _puzzle: DailyPuzzle,
+        _mode: ArcadeMode,
+        _difficulty: ArcadeDifficulty,
+        _finish: ArcadeFinish,
+    ) {
+    }
+    pub fn record_attention(_screen: Screen, _place: Place, _presence: Presence, _seconds: f64) {}
+    pub fn record_place_visit(_screen: Screen, _place: Place) {}
+    pub fn record_screensaver(
+        _trigger: ScreensaverTrigger,
+        _selection: AsciiSelection,
+        _piece: AsciiPiece,
+    ) {
+    }
     pub fn record_share_card(_kind: ShareCardKind) {}
     pub fn record_sliding_puzzle_art(_load: SlidingPuzzleArtLoad) {}
     pub fn record_daily_win_payout(_payout: DailyWinPayout) {}
     pub fn record_pool_shot(_outcome: PoolShotOutcome) {}
+    pub fn record_daily_snapshot_row_rejected(_error: &SnapshotRowError) {}
+    pub fn record_irc_history(_request: IrcHistoryRequest, _outcome: IrcHistoryOutcome) {}
     pub fn record_news_shared(_reward: NewsShareReward) {}
     pub fn record_news_x_media_lookup(_lookup: XMediaLookup) {}
     pub fn record_song_queued(_reward: SongQueueReward) {}
+    pub fn record_booth_thumbnail(_outcome: ThumbnailFetch) {}
+    pub fn record_radio_meta_poll(_feed: PolledFeed, _outcome: PollOutcome) {}
     pub fn record_gild_bought(_tier: GildTier) {}
     pub fn record_gild_refused(_refusal: GildRefusal) {}
     pub fn record_bonsai_action(_action: BonsaiAction, _result: BonsaiActionResult) {}
@@ -1494,20 +3263,51 @@ mod inner {
     pub fn record_crown_take_refused(_refusal: CrownRefusal) {}
     pub fn record_round_bought(_patrons: i64, _chips: i64) {}
     pub fn record_round_refused(_refusal: RoundRefusal) {}
+    pub fn record_gift_drink_bought(_chips: i64) {}
+    pub fn record_gift_drink_refused(_refusal: GiftDrinkRefusal) {}
     pub fn record_nightcap_order(_result: NightcapOrderResult) {}
+    pub fn record_nightcap_house_failure(_failure: NightcapHouseFailure) {}
     pub fn record_round_drink_cashed() {}
     pub fn record_pot_tickets_bought(_tickets: i64, _chips: i64) {}
     pub fn record_pot_buy_refused(_refusal: PotRefusal) {}
     pub fn record_pot_drawn(_payout: i64, _tickets: i64) {}
+    pub fn record_pot_reminder(_outcome: PotReminderOutcome) {}
+    pub fn record_calendar_write(_write: CalendarWrite) {}
+    pub fn record_calendar_refusal(_kind: CalendarRefusalKind) {}
+    pub fn record_calendar_failure(_op: CalendarOp) {}
+    pub fn record_calendar_announcement(_announcement: CalendarAnnouncement) {}
+    pub fn record_calendar_open(_origin: LiveOrigin) {}
+    pub fn record_referral_attach(_source: ReferralSource, _outcome: ReferralAttachOutcome) {}
+    pub fn record_referral_settlement(_settlement: ReferralSettlement) {}
+    pub fn record_newcomer_minute(_result: NewcomerMinuteResult) {}
+    pub fn record_award_announcement(_outcome: AwardAnnouncementOutcome) {}
     pub fn record_chat_translation(_result: TranslationResult) {}
     pub fn record_chat_summary(_result: SummaryResult) {}
     pub fn record_paper_print(_result: PaperPrintResult) {}
     pub fn record_paper_open(_result: PaperOpenResult) {}
+    pub fn record_jobs_fetch(
+        _source: late_core::models::job_posting::JobSource,
+        _result: JobsFetchResult,
+    ) {
+    }
+    pub fn record_jobs_read(_result: JobsReadResult) {}
+    pub fn record_jobs_press(_result: JobsPressResult) {}
+    pub fn record_jobs_released(_count: usize) {}
+    pub fn record_jobs_post(_result: JobsPostResult) {}
     pub fn record_gallery_hang(_result: GalleryHangResult) {}
     pub fn record_gallery_applause(_result: GalleryApplauseResult) {}
     pub fn record_gallery_take_down(_result: GalleryTakeDownResult) {}
+    pub fn record_gallery_splash_queue_depth(_depth: i64) {}
     pub fn record_door_ingest_line(_game: DoorGame) {}
     pub fn record_door_ingest_session_failure(_game: DoorGame) {}
+    pub fn record_door_watch_stream(_game: WatchDoor, _outcome: DoorWatchOutcome) {}
+    pub fn record_door_watch_roster_failure(_game: WatchDoor) {}
+    pub fn record_door_watch_chat_room_failure(_game: WatchDoor) {}
+    pub fn record_zork_launch(_edition: ZorkEdition, _action: ZorkAction) {}
+    pub fn record_zork_session_end(_edition: ZorkEdition, _end: ZorkSessionEnd) {}
+    pub fn record_zork_switch(_result: ZorkSwitchResult) {}
+    pub fn record_zork_catalogue_read(_result: ZorkCatalogueRead) {}
+    pub fn record_zork_suggestion(_result: ZorkSuggestion) {}
     pub fn record_online_time_flush(_result: OnlineTimeFlushResult) {}
 }
 

@@ -25,6 +25,8 @@ fn all_purpose_guide_splits_game_topics() {
     assert!(bot_app_context().contains("## Lateania\n"));
     assert!(bot_app_context().contains("## Minecraft\n"));
     assert!(bot_app_context().contains("mc.late.sh"));
+    assert!(bot_app_context().contains("## Vintage Story\n"));
+    assert!(bot_app_context().contains("vs.late.sh"));
     assert!(!bot_app_context().contains("## Games\n"));
 }
 
@@ -192,7 +194,7 @@ fn bot_context_includes_irc_access_flow() {
 fn chat_guide_lists_user_facing_slash_commands() {
     let lines = chat_help_lines(false).join("\n");
     for expected in [
-        "/brb               shortcut for /status away",
+        "/brb [reason]      away until your next key",
         "/coffee",
         "/friend [@user]",
         "/friends",
@@ -201,18 +203,36 @@ fn chat_guide_lists_user_facing_slash_commands() {
         "/petname [name]",
         "/poll",
         "/profile [@user]",
-        "/status [word] [m] set your status",
         "/tea",
         "/upload <url>",
     ] {
         assert!(lines.contains(expected), "missing {expected}");
     }
     assert!(!lines.contains("/music"));
+    assert!(
+        !lines.contains("/status"),
+        "away is automatic, there is no /status"
+    );
+}
+
+/// The guide names the last slot key; a change to `RADIO_SLOTS` has to
+/// change the copy with it.
+#[test]
+fn music_guide_names_every_pinned_slot_key() {
+    let last = late_core::radio::RADIO_SLOTS;
+    assert!(MUSIC_PAIR_TEXT.contains(&format!("v then 1..{last} ")));
+    assert!(MUSIC_PAIR_TEXT.contains(&format!("behind v1..v{last} ")));
+    assert!(
+        overview_lines()
+            .iter()
+            .any(|line| line.contains(&format!("v then 1..{last} ")))
+    );
+    assert!(!MUSIC_PAIR_TEXT.contains(&format!("1..{}", last + 1)));
 }
 
 #[test]
 fn music_guide_defers_pairing_setup_to_pair_tab() {
-    assert!(MUSIC_PAIR_TEXT.contains("three music sources"));
+    assert!(MUSIC_PAIR_TEXT.contains("two music sources"));
     assert!(MUSIC_PAIR_TEXT.contains("active YouTube-source users"));
     assert!(!MUSIC_PAIR_TEXT.contains("two audio surfaces"));
     assert!(!MUSIC_PAIR_TEXT.contains("paired users agree"));

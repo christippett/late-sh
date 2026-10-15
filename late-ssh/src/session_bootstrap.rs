@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
-use late_core::models::user_ssh_key::{KeyLayout, UserSshKey, extract_key_layout};
+use late_core::models::user_ssh_key::{
+    KeyLayout, UserSshKey, extract_key_artboard_disclaimer, extract_key_layout,
+};
 use late_core::models::{artboard_ban::ArtboardBan, user::User};
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -11,6 +13,10 @@ use crate::app::state::SessionConfig;
 use crate::authz::Permissions;
 use crate::session::SessionMessage;
 use crate::state::State;
+
+#[cfg(test)]
+#[path = "session_bootstrap_test.rs"]
+mod tests;
 
 pub struct SessionBootstrapInputs {
     pub user: User,
@@ -244,14 +250,20 @@ pub async fn load_arcade_session_preloads(state: &State, user_id: Uuid) -> Arcad
 }
 
 /// What the SSH key a session authenticated with remembers about its device.
-/// Every field is `None` for a keyless session, a key with nothing stored, or
-/// a failed read, and every consumer treats `None` as "no device fact":
-/// the rails follow the account default and a bare `/summary` opens its
-/// default window. That is why a failure here is logged and swallowed rather
-/// than failing the connection.
+/// Every field is `None` for a keyless session or a key with nothing stored,
+/// and every consumer treats `None` as "no device fact": the rails and the
+/// Artboard disclaimer follow the account default and a bare `/summary` opens
+/// its default window. A failed read is logged and swallowed rather than
+/// failing the connection; it reads as `None` too, except for the disclaimer,
+/// which is a content gate and fails closed (`Some(true)`): a device that
+/// turned the gate on must not lose it to a dropped query when the account
+/// seed is off.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeviceState {
     pub layout: Option<KeyLayout>,
+    /// This device's Artboard content disclaimer, `None` to follow the account.
+    /// `Some(true)` when the key could not be read.
+    pub artboard_disclaimer: Option<bool>,
     /// When the last session on this device went quiet before it ended.
     /// Taken, not read: the row is cleared by the read, so this session is
     /// the only one that will ever be handed this particular leave.
@@ -270,16 +282,24 @@ pub async fn load_device_state(
         Ok(client) => client,
         Err(e) => {
             tracing::warn!(error = ?e, "failed to get db client for device state");
-            return DeviceState::default();
+            return DeviceState {
+                artboard_disclaimer: Some(true),
+                ..DeviceState::default()
+            };
         }
     };
-    let layout = match UserSshKey::find_by_fingerprint(&client, user_id, fingerprint).await {
-        Ok(key) => key.and_then(|key| extract_key_layout(&key.settings)),
-        Err(e) => {
-            tracing::warn!(error = ?e, "failed to load device rail layout");
-            None
-        }
-    };
+    let (layout, artboard_disclaimer) =
+        match UserSshKey::find_by_fingerprint(&client, user_id, fingerprint).await {
+            Ok(Some(key)) => (
+                extract_key_layout(&key.settings),
+                extract_key_artboard_disclaimer(&key.settings),
+            ),
+            Ok(None) => (None, None),
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to load device settings");
+                (None, Some(true))
+            }
+        };
     let left_at = match UserSshKey::take_left_at(&client, user_id, fingerprint).await {
         Ok(left_at) => left_at,
         Err(e) => {
@@ -287,7 +307,20 @@ pub async fn load_device_state(
             None
         }
     };
-    DeviceState { layout, left_at }
+    DeviceState {
+        layout,
+        artboard_disclaimer,
+        left_at,
+    }
+}
+
+impl DeviceState {
+    /// Whether this session shows the Artboard content disclaimer: this
+    /// device's choice when its key has one, else the account's.
+    pub fn shows_artboard_disclaimer(&self, user: &User) -> bool {
+        self.artboard_disclaimer
+            .unwrap_or_else(|| late_core::models::user::extract_artboard_disclaimer(&user.settings))
+    }
 }
 
 pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs) -> SessionConfig {
@@ -390,10 +423,6 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
             None
         }
     };
-    // The door: the next of last month's podium pieces this account has
-    // not seen, or the cup. One claim per login, the gallery logs its
-    // own failures.
-    let splash_piece = state.gallery_service.claim_splash_piece(user_id).await;
     let initial_door_rcs = match state.door_rc_service.list(user_id).await {
         Ok(rcs) => rcs,
         Err(e) => {
@@ -403,6 +432,12 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
     };
 
     let device = load_device_state(state, user_id, key_fingerprint.as_deref()).await;
+    // The door: the day's wall piece for those who chose Always View on the
+    // Artboard content disclaimer (on this device), else the cup.
+    let splash_piece = state
+        .gallery_service
+        .splash_piece_for_login(device.shows_artboard_disclaimer(&user))
+        .await;
 
     let first_contact_gate = crate::app::deadchannel::haunt::svc::bootstrap_gate(
         state,
@@ -416,6 +451,7 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         term,
         key_fingerprint,
         key_layout: device.layout,
+        key_artboard_disclaimer: device.artboard_disclaimer,
         key_left_at: device.left_at,
         audio_service: state.audio_service.clone(),
         voice_service: state.voice_service.clone(),
@@ -424,8 +460,10 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         translation_service: state.translation_service.clone(),
         summary_service: state.summary_service.clone(),
         paper_service: state.paper_service.clone(),
+        jobs_service: state.jobs_service.clone(),
         notification_service: state.notification_service.clone(),
         article_service: state.article_service.clone(),
+        calendar_service: state.calendar_service.clone(),
         feed_service: state.feed_service.clone(),
         cyberspace_service: state.cyberspace_service.clone(),
         showcase_service: state.showcase_service.clone(),
@@ -462,6 +500,7 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         greendragon_service: state.greendragon_service.clone(),
         darkroom_service: state.darkroom_service.clone(),
         arcade_handle_service: state.arcade_handle_service.clone(),
+        live_games: state.live_games.clone(),
         door_rc_service: state.door_rc_service.clone(),
         initial_door_rcs,
         daily_service: state.daily_service.clone(),
@@ -473,6 +512,14 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         splash_piece,
         username: user.username.clone(),
         bonsai_service: state.bonsai_service.clone(),
+        fight_service: crate::app::deadchannel::fight::svc::FightService::new(
+            state.db.clone(),
+            state.chat_service.clone(),
+            state.chip_service.clone(),
+        ),
+        tailor_service: crate::app::deadchannel::tailor::svc::TailorService::new(state.db.clone()),
+        guide_service: crate::app::deadchannel::guide::svc::GuideService::new(state.db.clone()),
+        lounge_service: state.lounge_service.clone(),
         initial_bonsai_tree,
         initial_bonsai_decay_protection,
         pet_service: state.pet_service.clone(),
@@ -531,6 +578,10 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         codekeep_host: state.config.codekeep_host.clone(),
         codekeep_port: state.config.codekeep_port,
         codekeep_secret: state.config.codekeep_secret.clone(),
+        zork_enabled: state.config.zork_enabled,
+        zork_host: state.config.zork_host.clone(),
+        zork_port: state.config.zork_port,
+        zork_secret: state.config.zork_secret.clone(),
         session_token,
         session_registry: Some(state.session_registry.clone()),
         paired_client_registry: Some(state.paired_client_registry.clone()),
@@ -538,8 +589,7 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         now_playing_rx: Some(state.now_playing_rx.clone()),
         radio_meta_rx: Some(state.radio_meta_rx.clone()),
         active_users: Some(state.active_users.clone()),
-        clubhouse_lobby: Some(state.clubhouse_lobby.clone()),
-        nightcap_lobby: Some(state.nightcap_lobby.clone()),
+        drunk_map: state.drunk_map.clone(),
         nightcap_house: Some(state.nightcap_house.clone()),
         mention_ladders: state.mention_ladders.clone(),
         files: state.config.files.clone(),
@@ -551,15 +601,18 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
             &user.settings,
         ),
         first_contact_gate,
-        app_flags_rx: state.app_flags.subscribe(),
-        app_flags: Some(state.app_flags.clone()),
         runner_looks_rx: state.runner_looks.subscribe(),
+        presence: state.presence.clone(),
         zen_layout: late_core::models::user::extract_zen_layout(&user.settings),
         username_directory: Some(state.username_directory.clone()),
         flair_directory: Some(state.flair_directory.clone()),
-        status_directory: Some(state.status_directory.clone()),
         crown_service: Some(state.crown_service.clone()),
         pot_service: Some(state.pot_service.clone()),
+        referral_service: state.referral_service.clone(),
+        newcomer_clock: crate::app::referral::state::NewcomerClock::new(
+            user.created,
+            chrono::Utc::now(),
+        ),
         activity_feed_rx,
         user_id,
         permissions,
@@ -573,8 +626,8 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
             .unwrap_or_else(|| theme::DEFAULT_ID.to_string()),
         initial_interaction_mode: late_core::models::user::extract_interaction_mode(&user.settings),
         initial_audio_source: late_core::models::user::extract_audio_source(&user.settings),
-        initial_icecast_stream: late_core::models::user::extract_icecast_stream(&user.settings),
         initial_radio_station: late_core::models::user::extract_radio_station(&user.settings),
+        initial_radio_slots: late_core::models::user::extract_radio_slots(&user.settings),
         is_draining: state.is_draining.clone(),
     }
 }

@@ -186,7 +186,14 @@ impl Article {
     }
 }
 
-pub const NEWS_MARKER: &str = "---NEWS---";
+/// How many articles the shared news snapshot holds. Each session counts its
+/// unread badge from that snapshot, so the badge saturates here.
+pub const NEWS_FEED_LIMIT: i64 = 20;
+
+/// Cross-process refresh channel. Any write to `articles` fires it (migration
+/// 198 statement trigger, empty payload); every replica's listener re-reads
+/// the newest [`NEWS_FEED_LIMIT`] articles into its shared snapshot.
+pub const ARTICLES_CHANGED_CHANNEL: &str = "articles_changed";
 
 #[derive(Clone, Default)]
 pub struct ArticleSnapshot {
@@ -215,13 +222,14 @@ pub enum ArticleEvent {
     Deleted {
         user_id: Uuid,
     },
-    UnreadCountUpdated {
+    /// This user's news reads among the snapshot's articles
+    /// (`article_reads`), loaded at session start and after every write
+    /// (a News room visit, one article opened). Reads only grow, so a
+    /// session merges each load into what it holds, in whatever order the
+    /// loads land, and counts its own unread badge from them against the
+    /// shared snapshot.
+    ReadsLoaded {
         user_id: Uuid,
-        unread_count: i64,
-        last_read_at: Option<chrono::DateTime<chrono::Utc>>,
-    },
-    NewArticlesAvailable {
-        user_id: Uuid,
-        unread_count: i64,
+        read_article_ids: Vec<Uuid>,
     },
 }

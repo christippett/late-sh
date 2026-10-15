@@ -1,13 +1,18 @@
 use std::cell::Cell;
 
+use super::mouse::{Field, MouseState, Target};
 use chrono::{DateTime, Utc};
-use late_core::models::profile::{Profile, ProfileParams, normalize_profile_tags};
+use late_core::models::message_translation::TranslateLang;
+use late_core::models::profile::{Profile, ProfileParams};
+use late_core::models::profile_award::{ChatBadgeRow, chat_badge_rows};
 use late_core::models::rss_feed::RssFeed;
-use late_core::models::user::{
-    RightSidebarComponentSetting, RightSidebarMode, RoomListMode,
-    normalize_text_brightness_adjustment, sanitize_username_input,
+use late_core::models::statusline::{
+    LabelMode, StatusComponent, StatusComponentSetting, StatusVariant,
 };
-use ratatui::layout::Rect;
+use late_core::models::user::{
+    AsciiSelection, InteractionMode, RightSidebarComponentSetting, RightSidebarMode, RoomListMode,
+    Screensaver, normalize_text_brightness_adjustment, sanitize_username_input,
+};
 use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use tokio::sync::{broadcast, watch};
@@ -15,6 +20,8 @@ use uuid::Uuid;
 
 use crate::app::common::theme;
 use crate::app::profile::svc::{IrcTokenStatus, ProfileEvent, ProfileService};
+use crate::app::referral::state::typed_invite_code;
+use crate::app::referral::svc::{InviteOverview, ReferralEvent, ReferralService};
 use crate::app::{
     chat::feeds::svc::{FeedEvent, FeedService, FeedSnapshot},
     common::primitives::Banner,
@@ -29,6 +36,8 @@ const LINK_CODE_MAX_LEN: usize = 16;
 const LINK_CONFIRM_USERNAME_MAX_LEN: usize = late_core::models::user::USERNAME_MAX_LEN;
 pub(crate) const SYSTEM_FIELD_MAX_LEN: usize = 48;
 pub(crate) const FEED_URL_MAX_LEN: usize = 2000;
+/// Room for a whole pasted `ssh invite-<code>@late.sh` and some slack.
+pub(crate) const INVITE_CODE_INPUT_MAX_LEN: usize = 40;
 pub(crate) const BIO_MAX_LEN: usize = 1000;
 pub(crate) const DELETE_CONFIRM_MISMATCH: &str = "Typed username does not match current username.";
 pub(crate) const LINK_CONFIRM_MISMATCH: &str = "Typed username does not match the main username.";
@@ -37,6 +46,41 @@ pub(crate) const LINK_CONFIRM_MISMATCH: &str = "Typed username does not match th
 pub(crate) enum PickerKind {
     Country,
     Timezone,
+    Language,
+    InteractionMode,
+    Screensaver,
+}
+
+/// Off, then every piece: the Screensaver row's choices, in picker order.
+pub(crate) fn screensaver_choices() -> Vec<Screensaver> {
+    std::iter::once(Screensaver::Off)
+        .chain(AsciiSelection::ALL.into_iter().map(Screensaver::On))
+        .collect()
+}
+
+/// The Screensaver row's label for a choice: the piece's name, capitalised
+/// (`Aurora fjord · dots`).
+pub(crate) fn screensaver_label(saver: Screensaver) -> String {
+    let label = saver.label();
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+pub(crate) const INTERACTION_MODES: [InteractionMode; 3] = [
+    InteractionMode::Keyboard,
+    InteractionMode::Mouse,
+    InteractionMode::Hybrid,
+];
+
+pub(crate) fn interaction_mode_label(mode: InteractionMode) -> &'static str {
+    match mode {
+        InteractionMode::Keyboard => "Keyboard",
+        InteractionMode::Mouse => "Mouse",
+        InteractionMode::Hybrid => "Hybrid",
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,13 +130,15 @@ impl Row {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AccountRow {
+    Invites,
     LinkAccounts,
     IrcToken,
     DeleteAccount,
 }
 
 impl AccountRow {
-    pub(crate) const ALL: [AccountRow; 3] = [
+    pub(crate) const ALL: [AccountRow; 4] = [
+        AccountRow::Invites,
         AccountRow::LinkAccounts,
         AccountRow::IrcToken,
         AccountRow::DeleteAccount,
@@ -106,29 +152,74 @@ pub(crate) enum TweakRow {
     TextBrightness,
     RightSidebar,
     RoomListSidebar,
-    // Compose / Display / Startup groups. There is deliberately no music-mute
+    // Input / Display / Startup groups. There is deliberately no music-mute
     // row: mute and volume are owned by `m` and `+`/`-`, persisted per device,
     // and a second control here would be a second source of truth for them.
     ComposerKeepFocused,
+    InteractionMode,
     FlagFallback,
+    TerminalImages,
+    ChatBadges,
     LandingPage,
     PaperAtLogin,
-    // Input group.
-    InteractionMode,
+    ArtboardDisclaimer,
+    // Away group.
+    Screensaver,
 }
 
 impl TweakRow {
-    pub(crate) const ALL: [TweakRow; 9] = [
+    pub(crate) const ALL: [TweakRow; 13] = [
         TweakRow::BackgroundColor,
         TweakRow::TextBrightness,
         TweakRow::RightSidebar,
         TweakRow::RoomListSidebar,
         TweakRow::ComposerKeepFocused,
+        TweakRow::InteractionMode,
         TweakRow::FlagFallback,
+        TweakRow::TerminalImages,
+        TweakRow::ChatBadges,
         TweakRow::LandingPage,
         TweakRow::PaperAtLogin,
-        TweakRow::InteractionMode,
+        TweakRow::ArtboardDisclaimer,
+        TweakRow::Screensaver,
     ];
+}
+
+/// Which pane of the bottom status bar customizer the keys act on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatuslinePane {
+    /// The ordered segment list: reorder, enable, disable.
+    List,
+    /// The selected segment's dials.
+    Detail,
+}
+
+/// One dial in the customizer's detail pane.
+///
+/// Which of these a segment actually offers depends on the component, so the
+/// pane asks [`SettingsModalState::statusline_dials`] per selection instead of
+/// assuming every dial is present.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatuslineDial {
+    Brief,
+    Label,
+    AutoHide,
+    /// The component's own dial, whatever it happens to be. The heading comes
+    /// from `StatusComponent::variant_title`.
+    Variant,
+}
+
+impl StatuslineDial {
+    pub(crate) fn title(self, setting: &StatusComponentSetting) -> &'static str {
+        match self {
+            Self::Brief => "Brief",
+            Self::Label => "Label",
+            Self::AutoHide => "Auto-hide",
+            // Only offered when the component has a dial, and a component with
+            // a dial always names it (locked by a `late-core` test).
+            Self::Variant => setting.component.variant_title().unwrap_or("Mode"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,7 +240,6 @@ pub(crate) enum SystemField {
     Ide,
     Terminal,
     Os,
-    Langs,
 }
 
 impl SystemField {
@@ -158,7 +248,6 @@ impl SystemField {
             Row::Ide => Some(Self::Ide),
             Row::Terminal => Some(Self::Terminal),
             Row::Os => Some(Self::Os),
-            Row::Langs => Some(Self::Langs),
             _ => None,
         }
     }
@@ -168,7 +257,6 @@ impl SystemField {
             Self::Ide => profile.ide.clone(),
             Self::Terminal => profile.terminal.clone(),
             Self::Os => profile.os.clone(),
-            Self::Langs => (!profile.langs.is_empty()).then(|| profile.langs.join(", ")),
         }
     }
 
@@ -177,9 +265,6 @@ impl SystemField {
             Self::Ide => profile.ide = normalize_optional_text(&text),
             Self::Terminal => profile.terminal = normalize_optional_text(&text),
             Self::Os => profile.os = normalize_optional_text(&text),
-            Self::Langs => {
-                profile.langs = normalize_profile_tags([text.as_str()]);
-            }
         }
     }
 }
@@ -188,11 +273,12 @@ impl SystemField {
 /// (identity/appearance/location/notifications); `Themes` is a fast browser
 /// for the expanded theme catalog; `Bio` is a separate full-width pane with
 /// the markdown editor + preview; `Tweaks` holds power-user toggles and the
-/// gem easter egg.
+/// gem easter egg; `Statusline` edits the bottom status bar.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Tab {
     Settings,
     Tweaks,
+    Statusline,
     Bio,
     Themes,
     Account,
@@ -200,11 +286,12 @@ pub(crate) enum Tab {
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 6] = [
+    pub(crate) const ALL: [Tab; 7] = [
         Tab::Settings,
         Tab::Bio,
         Tab::Themes,
         Tab::Tweaks,
+        Tab::Statusline,
         Tab::Account,
         Tab::Feeds,
     ];
@@ -213,6 +300,7 @@ impl Tab {
         match self {
             Tab::Settings => "Settings",
             Tab::Tweaks => "Tweaks",
+            Tab::Statusline => "Statusline",
             Tab::Bio => "Bio",
             Tab::Themes => "Themes",
             Tab::Account => "Account",
@@ -352,6 +440,60 @@ impl IrcTokenDialogState {
     }
 }
 
+/// Settings > Account > Invites: this account's invite command, the people
+/// it invited, and (in the account's first week, with no inviter yet) a
+/// field to name one. Read on open; there is no live refresh.
+pub(crate) struct InvitesDialogState {
+    open: bool,
+    /// `None` while loading.
+    overview: Option<InviteOverview>,
+    code_input: TextArea<'static>,
+    pending: bool,
+    /// The last answer, and whether it is a refusal.
+    message: Option<(String, bool)>,
+}
+
+impl InvitesDialogState {
+    fn new() -> Self {
+        Self {
+            open: false,
+            overview: None,
+            code_input: new_short_textarea(true),
+            pending: false,
+            message: None,
+        }
+    }
+
+    pub(crate) fn open(&self) -> bool {
+        self.open
+    }
+
+    pub(crate) fn overview(&self) -> Option<&InviteOverview> {
+        self.overview.as_ref()
+    }
+
+    pub(crate) fn code_input(&self) -> &TextArea<'static> {
+        &self.code_input
+    }
+
+    pub(crate) fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Whether the code field is showing and takes keys.
+    pub(crate) fn accepts_code(&self) -> bool {
+        self.overview
+            .as_ref()
+            .is_some_and(|overview| overview.can_attach)
+    }
+
+    pub(crate) fn message(&self) -> Option<(&str, bool)> {
+        self.message
+            .as_ref()
+            .map(|(text, is_error)| (text.as_str(), *is_error))
+    }
+}
+
 pub(crate) struct LinkAccountDialogState {
     open: bool,
     step: LinkAccountStep,
@@ -443,6 +585,7 @@ pub(crate) struct SettingsTick {
 }
 
 pub(crate) struct SettingsModalState {
+    pub(crate) mouse: MouseState,
     profile_service: ProfileService,
     feed_service: FeedService,
     user_id: Uuid,
@@ -453,6 +596,11 @@ pub(crate) struct SettingsModalState {
     /// the account default on any unrelated settings edit, and every key that
     /// never stored a layout of its own would inherit it.
     device_rails: (RoomListMode, RightSidebarMode),
+    /// The Artboard content disclaimer row, held apart from `draft` for the
+    /// same reason as `device_rails`: it is this device's, and
+    /// `draft.artboard_disclaimer` stays the account default that keys with no
+    /// choice of their own inherit.
+    device_artboard_disclaimer: bool,
     selected_tab: Tab,
     row_index: usize,
     account_row_index: usize,
@@ -488,25 +636,26 @@ pub(crate) struct SettingsModalState {
     irc_token: IrcTokenDialogState,
     right_sidebar_components_open: bool,
     right_sidebar_components_index: usize,
+    statusline_index: usize,
+    statusline_pane: StatuslinePane,
+    statusline_dial_index: usize,
+    chat_badges_open: bool,
+    chat_badges_index: usize,
     feeds: Vec<RssFeed>,
     feed_index: usize,
+    /// A clicked feed survives older snapshots that temporarily omit its UUID.
+    selected_feed_id: Option<Uuid>,
     editing_feed_url: bool,
     feed_url_input: TextArea<'static>,
     feed_snapshot_rx: watch::Receiver<FeedSnapshot>,
     feed_event_rx: broadcast::Receiver<FeedEvent>,
     profile_event_rx: broadcast::Receiver<ProfileEvent>,
+    referral_service: ReferralService,
+    referral_event_rx: broadcast::Receiver<ReferralEvent>,
+    invites: InvitesDialogState,
     /// Per-session gem easter egg on the Special tab. Persists across modal
     /// open/close cycles for the lifetime of the SSH session.
     gem: GemState,
-    /// On-screen rects for each tab in the strip, indexed by the tab's
-    /// position in `Tab::ALL`. `None` if the tab is currently hidden (e.g.
-    /// the Special tab before it's unlocked). Populated by the renderer
-    /// each frame.
-    tab_rects: Cell<[Option<Rect>; Tab::ALL.len()]>,
-    /// Bounds of the body area (whichever tab is showing). Used to gate
-    /// scroll-wheel events to the body, so the wheel doesn't move the
-    /// row cursor when the pointer is hovering over the tab strip or footer.
-    body_area: Cell<Rect>,
     /// The live interaction mode (keyboard / mouse / hybrid), mirrored here for
     /// the Input row to display. Seeded from the app when the modal opens; the
     /// input handler applies changes on the app itself (they persist + flip the
@@ -518,18 +667,22 @@ impl SettingsModalState {
     pub(crate) fn new(
         profile_service: ProfileService,
         feed_service: FeedService,
+        referral_service: ReferralService,
         user_id: Uuid,
     ) -> Self {
         let feed_snapshot_rx = feed_service.subscribe_snapshot();
         let feed_event_rx = feed_service.subscribe_events();
         let profile_event_rx = profile_service.subscribe_events();
+        let referral_event_rx = referral_service.subscribe_events();
         feed_service.list_task(user_id);
         Self {
+            mouse: MouseState::default(),
             profile_service,
             feed_service,
             user_id,
             draft: Profile::default(),
             device_rails: (RoomListMode::On, RightSidebarMode::On),
+            device_artboard_disclaimer: true,
             selected_tab: Tab::Settings,
             row_index: 0,
             account_row_index: 0,
@@ -555,16 +708,23 @@ impl SettingsModalState {
             irc_token: IrcTokenDialogState::new(),
             right_sidebar_components_open: false,
             right_sidebar_components_index: 0,
+            statusline_index: 0,
+            statusline_pane: StatuslinePane::List,
+            statusline_dial_index: 0,
+            chat_badges_open: false,
+            chat_badges_index: 0,
             feeds: Vec::new(),
             feed_index: 0,
+            selected_feed_id: None,
             editing_feed_url: false,
             feed_url_input: new_short_textarea(false),
             feed_snapshot_rx,
             feed_event_rx,
             profile_event_rx,
+            referral_service,
+            referral_event_rx,
+            invites: InvitesDialogState::new(),
             gem: GemState::new(),
-            tab_rects: Cell::new([None; Tab::ALL.len()]),
-            body_area: Cell::new(Rect::new(0, 0, 0, 0)),
             interaction_mode: late_core::models::user::InteractionMode::default(),
         }
     }
@@ -590,6 +750,12 @@ impl SettingsModalState {
         self.device_rails
     }
 
+    /// The Artboard content disclaimer the Tweaks row is editing: this
+    /// device's, picked up by `App::set_device_artboard_disclaimer`.
+    pub(crate) fn device_artboard_disclaimer(&self) -> bool {
+        self.device_artboard_disclaimer
+    }
+
     pub(crate) fn gem(&self) -> &GemState {
         &self.gem
     }
@@ -602,14 +768,18 @@ impl SettingsModalState {
     /// session is actually rendering with (`App::rail_modes`) separately: the two
     /// rail rows are per device, so showing the account default would misreport
     /// what the user is looking at, and writing it back would leak this device's
-    /// layout onto every other one.
+    /// layout onto every other one. The Artboard disclaimer is per device too
+    /// (`App::artboard_disclaimer_enabled`).
     pub(crate) fn open_from_profile(
         &mut self,
         profile: &Profile,
         device_rails: (RoomListMode, RightSidebarMode),
+        device_artboard_disclaimer: bool,
     ) {
+        self.mouse.reveal_selection();
         self.draft = profile.clone();
         self.device_rails = device_rails;
+        self.device_artboard_disclaimer = device_artboard_disclaimer;
         self.selected_tab = Tab::Settings;
         self.row_index = 0;
         self.account_row_index = 0;
@@ -631,8 +801,14 @@ impl SettingsModalState {
         self.link_account = LinkAccountDialogState::new();
         self.delete_account = DeleteAccountDialogState::new();
         self.irc_token = IrcTokenDialogState::new();
+        self.invites = InvitesDialogState::new();
         self.right_sidebar_components_open = false;
         self.right_sidebar_components_index = 0;
+        self.statusline_index = 0;
+        self.statusline_pane = StatuslinePane::List;
+        self.statusline_dial_index = 0;
+        self.chat_badges_open = false;
+        self.chat_badges_index = 0;
         self.feed_service.list_task(self.user_id);
     }
 
@@ -642,11 +818,16 @@ impl SettingsModalState {
         // banner.
         let changed = self.feed_snapshot_rx.has_changed().unwrap_or(false)
             || !self.feed_event_rx.is_empty()
-            || !self.profile_event_rx.is_empty();
+            || !self.profile_event_rx.is_empty()
+            || !self.referral_event_rx.is_empty();
         self.drain_feed_snapshot();
+        self.drain_referral_events();
         let mut banner = self.drain_profile_events();
         if let Some(feed_banner) = self.drain_feed_events() {
             banner = Some(feed_banner);
+        }
+        if changed {
+            self.mouse.invalidate();
         }
         SettingsTick { banner, changed }
     }
@@ -712,29 +893,6 @@ impl SettingsModalState {
         self.selected_tab = next;
     }
 
-    pub(crate) fn set_tab_rects(&self, rects: [Option<Rect>; Tab::ALL.len()]) {
-        self.tab_rects.set(rects);
-    }
-
-    pub(crate) fn set_body_area(&self, area: Rect) {
-        self.body_area.set(area);
-    }
-
-    /// Hit-test the tab strip. Returns the tab whose cell contains the
-    /// (0-based ratatui) point, if any.
-    pub(crate) fn tab_at_point(&self, x: u16, y: u16) -> Option<Tab> {
-        let rects = self.tab_rects.get();
-        Tab::ALL
-            .iter()
-            .copied()
-            .zip(rects.iter())
-            .find_map(|(tab, slot)| slot.filter(|rect| rect_contains(*rect, x, y)).map(|_| tab))
-    }
-
-    pub(crate) fn body_contains(&self, x: u16, y: u16) -> bool {
-        rect_contains(self.body_area.get(), x, y)
-    }
-
     /// Tabs to show in the tab strip in display order. All tabs are always
     /// visible — there is no unlock gating.
     pub(crate) fn visible_tabs(&self) -> Vec<Tab> {
@@ -780,6 +938,54 @@ impl SettingsModalState {
             (self.right_sidebar_components_index as isize + delta).clamp(0, last) as usize;
     }
 
+    pub(crate) fn chat_badges_open(&self) -> bool {
+        self.chat_badges_open
+    }
+
+    pub(crate) fn open_chat_badges(&mut self) {
+        self.chat_badges_open = true;
+        self.chat_badges_index = 0;
+    }
+
+    pub(crate) fn close_chat_badges(&mut self) {
+        self.chat_badges_open = false;
+    }
+
+    pub(crate) fn chat_badges_index(&self) -> usize {
+        self.chat_badges_index
+    }
+
+    pub(crate) fn move_chat_badges_cursor(&mut self, delta: isize) {
+        let last = chat_badge_rows().len().saturating_sub(1) as isize;
+        self.chat_badges_index = (self.chat_badges_index as isize + delta).clamp(0, last) as usize;
+    }
+
+    /// Whether a picker row shows on the chat label: a row is hidden only
+    /// when every category it covers is hidden.
+    pub(crate) fn chat_badge_row_shown(&self, row: &ChatBadgeRow) -> bool {
+        !row.categories.iter().all(|category| {
+            self.draft
+                .hidden_award_categories
+                .iter()
+                .any(|hidden| hidden == category)
+        })
+    }
+
+    /// Flip the selected row: hiding stores every category the row covers
+    /// (all rungs of a game ladder), showing removes them all.
+    pub(crate) fn toggle_chat_badge(&mut self) {
+        let Some(row) = chat_badge_rows().into_iter().nth(self.chat_badges_index) else {
+            return;
+        };
+        let shown = self.chat_badge_row_shown(&row);
+        let hidden = &mut self.draft.hidden_award_categories;
+        hidden.retain(|category| !row.categories.contains(&category.as_str()));
+        if shown {
+            hidden.extend(row.categories.iter().map(ToString::to_string));
+        }
+        self.save();
+    }
+
     /// Toggle the on/off state of the selected component.
     pub(crate) fn toggle_right_sidebar_component(&mut self) {
         if let Some(setting) = self
@@ -807,6 +1013,126 @@ impl SettingsModalState {
         let setting = self.draft.right_sidebar_components.remove(from);
         self.draft.right_sidebar_components.insert(to, setting);
         self.right_sidebar_components_index = to;
+        self.save();
+    }
+
+    pub(crate) fn statusline_index(&self) -> usize {
+        self.statusline_index
+    }
+
+    pub(crate) fn statusline_pane(&self) -> StatuslinePane {
+        self.statusline_pane
+    }
+
+    pub(crate) fn statusline_dial_index(&self) -> usize {
+        self.statusline_dial_index
+    }
+
+    pub(crate) fn statusline_components(&self) -> &[StatusComponentSetting] {
+        &self.draft.statusline_components
+    }
+
+    fn selected_statusline_component(&self) -> Option<&StatusComponentSetting> {
+        self.draft.statusline_components.get(self.statusline_index)
+    }
+
+    /// The dials the selected segment offers, in display order.
+    pub(crate) fn statusline_dials(&self) -> Vec<StatuslineDial> {
+        self.selected_statusline_component()
+            .map(|setting| statusline_dials_for(setting.component))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn selected_statusline_dial(&self) -> Option<StatuslineDial> {
+        self.statusline_dials()
+            .get(self.statusline_dial_index)
+            .copied()
+    }
+
+    pub(crate) fn move_statusline_cursor(&mut self, delta: isize) {
+        let last = self.draft.statusline_components.len().saturating_sub(1) as isize;
+        self.statusline_index = (self.statusline_index as isize + delta).clamp(0, last) as usize;
+        // The new segment may offer fewer dials than the old one.
+        self.clamp_statusline_dial();
+    }
+
+    /// Move the selected segment left or right along the bar, keeping the
+    /// cursor on it. The list reads top-to-bottom as the bar reads
+    /// left-to-right along the bottom border, so "up" is "further left".
+    pub(crate) fn move_statusline_component(&mut self, delta: isize) {
+        let len = self.draft.statusline_components.len();
+        if len == 0 {
+            return;
+        }
+        let from = self.statusline_index;
+        let to = (from as isize + delta).clamp(0, len as isize - 1) as usize;
+        if to == from {
+            return;
+        }
+        let setting = self.draft.statusline_components.remove(from);
+        self.draft.statusline_components.insert(to, setting);
+        self.statusline_index = to;
+        self.save();
+    }
+
+    pub(crate) fn toggle_statusline_component(&mut self) {
+        if let Some(setting) = self
+            .draft
+            .statusline_components
+            .get_mut(self.statusline_index)
+        {
+            setting.enabled ^= true;
+            self.save();
+        }
+    }
+
+    pub(crate) fn focus_statusline_pane(&mut self, pane: StatuslinePane) {
+        // Nothing to focus on a segment with no dials at all.
+        if pane == StatuslinePane::Detail && self.statusline_dials().is_empty() {
+            return;
+        }
+        self.statusline_pane = pane;
+        self.clamp_statusline_dial();
+    }
+
+    pub(crate) fn move_statusline_dial(&mut self, delta: isize) {
+        let last = self.statusline_dials().len().saturating_sub(1) as isize;
+        self.statusline_dial_index =
+            (self.statusline_dial_index as isize + delta).clamp(0, last) as usize;
+    }
+
+    fn clamp_statusline_dial(&mut self) {
+        let last = self.statusline_dials().len().saturating_sub(1);
+        self.statusline_dial_index = self.statusline_dial_index.min(last);
+    }
+
+    /// Cycle the focused dial on the selected segment.
+    pub(crate) fn cycle_statusline_dial(&mut self, forward: bool) {
+        let Some(dial) = self.selected_statusline_dial() else {
+            return;
+        };
+        let Some(setting) = self
+            .draft
+            .statusline_components
+            .get_mut(self.statusline_index)
+        else {
+            return;
+        };
+        match dial {
+            StatuslineDial::Brief => setting.brief ^= true,
+            StatuslineDial::Label => {
+                setting.label = next_label_mode(setting.label, setting.component, forward);
+            }
+            StatuslineDial::AutoHide => setting.auto_hide ^= true,
+            StatuslineDial::Variant => {
+                let Some(next) =
+                    next_variant(setting.variant, setting.component.variants(), forward)
+                else {
+                    return;
+                };
+                setting.variant = Some(next);
+            }
+        }
         self.save();
     }
 
@@ -849,11 +1175,27 @@ impl SettingsModalState {
             TweakRow::FlagFallback => {
                 self.draft.show_flag_fallback ^= true;
             }
+            TweakRow::TerminalImages => {
+                self.draft.terminal_images = self.draft.terminal_images.cycle(true);
+            }
+            TweakRow::ChatBadges => {
+                // A list, not a value: Enter opens the picker instead.
+                self.open_chat_badges();
+                return;
+            }
             TweakRow::LandingPage => {
                 self.draft.landing_page = self.draft.landing_page.cycle(true);
             }
+            TweakRow::Screensaver => {
+                // A list, not a value: Enter opens the picker instead.
+                self.open_picker(PickerKind::Screensaver);
+                return;
+            }
             TweakRow::PaperAtLogin => {
                 self.draft.paper_at_login ^= true;
+            }
+            TweakRow::ArtboardDisclaimer => {
+                self.device_artboard_disclaimer ^= true;
             }
             TweakRow::InteractionMode => {
                 // Applied on the app (it flips the mouse live and persists on its
@@ -866,9 +1208,19 @@ impl SettingsModalState {
 
     pub(crate) fn cycle_selected_tweak(&mut self, forward: bool) {
         match self.selected_tweak_row() {
+            TweakRow::RightSidebar => self.device_rails.1 = self.device_rails.1.cycle(forward),
+            TweakRow::RoomListSidebar => self.device_rails.0 = self.device_rails.0.cycle(forward),
             TweakRow::TextBrightness => self.cycle_text_brightness_adjustment(forward),
             TweakRow::LandingPage => {
                 self.draft.landing_page = self.draft.landing_page.cycle(forward);
+                self.save();
+            }
+            TweakRow::Screensaver => {
+                self.draft.screensaver = self.draft.screensaver.cycle(forward);
+                self.save();
+            }
+            TweakRow::TerminalImages => {
+                self.draft.terminal_images = self.draft.terminal_images.cycle(forward);
                 self.save();
             }
             _ => self.toggle_selected_tweak(),
@@ -1216,6 +1568,85 @@ impl SettingsModalState {
         self.delete_account.input.lines().join("")
     }
 
+    pub(crate) fn invites_dialog(&self) -> &InvitesDialogState {
+        &self.invites
+    }
+
+    pub(crate) fn open_invites_dialog(&mut self) {
+        self.invites = InvitesDialogState::new();
+        self.invites.open = true;
+        // overview stays `None` (loading) until the service replies.
+        self.referral_service.load_overview_task(self.user_id);
+    }
+
+    pub(crate) fn close_invites_dialog(&mut self) {
+        self.invites = InvitesDialogState::new();
+    }
+
+    pub(crate) fn invites_code_input_mut(&mut self) -> &mut TextArea<'static> {
+        self.invites.message = None;
+        &mut self.invites.code_input
+    }
+
+    /// Enter in the code field. A shape that cannot be a code is refused
+    /// here, without a round trip.
+    pub(crate) fn submit_invite_code(&mut self) {
+        if self.invites.pending || !self.invites.accepts_code() {
+            return;
+        }
+        let typed = self.invites.code_input.lines().join("");
+        let Some(code) = typed_invite_code(&typed) else {
+            self.invites.message =
+                Some(("That does not look like an invite code.".to_string(), true));
+            return;
+        };
+        self.invites.pending = true;
+        self.invites.message = Some(("Checking the code...".to_string(), false));
+        self.referral_service.attach_task(
+            self.user_id,
+            code,
+            late_core::models::referral::ReferralSource::Settings,
+        );
+    }
+
+    fn drain_referral_events(&mut self) {
+        loop {
+            match self.referral_event_rx.try_recv() {
+                Ok(ReferralEvent::Overview { user_id, overview }) if user_id == self.user_id => {
+                    if self.invites.open {
+                        self.invites.overview = Some(overview);
+                    }
+                }
+                Ok(ReferralEvent::Attached { user_id, inviter }) if user_id == self.user_id => {
+                    if self.invites.open {
+                        self.invites.pending = false;
+                        self.invites.code_input = new_short_textarea(true);
+                        self.invites.message = Some((format!("Invited by @{inviter}."), false));
+                        self.referral_service.load_overview_task(self.user_id);
+                    }
+                }
+                Ok(ReferralEvent::Refused { user_id, refusal }) if user_id == self.user_id => {
+                    if self.invites.open {
+                        self.invites.pending = false;
+                        self.invites.message = Some((refusal.message().to_string(), true));
+                    }
+                }
+                Ok(ReferralEvent::Failed { user_id, message }) if user_id == self.user_id => {
+                    if self.invites.open {
+                        self.invites.pending = false;
+                        self.invites.message = Some((message, true));
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(e) => {
+                    tracing::error!(%e, "failed to receive settings referral event");
+                    break;
+                }
+            }
+        }
+    }
+
     pub(crate) fn irc_token_dialog(&self) -> &IrcTokenDialogState {
         &self.irc_token
     }
@@ -1300,10 +1731,6 @@ impl SettingsModalState {
 
     pub(crate) fn theme_selected_row(&self) -> usize {
         self.theme_selected_row
-    }
-
-    pub(crate) fn theme_scroll_offset(&self) -> usize {
-        self.theme_scroll_offset
     }
 
     pub(crate) fn set_theme_visible_height(&self, height: usize) {
@@ -1720,6 +2147,15 @@ impl SettingsModalState {
         self.editing_bio
     }
 
+    /// Whether a text field holds typing that is not in the draft yet. A
+    /// global chord that closes or reopens the modal now would drop it.
+    pub(crate) fn editing_text(&self) -> bool {
+        self.editing_username
+            || self.editing_system_field.is_some()
+            || self.editing_bio
+            || self.editing_feed_url
+    }
+
     pub(crate) fn username_input(&self) -> &TextArea<'static> {
         &self.username_input
     }
@@ -1785,14 +2221,41 @@ impl SettingsModalState {
     }
 
     pub(crate) fn open_picker(&mut self, kind: PickerKind) {
+        self.mouse.reset_pane(super::mouse::Pane::Picker);
+        self.mouse.reveal_selection();
         self.picker.kind = Some(kind);
         self.picker.query.clear();
-        self.picker.selected_index = 0;
+        self.picker.selected_index = match kind {
+            PickerKind::Language => TranslateLang::ALL
+                .iter()
+                .position(|lang| *lang == self.draft.translate_to)
+                .unwrap_or(0),
+            PickerKind::InteractionMode => INTERACTION_MODES
+                .iter()
+                .position(|mode| *mode == self.interaction_mode)
+                .unwrap_or(0),
+            PickerKind::Screensaver => screensaver_choices()
+                .iter()
+                .position(|saver| *saver == self.draft.screensaver)
+                .unwrap_or(0),
+            PickerKind::Country | PickerKind::Timezone => 0,
+        };
         self.picker.scroll_offset = 0;
     }
 
     pub(crate) fn close_picker(&mut self) {
         self.picker = PickerState::default();
+        self.mouse.invalidate();
+    }
+
+    /// The tag picker closed on the langs row: canonical language tags,
+    /// saved at once like every other row here.
+    pub(crate) fn set_langs(&mut self, langs: Vec<String>) {
+        if self.draft.langs == langs {
+            return;
+        }
+        self.draft.langs = langs;
+        self.save();
     }
 
     pub(crate) fn filtered_countries(&self) -> Vec<&'static CountryOption> {
@@ -1807,8 +2270,51 @@ impl SettingsModalState {
         match self.picker.kind {
             Some(PickerKind::Country) => self.filtered_countries().len(),
             Some(PickerKind::Timezone) => self.filtered_timezones().len(),
+            Some(PickerKind::Language) => self.filtered_languages().len(),
+            Some(PickerKind::InteractionMode) => self.filtered_interaction_modes().len(),
+            Some(PickerKind::Screensaver) => self.filtered_screensavers().len(),
             None => 0,
         }
+    }
+
+    pub(crate) fn filtered_screensavers(&self) -> Vec<Screensaver> {
+        let query = self.picker.query.trim().to_lowercase();
+        screensaver_choices()
+            .into_iter()
+            .filter(|saver| saver.label().contains(&query))
+            .collect()
+    }
+
+    pub(crate) fn filtered_languages(&self) -> Vec<TranslateLang> {
+        let query = self.picker.query.trim().to_lowercase();
+        TranslateLang::ALL
+            .into_iter()
+            .filter(|lang| {
+                lang.label().to_lowercase().contains(&query) || lang.as_str().contains(&query)
+            })
+            .collect()
+    }
+
+    pub(crate) fn filtered_interaction_modes(&self) -> Vec<InteractionMode> {
+        let query = self.picker.query.trim().to_lowercase();
+        INTERACTION_MODES
+            .into_iter()
+            .filter(|mode| {
+                interaction_mode_label(*mode)
+                    .to_lowercase()
+                    .contains(&query)
+            })
+            .collect()
+    }
+
+    pub(crate) fn picker_interaction_mode(&self) -> Option<InteractionMode> {
+        (self.picker.kind == Some(PickerKind::InteractionMode))
+            .then(|| {
+                self.filtered_interaction_modes()
+                    .get(self.picker.selected_index)
+                    .copied()
+            })
+            .flatten()
     }
 
     pub(crate) fn picker_move(&mut self, delta: isize) {
@@ -1829,12 +2335,16 @@ impl SettingsModalState {
     }
 
     pub(crate) fn picker_push(&mut self, ch: char) {
+        self.mouse.reset_pane(super::mouse::Pane::Picker);
+        self.mouse.reveal_selection();
         self.picker.query.push(ch);
         self.picker.selected_index = 0;
         self.picker.scroll_offset = 0;
     }
 
     pub(crate) fn picker_backspace(&mut self) {
+        self.mouse.reset_pane(super::mouse::Pane::Picker);
+        self.mouse.reveal_selection();
         self.picker.query.pop();
         self.picker.selected_index = 0;
         self.picker.scroll_offset = 0;
@@ -1857,6 +2367,27 @@ impl SettingsModalState {
                     mutated = true;
                 }
             }
+            Some(PickerKind::Language) => {
+                if let Some(lang) = self
+                    .filtered_languages()
+                    .get(self.picker.selected_index)
+                    .copied()
+                {
+                    self.draft.translate_to = lang;
+                    mutated = true;
+                }
+            }
+            Some(PickerKind::Screensaver) => {
+                if let Some(saver) = self
+                    .filtered_screensavers()
+                    .get(self.picker.selected_index)
+                    .copied()
+                {
+                    self.draft.screensaver = saver;
+                    mutated = true;
+                }
+            }
+            Some(PickerKind::InteractionMode) => {} // Applied through App's setter by input.rs.
             None => {}
         }
         self.close_picker();
@@ -1930,6 +2461,7 @@ impl SettingsModalState {
             return;
         }
         self.feed_index = (self.feed_index as isize + delta).clamp(0, len as isize - 1) as usize;
+        self.selected_feed_id = self.feeds.get(self.feed_index).map(|feed| feed.id);
     }
 
     pub(crate) fn feed_slot_count(&self) -> usize {
@@ -1941,6 +2473,8 @@ impl SettingsModalState {
     }
 
     pub(crate) fn start_feed_url_edit(&mut self) {
+        self.feed_index = self.feeds.len();
+        self.selected_feed_id = None;
         self.editing_feed_url = true;
         self.feed_url_input = new_short_textarea(true);
     }
@@ -1966,6 +2500,7 @@ impl SettingsModalState {
         let Some(feed) = self.feeds.get(self.feed_index) else {
             return;
         };
+        self.selected_feed_id = None;
         self.feed_service.delete_feed_task(self.user_id, feed.id);
     }
 
@@ -1978,7 +2513,20 @@ impl SettingsModalState {
         if let Ok(true) = self.feed_snapshot_rx.has_changed() {
             let snapshot = self.feed_snapshot_rx.borrow_and_update().clone();
             if snapshot.user_id == Some(self.user_id) {
+                let selected_id = self
+                    .selected_feed_id
+                    .or_else(|| self.feeds.get(self.feed_index).map(|feed| feed.id));
+                let was_add = self.selected_feed_id.is_none() && self.feed_index_is_add_row();
                 self.feeds = snapshot.feeds;
+                if was_add {
+                    self.feed_index = self.feeds.len();
+                } else if let Some(index) = self
+                    .feeds
+                    .iter()
+                    .position(|feed| Some(feed.id) == selected_id)
+                {
+                    self.feed_index = index;
+                }
                 self.feed_index = self
                     .feed_index
                     .min(self.feed_slot_count().saturating_sub(1));
@@ -2180,46 +2728,133 @@ impl SettingsModalState {
     }
 
     pub(crate) fn save(&self) {
-        self.profile_service.edit_profile(
-            self.user_id,
-            ProfileParams {
-                username: self.draft.username.clone(),
-                bio: self.draft.bio.clone(),
-                country: self.draft.country.clone(),
-                timezone: self.draft.timezone.clone(),
-                ide: self.draft.ide.clone(),
-                terminal: self.draft.terminal.clone(),
-                os: self.draft.os.clone(),
-                langs: self.draft.langs.clone(),
-                notify_kinds: self.draft.notify_kinds.clone(),
-                notify_bell: self.draft.notify_bell,
-                notify_cooldown_mins: self.draft.notify_cooldown_mins,
-                notify_format: self.draft.notify_format.clone(),
-                theme_id: Some(
-                    self.draft
-                        .theme_id
-                        .clone()
-                        .unwrap_or_else(|| theme::DEFAULT_ID.to_string()),
-                ),
-                enable_background_color: self.draft.enable_background_color,
-                text_brightness_adjustment: self.draft.text_brightness_adjustment,
-                show_right_sidebar: self.draft.show_right_sidebar,
-                right_sidebar_mode: self.draft.right_sidebar_mode,
-                right_sidebar_components: self.draft.right_sidebar_components.clone(),
-                show_room_list_sidebar: self.draft.show_room_list_sidebar,
-                room_list_mode: self.draft.room_list_mode,
-                keep_composer_focused: self.draft.keep_composer_focused,
-                start_with_music_muted: self.draft.start_with_music_muted,
-                landing_page: self.draft.landing_page,
-                paper_at_login: self.draft.paper_at_login,
-                show_flag_fallback: self.draft.show_flag_fallback,
-                translate_to: self.draft.translate_to,
-                auto_translate: self.draft.auto_translate,
-                translate_mine_to_en: self.draft.translate_mine_to_en,
-                favorite_room_ids: self.draft.favorite_room_ids.clone(),
-                favorite_theme_ids: self.draft.favorite_theme_ids.clone(),
-            },
-        );
+        self.profile_service
+            .edit_profile(self.user_id, Self::params(&self.draft));
+    }
+
+    fn params(draft: &Profile) -> ProfileParams {
+        ProfileParams {
+            username: draft.username.clone(),
+            bio: draft.bio.clone(),
+            country: draft.country.clone(),
+            timezone: draft.timezone.clone(),
+            ide: draft.ide.clone(),
+            terminal: draft.terminal.clone(),
+            os: draft.os.clone(),
+            langs: draft.langs.clone(),
+            notify_kinds: draft.notify_kinds.clone(),
+            notify_bell: draft.notify_bell,
+            notify_cooldown_mins: draft.notify_cooldown_mins,
+            notify_format: draft.notify_format.clone(),
+            theme_id: Some(
+                draft
+                    .theme_id
+                    .clone()
+                    .unwrap_or_else(|| theme::DEFAULT_ID.to_string()),
+            ),
+            enable_background_color: draft.enable_background_color,
+            text_brightness_adjustment: draft.text_brightness_adjustment,
+            show_right_sidebar: draft.show_right_sidebar,
+            right_sidebar_mode: draft.right_sidebar_mode,
+            right_sidebar_components: draft.right_sidebar_components.clone(),
+            statusline_components: draft.statusline_components.clone(),
+            show_room_list_sidebar: draft.show_room_list_sidebar,
+            room_list_mode: draft.room_list_mode,
+            keep_composer_focused: draft.keep_composer_focused,
+            start_with_music_muted: draft.start_with_music_muted,
+            landing_page: draft.landing_page,
+            paper_at_login: draft.paper_at_login,
+            screensaver: draft.screensaver,
+            show_watch_chat: draft.show_watch_chat,
+            artboard_disclaimer: draft.artboard_disclaimer,
+            terminal_images: draft.terminal_images,
+            hidden_award_categories: draft.hidden_award_categories.clone(),
+            show_flag_fallback: draft.show_flag_fallback,
+            translate_to: draft.translate_to,
+            auto_translate: draft.auto_translate,
+            translate_mine_to_en: draft.translate_mine_to_en,
+            favorite_room_ids: draft.favorite_room_ids.clone(),
+            favorite_theme_ids: draft.favorite_theme_ids.clone(),
+        }
+    }
+
+    /// A click elsewhere leaves the open text editor the way its keyboard
+    /// submit does (Bio saves on Esc), so both inputs share one save path.
+    pub(crate) fn submit_text_edit(&mut self) {
+        if self.editing_username {
+            self.submit_username();
+        } else if self.editing_system_field.is_some() {
+            self.submit_system_field();
+        } else if self.editing_bio {
+            self.stop_bio_edit();
+        } else if self.editing_feed_url {
+            self.submit_feed_url();
+        }
+    }
+
+    pub(crate) fn select_mouse_target(&mut self, target: Target) {
+        match target {
+            Target::Row(row) | Target::RowCycle(row, _) => {
+                self.row_index = Row::ALL.iter().position(|r| *r == row).unwrap_or(0)
+            }
+            Target::Tweak(row) | Target::TweakCycle(row, _) => {
+                self.tweak_row_index = TweakRow::ALL.iter().position(|r| *r == row).unwrap_or(0)
+            }
+            Target::SidebarMode => {
+                self.tweak_row_index = TweakRow::ALL
+                    .iter()
+                    .position(|r| *r == TweakRow::RightSidebar)
+                    .unwrap_or(0)
+            }
+            Target::Account(row) => {
+                self.account_row_index = AccountRow::ALL.iter().position(|r| *r == row).unwrap_or(0)
+            }
+            Target::Theme(index) | Target::Star(index) => {
+                self.theme_selected_row = index.min(self.theme_tree_rows().len().saturating_sub(1))
+            }
+            Target::Status(index) | Target::StatusToggle(index) | Target::StatusMove(index, _) => {
+                self.statusline_index =
+                    index.min(self.statusline_components().len().saturating_sub(1));
+                self.clamp_statusline_dial();
+            }
+            Target::Dial(index) | Target::DialCycle(index, _) => {
+                self.statusline_dial_index =
+                    index.min(self.statusline_dials().len().saturating_sub(1))
+            }
+            Target::Sidebar(index) | Target::SidebarMove(index, _) => {
+                self.right_sidebar_components_index =
+                    index.min(self.right_sidebar_components().len().saturating_sub(1))
+            }
+            Target::Badge(index) => {
+                self.chat_badges_index = index.min(chat_badge_rows().len().saturating_sub(1))
+            }
+            Target::Pick(index) => {
+                self.picker.selected_index = index.min(self.picker_len().saturating_sub(1))
+            }
+            Target::Feed(id) => {
+                self.selected_feed_id = Some(id);
+                if let Some(index) = self.feeds.iter().position(|feed| feed.id == id) {
+                    self.feed_index = index;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn position_caret(&mut self, field: Field, col: usize) {
+        let input = match field {
+            Field::Username => &mut self.username_input,
+            Field::System => &mut self.system_input,
+            Field::Feed => &mut self.feed_url_input,
+            Field::InviteCode => &mut self.invites.code_input,
+            Field::LinkCode => {
+                self.move_link_account_enter_code_focus(LinkAccountEnterCodeFocus::PeerCode);
+                &mut self.link_account.code_input
+            }
+            Field::LinkConfirm => &mut self.link_account.confirm_input,
+            Field::DeleteConfirm => &mut self.delete_account.input,
+        };
+        input.move_cursor(CursorMove::Jump(0, col as u16));
     }
 }
 
@@ -2235,6 +2870,58 @@ fn cycle_notify_format(current: Option<&str>, forward: bool) -> &'static str {
         (idx + OPTIONS.len() - 1) % OPTIONS.len()
     };
     OPTIONS[next]
+}
+
+/// The dials a bottom status bar segment offers, in display order. Keyhints
+/// offers a brief display switch in addition to the list's enable switch. A
+/// status component with no inactive reading gets no auto-hide switch, and one
+/// with no variants gets no mode row, so the pane never shows a dead control.
+fn statusline_dials_for(component: StatusComponent) -> Vec<StatuslineDial> {
+    if component == StatusComponent::Shortcuts {
+        return vec![StatuslineDial::Brief];
+    }
+    let mut dials = vec![StatuslineDial::Label];
+    if component.can_auto_hide() {
+        dials.push(StatuslineDial::AutoHide);
+    }
+    if !component.variants().is_empty() {
+        dials.push(StatuslineDial::Variant);
+    }
+    dials
+}
+
+/// Advance a segment's component-specific dial. `None` when the component has
+/// no dial; an unrecognized stored variant restarts from the first.
+fn next_variant(
+    current: Option<StatusVariant>,
+    variants: &[StatusVariant],
+    forward: bool,
+) -> Option<StatusVariant> {
+    if variants.is_empty() {
+        return None;
+    }
+    let idx = current
+        .and_then(|current| variants.iter().position(|v| *v == current))
+        .unwrap_or(0);
+    let len = variants.len();
+    let next = if forward {
+        (idx + 1) % len
+    } else {
+        (idx + len - 1) % len
+    };
+    variants.get(next).copied()
+}
+
+/// Advance a segment's label mode, skipping `Text` for a component that has no
+/// word to show: for those, `Text` paints exactly what `None` paints, and a
+/// cycle position that visibly does nothing reads as a broken control.
+fn next_label_mode(current: LabelMode, component: StatusComponent, forward: bool) -> LabelMode {
+    let next = current.cycle(forward);
+    if next == LabelMode::Text && component.text_label().is_empty() {
+        next.cycle(forward)
+    } else {
+        next
+    }
 }
 
 fn toggle_kind(kinds: &mut Vec<String>, kind: &str) {
@@ -2325,15 +3012,6 @@ fn theme_matches(option: &theme::ThemeOption, query_lower: &str) -> bool {
     option.label.to_lowercase().contains(query_lower)
         || option.id.to_lowercase().contains(query_lower)
         || option.group.label().to_lowercase().contains(query_lower)
-}
-
-fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
-    rect.width > 0
-        && rect.height > 0
-        && x >= rect.x
-        && x < rect.x + rect.width
-        && y >= rect.y
-        && y < rect.y + rect.height
 }
 
 #[cfg(test)]

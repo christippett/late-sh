@@ -17,8 +17,12 @@ use irc_proto::{
 use late_core::{
     MutexRecover,
     models::{
-        chat_message::ChatMessage, chat_room::ChatRoom, chat_room_member::ChatRoomMember,
-        room_ban::RoomBan, user::User,
+        chat_message::{ChatMessage, IrcHistoryMessage},
+        chat_room::ChatRoom,
+        chat_room_member::ChatRoomMember,
+        irc_history::{HistoryReader, Page, ReadError, Selection},
+        room_ban::RoomBan,
+        user::User,
     },
     rate_limit::IpRateLimiter,
 };
@@ -32,16 +36,18 @@ use uuid::Uuid;
 
 use super::{
     auth::{self, AuthOutcome},
-    motd, proj,
+    history, motd, proj,
     registry::IrcControl,
     replies::{self, NETWORK_NAME, SERVER_NAME, VERSION_STRING},
 };
 use crate::{
     app::chat::svc::{ChatEvent, ChatReactionAction, ChatReactionDelta},
     authz::Permissions,
+    metrics,
     moderation::{
         command::{RoleAction, RoomModAction},
         event::ModerationEvent,
+        service::{RoomModRequest, RoomRef},
     },
     state::{ActiveSession, ActiveUser, State},
     usernames,
@@ -60,7 +66,50 @@ const PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// security boundary (FRD §5.2 A4).
 const AUTH_FAIL_DELAY: Duration = Duration::from_secs(1);
 const AUTH_FAIL_DELAY_LIMITED: Duration = Duration::from_secs(8);
-const SUPPORTED_CAPS: &[&str] = &["message-tags", "server-time", "echo-message"];
+const SUPPORTED_CAPS: &[&str] = &[
+    "message-tags",
+    "server-time",
+    "echo-message",
+    "away-notify",
+    "batch",
+    "draft/chathistory",
+];
+
+/// Which path asked for history: a client `CHATHISTORY` command, or the
+/// server's own 25-message replay after a channel JOIN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrcHistoryRequest {
+    Explicit,
+    JoinReplay,
+}
+
+/// How a history request resolved, one count per request. Counted where the
+/// request is answered (`handle_history`, the JOIN replay, the rate limiter)
+/// so no request is counted twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrcHistoryOutcome {
+    Served,
+    /// Refused by the shared expensive-command limiter before parsing.
+    RateLimited,
+    /// Malformed subcommand, selector, or limit.
+    InvalidRequest,
+    /// Not a joined channel, an existing DM, or a readable room.
+    InvalidTarget,
+    /// A `msgid=` anchor that is not a visible message of the target.
+    InvalidReference,
+    /// The database read failed; the client got a generic `FAIL`.
+    Failed,
+}
+
+impl IrcHistoryOutcome {
+    fn from_read_error(error: &ReadError) -> Self {
+        match error {
+            ReadError::InvalidTarget => Self::InvalidTarget,
+            ReadError::InvalidReference => Self::InvalidReference,
+            ReadError::Database(_) => Self::Failed,
+        }
+    }
+}
 
 pub trait IrcIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -118,6 +167,7 @@ where
 
     let mut session = Session {
         state: state.clone(),
+        conn_id,
         user_id: registration.user_id,
         nick: registration.nick,
         is_admin: registration.is_admin,
@@ -132,6 +182,10 @@ where
         recent_commands: VecDeque::new(),
         last_rate_notice: None,
         last_online: HashSet::new(),
+        last_away: HashSet::new(),
+        sent_away: false,
+        last_spoke_at: Instant::now(),
+        away: false,
     };
 
     let result = session.run(&mut framed, control_rx).await;
@@ -170,7 +224,12 @@ impl Pending {
 struct IrcCapabilities {
     message_tags: bool,
     server_time: bool,
+    batch: bool,
+    chathistory: bool,
     echo_message: bool,
+    /// IRCv3 `away-notify`: an `AWAY` line when someone sharing a channel
+    /// goes away or comes back (`common/away.rs`).
+    away_notify: bool,
 }
 
 impl IrcCapabilities {
@@ -178,7 +237,10 @@ impl IrcCapabilities {
         match cap {
             "message-tags" => self.message_tags = true,
             "server-time" => self.server_time = true,
+            "batch" => self.batch = true,
+            "draft/chathistory" => self.chathistory = true,
             "echo-message" => self.echo_message = true,
+            "away-notify" => self.away_notify = true,
             _ => {}
         }
     }
@@ -187,7 +249,10 @@ impl IrcCapabilities {
         match cap {
             "message-tags" => self.message_tags = false,
             "server-time" => self.server_time = false,
+            "batch" => self.batch = false,
+            "draft/chathistory" => self.chathistory = false,
             "echo-message" => self.echo_message = false,
+            "away-notify" => self.away_notify = false,
             _ => {}
         }
     }
@@ -203,7 +268,20 @@ impl IrcCapabilities {
         if self.echo_message {
             caps.push("echo-message");
         }
+        if self.away_notify {
+            caps.push("away-notify");
+        }
+        if self.batch {
+            caps.push("batch");
+        }
+        if self.chathistory {
+            caps.push("draft/chathistory");
+        }
         caps.join(" ")
+    }
+
+    fn automatic_history(self) -> bool {
+        self.batch && self.server_time && !self.chathistory
     }
 }
 
@@ -415,6 +493,11 @@ async fn welcome(state: &State, framed: &mut IrcStream, registered: &Registered)
                 "TOPICLEN=300".to_string(),
                 "MODES=1".to_string(),
                 "UTF8ONLY".to_string(),
+                format!(
+                    "CHATHISTORY={}",
+                    late_core::models::irc_history::MAX_MESSAGES
+                ),
+                "MSGREFTYPES=msgid,timestamp".to_string(),
                 "are supported by this server".to_string(),
             ],
         ),
@@ -424,6 +507,24 @@ async fn welcome(state: &State, framed: &mut IrcStream, registered: &Registered)
             vec![format!("There are {online} users on 1 server")],
         ),
     ];
+    // Token authentication sets an account just as SASL would. Send this after
+    // ISUPPORT so clients can start history target discovery with the right limit.
+    let mut logged_in = replies::numeric(
+        nick,
+        Response::RPL_LOGGEDIN,
+        vec![
+            format!("{nick}!{nick}@{}", replies::USER_HOSTNAME),
+            registered.username.clone(),
+            format!("You are now logged in as {}", registered.username),
+        ],
+    );
+    if registered.caps.server_time {
+        logged_in.tags = Some(vec![Tag(
+            "time".to_string(),
+            Some(proj::server_time(chrono::Utc::now())),
+        )]);
+    }
+    burst.push(logged_in);
     burst.extend(motd_burst(nick, &state.config.web_url));
     send_all(framed, burst).await?;
     Ok(())
@@ -444,7 +545,7 @@ fn track_active_irc_user(
         token: irc_session_token(conn_id),
         fingerprint: Some(registered.fingerprint.clone()),
         peer_ip: client_ip,
-        status: None,
+        away: false,
     };
 
     let became_online = if let Some(active) = active_users.get_mut(&registered.user_id) {
@@ -522,6 +623,14 @@ struct JoinedChannel {
     name: String,
     slug: String,
     is_lounge: bool,
+    /// At most JOIN_MESSAGES IDs, suppressing creation events queued during replay.
+    replayed: HashSet<Uuid>,
+}
+
+impl JoinedChannel {
+    fn suppress_replayed_create(&mut self, message_id: Uuid, is_edit: bool) -> bool {
+        !is_edit && self.replayed.remove(&message_id)
+    }
 }
 
 struct DmPeer {
@@ -531,6 +640,9 @@ struct DmPeer {
 
 struct Session {
     state: State,
+    /// This connection's id; its roster session token is
+    /// `irc_session_token(conn_id)`.
+    conn_id: u64,
     user_id: Uuid,
     nick: String,
     is_admin: bool,
@@ -556,6 +668,16 @@ struct Session {
     last_rate_notice: Option<Instant>,
     /// Online users at the last presence poll, for JOIN/QUIT projection.
     last_online: HashSet<Uuid>,
+    /// Away users at the last presence poll, for `away-notify` projection.
+    last_away: HashSet<Uuid>,
+    /// `AWAY :msg` was sent and not yet cleared by a bare `AWAY`.
+    sent_away: bool,
+    /// When this connection last sent a PRIVMSG or NOTICE: IRC's "input".
+    /// PINGs and client-side polls do not count, or no IRC session would
+    /// ever go quiet.
+    last_spoke_at: Instant,
+    /// This connection's away flag as last written to the roster.
+    away: bool,
 }
 
 impl Session {
@@ -576,6 +698,7 @@ impl Session {
 
         self.force_join_lounge(framed).await?;
         self.last_online = self.online_user_ids();
+        self.last_away = self.away_user_ids();
 
         loop {
             tokio::select! {
@@ -634,6 +757,7 @@ impl Session {
                     }
                 }
                 _ = presence_timer.tick() => {
+                    self.sync_away();
                     self.project_presence_changes(framed).await?;
                 }
                 _ = ping_timer.tick() => {
@@ -655,6 +779,23 @@ impl Session {
     /// Returns false when the connection should close.
     async fn handle_command(&mut self, framed: &mut IrcStream, message: Message) -> Result<bool> {
         if is_rate_limited_command(&message.command) && !self.allow_command() {
+            if let Command::Raw(cmd, args) = &message.command
+                && cmd.eq_ignore_ascii_case("CHATHISTORY")
+                && self.caps.chathistory
+            {
+                metrics::record_irc_history(
+                    IrcHistoryRequest::Explicit,
+                    IrcHistoryOutcome::RateLimited,
+                );
+                framed
+                    .send(history::fail(
+                        "MESSAGE_ERROR",
+                        &args[..args.len().min(2)],
+                        "IRC command rate limit exceeded",
+                    ))
+                    .await?;
+                return Ok(true);
+            }
             if !matches!(message.command, Command::NOTICE(_, _)) && self.should_send_rate_notice() {
                 framed
                     .send(replies::server_notice(
@@ -681,10 +822,12 @@ impl Session {
                 return Ok(false);
             }
             Command::PRIVMSG(target, text) => {
+                self.note_spoke();
                 self.handle_privmsg(framed, &target, text, true, tags.as_deref())
                     .await?;
             }
             Command::NOTICE(target, text) => {
+                self.note_spoke();
                 // RFC: never generate error replies to NOTICE.
                 self.handle_privmsg(framed, &target, text, false, tags.as_deref())
                     .await?;
@@ -860,6 +1003,8 @@ impl Session {
                     .await?;
             }
             Command::AWAY(Some(_)) => {
+                self.sent_away = true;
+                self.sync_away();
                 framed
                     .send(replies::numeric(
                         &self.nick,
@@ -869,6 +1014,8 @@ impl Session {
                     .await?;
             }
             Command::AWAY(None) => {
+                self.sent_away = false;
+                self.note_spoke();
                 framed
                     .send(replies::numeric(
                         &self.nick,
@@ -923,6 +1070,11 @@ impl Session {
                     .await?;
             }
             Command::CAP(_, _, _, _) => {}
+            Command::Raw(cmd, args)
+                if cmd.eq_ignore_ascii_case("CHATHISTORY") && self.caps.chathistory =>
+            {
+                self.handle_history(framed, &args).await?;
+            }
             Command::Raw(cmd, args) if cmd.eq_ignore_ascii_case("TAGMSG") => {
                 if let Some(target) = args.first() {
                     self.handle_tagmsg(framed, target, tags.as_deref()).await?;
@@ -958,6 +1110,184 @@ impl Session {
             }
         }
         Ok(true)
+    }
+
+    async fn handle_history(&mut self, framed: &mut IrcStream, args: &[String]) -> Result<()> {
+        let context = &args[..args.len().min(2)];
+        let request = match history::parse(args) {
+            Ok(request) => request,
+            Err(error) => {
+                metrics::record_irc_history(
+                    IrcHistoryRequest::Explicit,
+                    IrcHistoryOutcome::InvalidRequest,
+                );
+                framed
+                    .send(history::fail(error.code, context, error.description))
+                    .await?;
+                return Ok(());
+            }
+        };
+        match self.history_response(request).await {
+            Ok((messages, _)) => {
+                metrics::record_irc_history(IrcHistoryRequest::Explicit, IrcHistoryOutcome::Served);
+                send_all(framed, messages).await?;
+            }
+            Err(error) => {
+                metrics::record_irc_history(
+                    IrcHistoryRequest::Explicit,
+                    IrcHistoryOutcome::from_read_error(&error),
+                );
+                let (code, description) = match error {
+                    ReadError::InvalidTarget => {
+                        ("INVALID_TARGET", "Messages could not be retrieved")
+                    }
+                    ReadError::InvalidReference => {
+                        ("MESSAGE_ERROR", "Message reference could not be resolved")
+                    }
+                    ReadError::Database(error) => {
+                        tracing::warn!(%error, "ircd: history read failed");
+                        ("MESSAGE_ERROR", "Messages could not be retrieved")
+                    }
+                };
+                framed
+                    .send(history::fail(code, context, description))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn history_response(
+        &mut self,
+        request: history::Request,
+    ) -> std::result::Result<(Vec<Message>, Vec<Uuid>), ReadError> {
+        let client = self.state.db.get().await?;
+        // Commands can arrive before a queued IgnoreListUpdated broadcast.
+        let ignored = User::ignored_user_ids(&client, self.user_id).await?;
+        let joined: Vec<Uuid> = self.joined.keys().copied().collect();
+        let reader = HistoryReader {
+            client: &client,
+            viewer: self.user_id,
+            joined_channels: &joined,
+            ignored_authors: &ignored,
+        };
+        match request {
+            history::Request::Targets {
+                first,
+                second,
+                limit,
+            } => {
+                let page = reader.targets(first, second, limit).await?;
+                let messages = page
+                    .items
+                    .into_iter()
+                    .filter_map(|target| {
+                        let name = if target.room.kind == "dm" {
+                            target
+                                .peer_username
+                                .map(|username| proj::nick_for_username(&username))
+                        } else {
+                            proj::channel_name(&target.room)
+                        }?;
+                        Some(replies::server_msg(Command::Raw(
+                            "CHATHISTORY".to_string(),
+                            vec![
+                                "TARGETS".to_string(),
+                                name,
+                                proj::server_time(target.latest),
+                            ],
+                        )))
+                    })
+                    .collect();
+                Ok((
+                    history::batch(
+                        messages,
+                        None,
+                        self.caps.batch,
+                        self.caps.message_tags && page.exhausted,
+                    ),
+                    Vec::new(),
+                ))
+            }
+            history::Request::Messages {
+                target,
+                selection,
+                limit,
+            } => {
+                let (room_id, canonical, is_dm) = if target.starts_with('#') {
+                    let room_id = self
+                        .channels
+                        .get(&proj::normalize_channel(&target))
+                        .copied()
+                        .ok_or(ReadError::InvalidTarget)?;
+                    let channel = self.joined.get(&room_id).ok_or(ReadError::InvalidTarget)?;
+                    (Some(room_id), channel.name.clone(), false)
+                } else {
+                    let peer = User::find_by_username(&client, &proj::username_for_nick(&target))
+                        .await?
+                        .ok_or(ReadError::InvalidTarget)?;
+                    if peer.id == self.user_id {
+                        return Err(ReadError::InvalidTarget);
+                    }
+                    let room = ChatRoom::get_dm(&client, self.user_id, peer.id).await?;
+                    (
+                        room.map(|room| room.id),
+                        proj::nick_for_username(&peer.username),
+                        true,
+                    )
+                };
+                let page = match room_id {
+                    Some(room_id) => reader.messages(room_id, selection, limit).await?,
+                    None => {
+                        // An existing user with no DM conversation has empty
+                        // history. In particular, querying it never creates a room.
+                        if selection_has_message_id(selection) {
+                            return Err(ReadError::InvalidReference);
+                        }
+                        Page {
+                            items: Vec::new(),
+                            exhausted: true,
+                        }
+                    }
+                };
+                let ids = page.items.iter().map(|item| item.message.id).collect();
+                let messages = self.history_lines(&canonical, is_dm, &page.items);
+                Ok((
+                    history::batch(
+                        messages,
+                        Some(&canonical),
+                        self.caps.batch,
+                        self.caps.message_tags && page.exhausted,
+                    ),
+                    ids,
+                ))
+            }
+        }
+    }
+
+    fn history_lines(
+        &self,
+        canonical: &str,
+        is_dm: bool,
+        items: &[IrcHistoryMessage],
+    ) -> Vec<Message> {
+        let directory = usernames::snapshot(&self.state.username_directory);
+        let mut messages = Vec::new();
+        for item in items {
+            let author = proj::nick_for_username(&item.author_username);
+            let target = if is_dm && item.message.user_id != self.user_id {
+                &self.nick
+            } else {
+                canonical
+            };
+            let body = if is_dm {
+                proj::body_for_irc(&item.message.body, &author)
+            } else {
+                proj::channel_body_for_irc(&item.message.body, &author, &directory)
+            };
+            messages.extend(self.privmsg_lines(&author, target, &item.message, &body, false));
+        }
+        messages
     }
 
     async fn handle_privmsg(
@@ -1061,11 +1391,12 @@ impl Session {
             {
                 return Ok(());
             }
+            let peer_nick = proj::nick_for_username(&target_username);
             self.dm_peers.insert(
                 room.id,
                 DmPeer {
                     peer_user_id: target_id,
-                    peer_nick: proj::nick_for_username(&target_username),
+                    peer_nick: peer_nick.clone(),
                 },
             );
             self.state.chat_service.send_message_with_reply_task(
@@ -1079,6 +1410,10 @@ impl Session {
                     is_admin: self.is_admin,
                 },
             );
+            // The standard courtesy: tell the sender their peer is away.
+            if reply_errors && self.is_user_away(target_id) {
+                framed.send(away_reply(&self.nick, &peer_nick)).await?;
+            }
         }
         Ok(())
     }
@@ -1379,10 +1714,11 @@ impl Session {
     }
 
     async fn handle_join(&mut self, framed: &mut IrcStream, name: &str) -> Result<()> {
-        if self.channels.contains_key(&proj::normalize_channel(name)) {
+        let normalized = proj::normalize_channel(name);
+        if self.channels.contains_key(&normalized) {
             return Ok(()); // already joined; ignore
         }
-        let Some(slug) = proj::slug_for_channel(name) else {
+        let Some((visibility, slug)) = proj::channel_parts(&normalized) else {
             framed
                 .send(replies::numeric(
                     &self.nick,
@@ -1393,7 +1729,9 @@ impl Session {
             return Ok(());
         };
         let client = self.state.db.get().await?;
-        let room = ChatRoom::find_irc_channel_by_slug_for_user(&client, slug, self.user_id).await?;
+        let room =
+            ChatRoom::find_irc_channel_by_slug_for_user(&client, visibility, slug, self.user_id)
+                .await?;
         let Some(room) = room.filter(proj::is_irc_channel_kind) else {
             framed
                 .send(replies::numeric(
@@ -1456,6 +1794,7 @@ impl Session {
                 name: name.clone(),
                 slug,
                 is_lounge: proj::is_lounge(room),
+                replayed: HashSet::new(),
             },
         );
         framed
@@ -1467,7 +1806,40 @@ impl Session {
         framed
             .send(replies::topic(&self.nick, &name, room.topic.as_deref()))
             .await?;
-        self.send_names(framed, &name).await
+        self.send_names(framed, &name).await?;
+        if self.caps.automatic_history() {
+            let request = history::Request::Messages {
+                target: name.clone(),
+                selection: Selection::Latest(None),
+                limit: history::JOIN_MESSAGES,
+            };
+            match self.history_response(request).await {
+                Ok((messages, ids)) => {
+                    metrics::record_irc_history(
+                        IrcHistoryRequest::JoinReplay,
+                        IrcHistoryOutcome::Served,
+                    );
+                    if let Some(channel) = self.joined.get_mut(&room.id) {
+                        channel.replayed = ids.into_iter().collect();
+                    }
+                    send_all(framed, messages).await?;
+                }
+                Err(error) => {
+                    metrics::record_irc_history(
+                        IrcHistoryRequest::JoinReplay,
+                        IrcHistoryOutcome::from_read_error(&error),
+                    );
+                    tracing::warn!(?error, "ircd: automatic history read failed");
+                    framed
+                        .send(replies::server_notice(
+                            &self.nick,
+                            "Channel history could not be retrieved",
+                        ))
+                        .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn handle_part(&mut self, framed: &mut IrcStream, name: &str) -> Result<()> {
@@ -1619,12 +1991,13 @@ impl Session {
                 let staff = User::staff_flags_by_ids(&client, &online).await?;
                 drop(client);
                 let directory = usernames::snapshot(&self.state.username_directory);
+                let away_ids = self.away_user_ids();
                 for id in online {
                     let Some(username) = directory.get(&id) else {
                         continue;
                     };
                     let nick = proj::nick_for_username(username);
-                    let flags = if staff.contains_key(&id) { "H@" } else { "H" };
+                    let flags = who_flags(away_ids.contains(&id), staff.contains_key(&id));
                     out.push(replies::numeric(
                         &self.nick,
                         Response::RPL_WHOREPLY,
@@ -1634,7 +2007,7 @@ impl Session {
                             replies::USER_HOSTNAME.to_string(),
                             SERVER_NAME.to_string(),
                             nick.clone(),
-                            flags.to_string(),
+                            flags,
                             format!("0 {nick}"),
                         ],
                     ));
@@ -1646,6 +2019,7 @@ impl Session {
                 && (self.is_user_online(id) || id == self.user_id)
             {
                 let nick = proj::nick_for_username(&username);
+                let flags = who_flags(self.is_user_away(id), false);
                 out.push(replies::numeric(
                     &self.nick,
                     Response::RPL_WHOREPLY,
@@ -1655,7 +2029,7 @@ impl Session {
                         replies::USER_HOSTNAME.to_string(),
                         SERVER_NAME.to_string(),
                         nick.clone(),
-                        "H".to_string(),
+                        flags,
                         format!("0 {nick}"),
                     ],
                 ));
@@ -1718,6 +2092,9 @@ impl Session {
                 ],
             ),
         ];
+        if self.is_user_away(id) {
+            out.push(away_reply(&self.nick, &nick));
+        }
         if staff.get(&id).is_some_and(|(is_admin, _)| *is_admin) {
             out.push(replies::numeric(
                 &self.nick,
@@ -1755,7 +2132,15 @@ impl Session {
                 .send(replies::numeric(
                     &self.nick,
                     Response::RPL_CHANNELMODEIS,
-                    vec![channel.to_string(), "+nt".to_string()],
+                    vec![
+                        channel.to_string(),
+                        if channel.starts_with("##") {
+                            "+inst"
+                        } else {
+                            "+nt"
+                        }
+                        .to_string(),
+                    ],
                 ))
                 .await?;
             return Ok(());
@@ -1768,10 +2153,12 @@ impl Session {
                     self.send_banlist(framed, channel, room_id).await?;
                 }
                 Mode::Plus(ChannelMode::Ban, Some(mask)) => {
-                    self.handle_ban_mode(framed, channel, &mask, true).await?;
+                    self.handle_ban_mode(framed, channel, room_id, &mask, true)
+                        .await?;
                 }
                 Mode::Minus(ChannelMode::Ban, Some(mask)) => {
-                    self.handle_ban_mode(framed, channel, &mask, false).await?;
+                    self.handle_ban_mode(framed, channel, room_id, &mask, false)
+                        .await?;
                 }
                 Mode::Plus(ChannelMode::InviteOnly, _)
                 | Mode::Minus(ChannelMode::InviteOnly, _)
@@ -1816,10 +2203,7 @@ impl Session {
                 .await?;
             return Ok(());
         }
-        if !self
-            .channels
-            .contains_key(&proj::normalize_channel(channel))
-        {
+        let Some((room_id, _)) = self.authorized_joined_channel(channel).await? else {
             framed
                 .send(replies::numeric(
                     &self.nick,
@@ -1828,13 +2212,22 @@ impl Session {
                 ))
                 .await?;
             return Ok(());
-        }
+        };
         let reason = reason.unwrap_or("IRC KICK");
         for nick in users.split(',').filter(|nick| !nick.trim().is_empty()) {
             let username = proj::username_for_nick(nick.trim());
-            let command = format!("kick {channel} @{username} {reason}");
-            self.run_moderation_command(framed, channel, &command)
-                .await?;
+            self.run_room_moderation_command(
+                framed,
+                channel,
+                RoomModRequest {
+                    action: RoomModAction::Kick,
+                    room: RoomRef::Id(room_id),
+                    username,
+                    duration: None,
+                    reason: reason.to_string(),
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1864,6 +2257,7 @@ impl Session {
         &mut self,
         framed: &mut IrcStream,
         channel: &str,
+        room_id: Uuid,
         mask: &str,
         add: bool,
     ) -> Result<()> {
@@ -1890,12 +2284,22 @@ impl Session {
             return Ok(());
         };
         let username = proj::username_for_nick(nick);
-        let command = if add {
-            format!("ban {channel} @{username} IRC MODE +b")
-        } else {
-            format!("unban {channel} @{username} IRC MODE -b")
-        };
-        self.run_moderation_command(framed, channel, &command).await
+        self.run_room_moderation_command(
+            framed,
+            channel,
+            RoomModRequest {
+                action: if add {
+                    RoomModAction::Ban
+                } else {
+                    RoomModAction::Unban
+                },
+                room: RoomRef::Id(room_id),
+                username,
+                duration: None,
+                reason: if add { "IRC MODE +b" } else { "IRC MODE -b" }.to_string(),
+            },
+        )
+        .await
     }
 
     async fn send_banlist(
@@ -1938,12 +2342,36 @@ impl Session {
         command: &str,
     ) -> Result<()> {
         let permissions = self.reload_permissions().await?;
-        match self
+        let result = self
             .state
             .chat_service
             .run_mod_command(self.user_id, permissions, command)
-            .await
-        {
+            .await;
+        self.send_moderation_result(framed, context, result).await
+    }
+
+    async fn run_room_moderation_command(
+        &mut self,
+        framed: &mut IrcStream,
+        channel: &str,
+        request: RoomModRequest,
+    ) -> Result<()> {
+        let permissions = self.reload_permissions().await?;
+        let result = self
+            .state
+            .chat_service
+            .run_room_mod_command(self.user_id, permissions, request)
+            .await;
+        self.send_moderation_result(framed, channel, result).await
+    }
+
+    async fn send_moderation_result(
+        &self,
+        framed: &mut IrcStream,
+        context: &str,
+        result: Result<Vec<String>>,
+    ) -> Result<()> {
+        match result {
             Ok(lines) => {
                 for line in lines {
                     framed
@@ -2217,6 +2645,10 @@ impl Session {
         author_username: Option<String>,
         is_edit: bool,
     ) -> Result<()> {
+        let replayed = self
+            .joined
+            .get_mut(&message.room_id)
+            .is_some_and(|channel| channel.suppress_replayed_create(message.id, is_edit));
         if let Some(channel) = self.joined.get(&message.room_id) {
             if target_user_ids
                 .as_ref()
@@ -2242,6 +2674,11 @@ impl Session {
                     return Ok(());
                 }
             }
+            // Consume any matching recent send above even when this creation
+            // was replayed, so it cannot suppress a later identical TUI body.
+            if replayed {
+                return Ok(());
+            }
             let directory = usernames::snapshot(&self.state.username_directory);
             let author = match author_username {
                 Some(author) => author,
@@ -2252,13 +2689,7 @@ impl Session {
             };
             let author = proj::nick_for_username(&author);
             let channel_name = channel.name.clone();
-            let body = proj::body_for_irc(&message.body, &author);
-            let body = proj::rewrite_leading_mention_for_irc(&body, |username| {
-                directory
-                    .values()
-                    .find(|candidate| candidate.eq_ignore_ascii_case(username))
-                    .cloned()
-            });
+            let body = proj::channel_body_for_irc(&message.body, &author, &directory);
             self.deliver_privmsg(framed, &author, &channel_name, &message, &body, is_edit)
                 .await?;
             return Ok(());
@@ -2317,14 +2748,38 @@ impl Session {
         body: &str,
         is_edit: bool,
     ) -> Result<()> {
-        let mut lines = proj::split_body(body, proj::PRIVMSG_CHUNK_BYTES);
+        send_all(
+            framed,
+            self.privmsg_lines(author, target, message, body, is_edit),
+        )
+        .await
+    }
+
+    fn privmsg_lines(
+        &self,
+        author: &str,
+        target: &str,
+        message: &ChatMessage,
+        body: &str,
+        is_edit: bool,
+    ) -> Vec<Message> {
+        // IRCv3 tags have a separate size budget. Keep the command, prefix,
+        // trailing colon and CRLF within 512 bytes even for maximum-length
+        // nicks/channels; use the same split for live traffic and replay.
+        let overhead =
+            replies::from_user(author, Command::PRIVMSG(target.to_string(), String::new()))
+                .to_string()
+                .len()
+                + if is_edit { "[edit] ".len() } else { 0 };
+        let chunk_bytes = proj::PRIVMSG_CHUNK_BYTES.min(512usize.saturating_sub(overhead).max(4));
+        let mut lines = proj::split_body(body, chunk_bytes);
         if is_edit {
             lines = lines
                 .into_iter()
                 .map(|line| format!("[edit] {line}"))
                 .collect();
         }
-        let messages: Vec<Message> = lines
+        lines
             .into_iter()
             .enumerate()
             .map(|(idx, line)| {
@@ -2334,9 +2789,7 @@ impl Session {
                     self.privmsg_tags(message, idx == 0, is_edit),
                 )
             })
-            .collect();
-        send_all(framed, messages).await?;
-        Ok(())
+            .collect()
     }
 
     async fn project_reaction_delta(
@@ -2598,6 +3051,42 @@ impl Session {
         Ok(!memberships.is_empty())
     }
 
+    /// Recompute this connection's away flag (`common/away.rs`) and write it
+    /// to the roster when it changed.
+    fn sync_away(&mut self) {
+        let away =
+            crate::app::common::away::session_is_away(self.last_spoke_at.elapsed(), self.sent_away);
+        if away == self.away {
+            return;
+        }
+        self.away = away;
+        crate::app::common::away::set_session_away(
+            &self.state.active_users,
+            self.user_id,
+            &irc_session_token(self.conn_id),
+            away,
+        );
+    }
+
+    /// The user spoke from this connection: it is here again (unless an
+    /// explicit `AWAY :msg` still stands).
+    fn note_spoke(&mut self) {
+        self.last_spoke_at = Instant::now();
+        self.sync_away();
+    }
+
+    fn is_user_away(&self, user_id: Uuid) -> bool {
+        self.state
+            .active_users
+            .lock_recover()
+            .get(&user_id)
+            .is_some_and(crate::app::common::away::user_is_away)
+    }
+
+    fn away_user_ids(&self) -> HashSet<Uuid> {
+        crate::app::common::away::away_user_ids(&self.state.active_users.lock_recover())
+    }
+
     fn is_user_online(&self, user_id: Uuid) -> bool {
         self.state
             .active_users
@@ -2671,13 +3160,95 @@ impl Session {
             }
         }
 
+        // `away-notify`: an AWAY line for everyone online sharing a channel
+        // whose away flag moved since the last poll. An arrival who is away
+        // lands here too, right after their JOIN above, as the spec asks.
+        let now_away = self.away_user_ids();
+        if self.caps.away_notify && !self.joined.is_empty() {
+            let changed: Vec<Uuid> = now_away
+                .symmetric_difference(&self.last_away)
+                .filter(|id| **id != self.user_id && now_online.contains(*id))
+                .copied()
+                .collect();
+            if !changed.is_empty() {
+                let client = self.state.db.get().await?;
+                let joined_room_ids: Vec<Uuid> = self.joined.keys().copied().collect();
+                let memberships = ChatRoomMember::list_memberships_for_users_in_rooms(
+                    &client,
+                    &changed,
+                    &joined_room_ids,
+                )
+                .await?;
+                drop(client);
+                let sharing: HashSet<Uuid> = memberships
+                    .into_iter()
+                    .map(|(user_id, _)| user_id)
+                    .collect();
+                for user_id in sharing {
+                    let Some(nick) = directory
+                        .get(&user_id)
+                        .map(|username| proj::nick_for_username(username))
+                    else {
+                        continue;
+                    };
+                    let message = match now_away.contains(&user_id) {
+                        true => Some(crate::app::common::away::AWAY_GLYPH.to_string()),
+                        false => None,
+                    };
+                    out.push(replies::from_user(&nick, Command::AWAY(message)));
+                }
+            }
+        }
+
         self.last_online = now_online;
+        self.last_away = now_away;
         send_all(framed, out).await?;
         Ok(())
     }
 }
 
+/// A WHO reply's flags: `H` here or `G` gone (away), then `@` for staff.
+fn who_flags(away: bool, staff: bool) -> String {
+    let presence = match away {
+        true => "G",
+        false => "H",
+    };
+    match staff {
+        true => format!("{presence}@"),
+        false => presence.to_string(),
+    }
+}
+
+/// `RPL_AWAY` (301) about `target_nick`, sent to `nick`. The away message
+/// is the away glyph: late.sh away carries no text.
+fn away_reply(nick: &str, target_nick: &str) -> Message {
+    replies::numeric(
+        nick,
+        Response::RPL_AWAY,
+        vec![
+            target_nick.to_string(),
+            crate::app::common::away::AWAY_GLYPH.to_string(),
+        ],
+    )
+}
+
+fn selection_has_message_id(selection: Selection) -> bool {
+    use late_core::models::irc_history::Reference::MessageId;
+    matches!(
+        selection,
+        Selection::Latest(Some(MessageId(_)))
+            | Selection::Before(MessageId(_))
+            | Selection::After(MessageId(_))
+            | Selection::Around(MessageId(_))
+            | Selection::Between(MessageId(_), _)
+            | Selection::Between(_, MessageId(_))
+    )
+}
+
 fn is_rate_limited_command(command: &Command) -> bool {
+    if matches!(command, Command::Raw(cmd, _) if cmd.eq_ignore_ascii_case("CHATHISTORY")) {
+        return true;
+    }
     matches!(
         command,
         Command::PRIVMSG(_, _)

@@ -9,16 +9,19 @@ use uuid::Uuid;
 
 use super::marketplace::{CHAT_BADGE_SLOT, CHAT_FLAG_SLOT};
 use super::profile_award::{
-    MILESTONE_AWARD_CATEGORIES, PROFILE_AWARD_RANK_LIMIT, top_badge_per_game,
+    CROWN_AWARD_CATEGORY, MILESTONE_AWARD_CATEGORIES, PROFILE_AWARD_RANK_LIMIT, top_badge_per_game,
+};
+use super::statusline::{
+    StatusComponentSetting, default_statusline_components, parse_statusline_components,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioSource {
-    Icecast,
     Youtube,
-    /// Nightride FM direct streams. The default for users who never picked
-    /// a source, so fresh `late` sessions land on the radio.
+    /// Direct station streams from the radio catalogue (`crate::radio`).
+    /// The default for users who never picked a source, so fresh `late`
+    /// sessions land on the radio.
     #[default]
     Radio,
 }
@@ -26,16 +29,16 @@ pub enum AudioSource {
 impl AudioSource {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Icecast => "icecast",
             Self::Youtube => "youtube",
             Self::Radio => "radio",
         }
     }
 
+    /// `icecast` is the retired house-stream source; migration 220 moved
+    /// its users to `radio` on the mount they had.
     pub fn from_settings_str(value: &str) -> Self {
         match value {
             "youtube" => Self::Youtube,
-            "icecast" => Self::Icecast,
             _ => Self::Radio,
         }
     }
@@ -87,66 +90,7 @@ impl InteractionMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IcecastStream {
-    #[default]
-    Chill,
-    Classical,
-}
-
-impl IcecastStream {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Chill => "chill",
-            Self::Classical => "classical",
-        }
-    }
-
-    pub fn from_settings_str(value: &str) -> Self {
-        match value {
-            "classical" => Self::Classical,
-            _ => Self::Chill,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RadioStation {
-    #[default]
-    Chillsynth,
-    Nightride,
-    Datawave,
-    Spacesynth,
-    Ambient,
-}
-
-impl RadioStation {
-    /// Settings/persistence key, also used to look up live now-playing
-    /// metadata in the Nightride `/meta` feed. The feed keys stations by
-    /// their stream filename, so `Ambient` must key on `"rektify"` (its
-    /// `rektify.mp3` stream) even though its display label is `"ambient"`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Chillsynth => "chillsynth",
-            Self::Nightride => "nightride",
-            Self::Datawave => "datawave",
-            Self::Spacesynth => "spacesynth",
-            Self::Ambient => "rektify",
-        }
-    }
-
-    pub fn from_settings_str(value: &str) -> Self {
-        match value {
-            "nightride" => Self::Nightride,
-            "datawave" => Self::Datawave,
-            "spacesynth" => Self::Spacesynth,
-            "rektify" => Self::Ambient,
-            _ => Self::Chillsynth,
-        }
-    }
-}
+pub use crate::radio::{RADIO_SLOTS, RadioSlots, RadioStation};
 
 crate::model! {
     table = "users";
@@ -199,11 +143,11 @@ impl RightSidebarMode {
         }
     }
 
-    pub fn cycle(self, _forward: bool) -> Self {
-        match self {
-            Self::On => Self::Off,
-            Self::Off => Self::Auto,
-            Self::Auto => Self::On,
+    pub fn cycle(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::On, true) | (Self::Auto, false) => Self::Off,
+            (Self::Off, true) | (Self::On, false) => Self::Auto,
+            (Self::Auto, true) | (Self::Off, false) => Self::On,
         }
     }
 }
@@ -247,6 +191,338 @@ impl LandingPage {
     }
 }
 
+/// A colour scene from ascii.rest: shaded per cell, drawn in a
+/// `SceneStyle`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Scene {
+    /// A slow one, the default: the Earth turning over the lunar horizon,
+    /// played at a crawl.
+    Earthrise,
+    /// A slow one: fog and sunbeams through pines, played at a crawl.
+    MistyForest,
+    AuroraFjord,
+    AlpineDawn,
+}
+
+impl Scene {
+    pub const ALL: [Scene; 4] = [
+        Scene::Earthrise,
+        Scene::MistyForest,
+        Scene::AuroraFjord,
+        Scene::AlpineDawn,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Earthrise => "earthrise",
+            Self::MistyForest => "misty_forest",
+            Self::AuroraFjord => "aurora_fjord",
+            Self::AlpineDawn => "alpine_dawn",
+        }
+    }
+
+    /// Lowercase display name, the way ascii.rest names its pieces.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Earthrise => "earthrise",
+            Self::MistyForest => "misty forest",
+            Self::AuroraFjord => "aurora fjord",
+            Self::AlpineDawn => "alpine dawn",
+        }
+    }
+}
+
+/// How a scene is drawn on the terminal's cells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SceneStyle {
+    /// The original's halftone: a grid of dots sized and lit by
+    /// brightness.
+    Dots,
+    /// Solid half-block pixels, two to a cell, in true colour.
+    Pixels,
+}
+
+impl SceneStyle {
+    pub const ALL: [SceneStyle; 2] = [SceneStyle::Dots, SceneStyle::Pixels];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dots => "dots",
+            Self::Pixels => "pixels",
+        }
+    }
+}
+
+/// An animated ascii piece (`late-ssh/src/app/ascii`): what a Zen ascii tile
+/// shows and what the away screensaver plays, a scene in one of its styles.
+/// Ported from ascii.rest by @bas3line (MIT). Stored by key (`as_str`) in
+/// `users.settings` and in the Zen layout: a scene's key is its name for
+/// dots, `<name>_pixels` for pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AsciiPiece {
+    pub scene: Scene,
+    pub style: SceneStyle,
+}
+
+impl AsciiPiece {
+    /// What plays when nothing was picked, on a Zen ascii tile and as the
+    /// screensaver alike: earthrise in dots, a slow piece, a frame a second
+    /// that moves a few cells, so a tile left up or an away session costs
+    /// about what idling does.
+    pub const DEFAULT: AsciiPiece = AsciiPiece {
+        scene: Scene::Earthrise,
+        style: SceneStyle::Dots,
+    };
+
+    /// Picker and cycle order: each scene in both styles, the screensaver's
+    /// default first.
+    pub const ALL: [AsciiPiece; 8] = [
+        AsciiPiece {
+            scene: Scene::Earthrise,
+            style: SceneStyle::Dots,
+        },
+        AsciiPiece {
+            scene: Scene::Earthrise,
+            style: SceneStyle::Pixels,
+        },
+        AsciiPiece {
+            scene: Scene::MistyForest,
+            style: SceneStyle::Dots,
+        },
+        AsciiPiece {
+            scene: Scene::MistyForest,
+            style: SceneStyle::Pixels,
+        },
+        AsciiPiece {
+            scene: Scene::AuroraFjord,
+            style: SceneStyle::Dots,
+        },
+        AsciiPiece {
+            scene: Scene::AuroraFjord,
+            style: SceneStyle::Pixels,
+        },
+        AsciiPiece {
+            scene: Scene::AlpineDawn,
+            style: SceneStyle::Dots,
+        },
+        AsciiPiece {
+            scene: Scene::AlpineDawn,
+            style: SceneStyle::Pixels,
+        },
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match (self.scene, self.style) {
+            (Scene::Earthrise, SceneStyle::Dots) => "earthrise",
+            (Scene::Earthrise, SceneStyle::Pixels) => "earthrise_pixels",
+            (Scene::MistyForest, SceneStyle::Dots) => "misty_forest",
+            (Scene::MistyForest, SceneStyle::Pixels) => "misty_forest_pixels",
+            (Scene::AuroraFjord, SceneStyle::Dots) => "aurora_fjord",
+            (Scene::AuroraFjord, SceneStyle::Pixels) => "aurora_fjord_pixels",
+            (Scene::AlpineDawn, SceneStyle::Dots) => "alpine_dawn",
+            (Scene::AlpineDawn, SceneStyle::Pixels) => "alpine_dawn_pixels",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        let key = key.trim();
+        Self::ALL.into_iter().find(|piece| piece.as_str() == key)
+    }
+
+    /// Lowercase display name, the way ascii.rest names its pieces, with the
+    /// style: `aurora fjord · dots`.
+    pub fn label(self) -> String {
+        format!("{} · {}", self.scene.label(), self.style.label())
+    }
+}
+
+impl Serialize for AsciiPiece {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AsciiPiece {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let key = String::deserialize(deserializer)?;
+        match Self::from_key(&key) {
+            Some(piece) => Ok(piece),
+            None => Err(serde::de::Error::custom(format!(
+                "unknown ascii piece {key:?}"
+            ))),
+        }
+    }
+}
+
+/// What an animated view plays. Persist the selection, never its random result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsciiSelection {
+    Piece(AsciiPiece),
+    Random,
+    Randomer,
+}
+
+impl AsciiSelection {
+    pub const DEFAULT: Self = Self::Piece(AsciiPiece::DEFAULT);
+    /// Fixed pieces in their existing order, then the two random modes.
+    pub const ALL: [Self; AsciiPiece::ALL.len() + 2] = {
+        let mut choices = [Self::Random; AsciiPiece::ALL.len() + 2];
+        let mut i = 0;
+        while i < AsciiPiece::ALL.len() {
+            choices[i] = Self::Piece(AsciiPiece::ALL[i]);
+            i += 1;
+        }
+        choices[i + 1] = Self::Randomer;
+        choices
+    };
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Piece(piece) => piece.as_str(),
+            Self::Random => "random",
+            Self::Randomer => "randomer",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key.trim() {
+            "random" => Some(Self::Random),
+            "randomer" => Some(Self::Randomer),
+            other => AsciiPiece::from_key(other).map(Self::Piece),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Piece(piece) => piece.label(),
+            Self::Random => "random".to_string(),
+            Self::Randomer => "randomer".to_string(),
+        }
+    }
+
+    pub fn cycle(self, forward: bool) -> Self {
+        let at = Self::ALL
+            .iter()
+            .position(|choice| *choice == self)
+            .expect("every selection is in ALL");
+        let len = Self::ALL.len();
+        Self::ALL[(at + if forward { 1 } else { len - 1 }) % len]
+    }
+}
+
+impl Serialize for AsciiSelection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AsciiSelection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let key = String::deserialize(deserializer)?;
+        Self::from_key(&key)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown ascii selection {key:?}")))
+    }
+}
+
+/// Tweak: what covers the screen while the session is away. Defaults to
+/// earthrise in dots; random selections are resolved separately per activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Screensaver {
+    Off,
+    On(AsciiSelection),
+}
+
+impl Screensaver {
+    pub const DEFAULT: Self = Self::On(AsciiSelection::DEFAULT);
+
+    pub fn selection(self) -> Option<AsciiSelection> {
+        match self {
+            Self::Off => None,
+            Self::On(selection) => Some(selection),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On(selection) => selection.as_str(),
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key.trim() {
+            "off" => Some(Self::Off),
+            other => AsciiSelection::from_key(other).map(Self::On),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Off => "off".to_string(),
+            Self::On(selection) => selection.label(),
+        }
+    }
+
+    /// Off, then every selection in picker order, then Off again.
+    pub fn cycle(self, forward: bool) -> Self {
+        let first = AsciiSelection::ALL[0];
+        let last = AsciiSelection::ALL[AsciiSelection::ALL.len() - 1];
+        match (self, forward) {
+            (Self::Off, true) => Self::On(first),
+            (Self::Off, false) => Self::On(last),
+            (Self::On(selection), true) if selection == last => Self::Off,
+            (Self::On(selection), false) if selection == first => Self::Off,
+            (Self::On(selection), forward) => Self::On(selection.cycle(forward)),
+        }
+    }
+}
+
+/// Inline terminal image previews (Settings, Tweaks, Display). `Auto` trusts
+/// what the terminal reports. The other two override it for terminals that
+/// report wrong: tmux can pass on sixel support its host terminal lacks, and
+/// some terminals draw sixel without ever advertising it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalImagesMode {
+    Auto,
+    Off,
+    Sixel,
+}
+
+impl TerminalImagesMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::Sixel => "sixel",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key.trim() {
+            "auto" => Some(Self::Auto),
+            "off" => Some(Self::Off),
+            "sixel" => Some(Self::Sixel),
+            _ => None,
+        }
+    }
+
+    pub fn cycle(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Auto, true) => Self::Off,
+            (Self::Off, true) => Self::Sixel,
+            (Self::Sixel, true) => Self::Auto,
+            (Self::Auto, false) => Self::Sixel,
+            (Self::Off, false) => Self::Auto,
+            (Self::Sixel, false) => Self::Off,
+        }
+    }
+}
+
 /// Master on/off for the Home room-list rail, the left column. Mirrors
 /// [`RightSidebarMode`], including `Auto`: the rail folds away on terminals too
 /// narrow to carry three columns.
@@ -275,67 +551,106 @@ impl RoomListMode {
         }
     }
 
-    pub fn cycle(self, _forward: bool) -> Self {
-        match self {
-            Self::On => Self::Off,
-            Self::Off => Self::Auto,
-            Self::Auto => Self::On,
+    pub fn cycle(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::On, true) | (Self::Auto, false) => Self::Off,
+            (Self::Off, true) | (Self::On, false) => Self::Auto,
+            (Self::Auto, true) | (Self::Off, false) => Self::On,
         }
     }
 }
 
 /// Number of reorderable/toggleable panels in the right sidebar (the clock is
 /// always pinned at the top and is not part of this list).
-pub const RIGHT_SIDEBAR_COMPONENT_COUNT: usize = 3;
+pub const RIGHT_SIDEBAR_COMPONENT_COUNT: usize = 7;
 
 /// A right-sidebar panel the user can reorder and toggle. The clock is not
-/// listed here — it is always pinned at the top of the sidebar. The
+/// listed here: it is always pinned at the top of the sidebar. The
 /// visualizer is not a panel of its own: it renders inline at the top of
 /// `Music`, see `common/sidebar.rs`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RightSidebarComponent {
+    /// What the house can watch right now: the live games on the
+    /// watchable doors, a row each.
+    Live,
     Music,
     Bonsai,
     Daily,
+    /// The Pet Companion's box; drawn only while the account owns one.
+    Pet,
+    /// A small tank of one-to-three-cell fish; drawn only while the account
+    /// owns the aquarium.
+    Tank,
+    /// Free space: no rule, no rows of its own, it takes whatever the rail
+    /// has left, so the panels under it sit at the bottom.
+    Spacer,
 }
 
 impl RightSidebarComponent {
     /// Default order, top to bottom. Used when a user has no stored list and
-    /// to backfill any panels missing from a stored list. Space cuts by
-    /// shrink priority; Bonsai is the one flexible panel and absorbs leftover
-    /// rows. Stale stored keys (e.g. the retired "activity", "visualizer" and
-    /// "pot" panels) are dropped on read by `from_key`.
-    pub const ALL: [RightSidebarComponent; RIGHT_SIDEBAR_COMPONENT_COUNT] =
-        [Self::Daily, Self::Music, Self::Bonsai];
+    /// to place any panel missing from a stored list (right after the panel
+    /// before it here, see `normalize_right_sidebar_components`). Every panel has a
+    /// fixed height; when the rail runs short, panels drop from the bottom
+    /// of this order up. Stale stored keys (e.g. the retired "pet",
+    /// "activity", "visualizer" and "pot" panels) are dropped on read by
+    /// `from_key`; the pet panel came back under a new key so an old stored
+    /// "pet" entry cannot switch it on.
+    pub const ALL: [RightSidebarComponent; RIGHT_SIDEBAR_COMPONENT_COUNT] = [
+        Self::Music,
+        Self::Daily,
+        Self::Live,
+        Self::Spacer,
+        Self::Bonsai,
+        Self::Pet,
+        Self::Tank,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Live => "live",
             Self::Music => "music",
             Self::Bonsai => "bonsai",
             Self::Daily => "daily",
+            Self::Pet => "pet_box",
+            Self::Tank => "mini_tank",
+            Self::Spacer => "spacer",
         }
     }
 
     pub fn from_key(key: &str) -> Option<Self> {
         match key.trim() {
+            "live" => Some(Self::Live),
             "music" => Some(Self::Music),
             "bonsai" => Some(Self::Bonsai),
             "daily" => Some(Self::Daily),
+            "pet_box" => Some(Self::Pet),
+            "mini_tank" => Some(Self::Tank),
+            "spacer" => Some(Self::Spacer),
             _ => None,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Live => "Live",
             Self::Music => "Audio playback",
             Self::Bonsai => "Bonsai",
             Self::Daily => "Lobby",
+            Self::Pet => "Pet",
+            Self::Tank => "Tank",
+            Self::Spacer => "Free space",
         }
     }
 
-    /// Whether the panel starts enabled for users without a stored setting.
+    /// Whether the panel starts enabled, for new users and when a new panel
+    /// is backfilled into an existing user's stored list. The pet and the
+    /// tank start off: the rail is tight and they are opt-in. Live starts
+    /// on: a game nobody can see is a game nobody watches.
     pub fn default_enabled(self) -> bool {
-        true
+        match self {
+            Self::Live | Self::Music | Self::Bonsai | Self::Daily | Self::Spacer => true,
+            Self::Pet | Self::Tank => false,
+        }
     }
 }
 
@@ -359,14 +674,13 @@ pub fn default_right_sidebar_components() -> Vec<RightSidebarComponentSetting> {
         .collect()
 }
 
-/// Drop duplicates and backfill any missing panels at the end so the list
-/// always covers every component exactly once, preserving stored order.
-///
-/// Missing panels are backfilled **enabled**, not at `default_enabled()`: a
-/// user with a stored list is an existing user whose effective state must not
-/// silently change when a new panel ships. `default_enabled()` applies only to
-/// the no-stored-list path in `default_right_sidebar_components`, i.e.
-/// genuinely new users.
+/// Drop duplicates and backfill any missing panels so the list always
+/// covers every component exactly once, preserving stored order. A missing
+/// panel lands where a new user has it: right under the panel that precedes
+/// it in `ALL`, wherever the stored order put that one (the first panel of
+/// `ALL` goes on top), so a new panel shipped under the lobby sits under
+/// the lobby on every rail and is not lost off the bottom of a full one.
+/// It takes its `default_enabled()`, the same as a new user gets it.
 pub fn normalize_right_sidebar_components(
     components: &[RightSidebarComponentSetting],
 ) -> Vec<RightSidebarComponentSetting> {
@@ -377,13 +691,30 @@ pub fn normalize_right_sidebar_components(
         }
         result.push(*setting);
     }
-    for component in RightSidebarComponent::ALL {
-        if !result.iter().any(|s| s.component == component) {
-            result.push(RightSidebarComponentSetting {
-                component,
-                enabled: true,
-            });
+    for (index, component) in RightSidebarComponent::ALL.into_iter().enumerate() {
+        if result.iter().any(|s| s.component == component) {
+            continue;
         }
+        // Missing panels are placed in ALL order, so the predecessor is
+        // in the list by now, stored or just placed.
+        let at = match index {
+            0 => 0,
+            _ => {
+                let before = RightSidebarComponent::ALL[index - 1];
+                result
+                    .iter()
+                    .position(|s| s.component == before)
+                    .expect("the panel before it in ALL is placed first")
+                    + 1
+            }
+        };
+        result.insert(
+            at,
+            RightSidebarComponentSetting {
+                component,
+                enabled: component.default_enabled(),
+            },
+        );
     }
     result
 }
@@ -393,8 +724,8 @@ const FRIEND_USER_IDS_KEY: &str = "friend_user_ids";
 const INTERACTION_MODE_KEY: &str = "interaction_mode";
 const THEME_ID_KEY: &str = "theme_id";
 const AUDIO_SOURCE_KEY: &str = "audio_source";
-const ICECAST_STREAM_KEY: &str = "icecast_stream";
 const RADIO_STATION_KEY: &str = "radio_station";
+const RADIO_SLOTS_KEY: &str = "radio_slots";
 const NOTIFY_KINDS_KEY: &str = "notify_kinds";
 const NOTIFY_BELL_KEY: &str = "notify_bell";
 const NOTIFY_COOLDOWN_MINS_KEY: &str = "notify_cooldown_mins";
@@ -404,6 +735,7 @@ const TEXT_BRIGHTNESS_ADJUSTMENT_KEY: &str = "text_brightness_adjustment";
 const SHOW_RIGHT_SIDEBAR_KEY: &str = "show_right_sidebar";
 const RIGHT_SIDEBAR_MODE_KEY: &str = "right_sidebar_mode";
 const RIGHT_SIDEBAR_COMPONENTS_KEY: &str = "right_sidebar_components";
+const STATUSLINE_COMPONENTS_KEY: &str = "statusline_components";
 /// The Rice page's tiling layout and look (`late-ssh/src/app/zen`), stored
 /// as the JSON the page itself serializes; absent until first edited.
 const ZEN_LAYOUT_KEY: &str = "zen_layout";
@@ -412,13 +744,15 @@ const ROOM_LIST_MODE_KEY: &str = "room_list_mode";
 const KEEP_COMPOSER_FOCUSED_KEY: &str = "keep_composer_focused";
 const START_WITH_MUSIC_MUTED_KEY: &str = "start_with_music_muted";
 const LANDING_PAGE_KEY: &str = "landing_page";
+const SCREENSAVER_KEY: &str = "screensaver";
 const PAPER_AT_LOGIN_KEY: &str = "paper_at_login";
+const SHOW_WATCH_CHAT_KEY: &str = "show_watch_chat";
+const TERMINAL_IMAGES_KEY: &str = "terminal_images";
+/// Award categories the user keeps off their chat label. Read by the chat
+/// label SQL straight from `users.settings`, so the key is spelled there too.
+const HIDDEN_AWARD_CATEGORIES_KEY: &str = "hidden_award_categories";
 /// The edition (UTC date, ISO) whose login pop this account has had.
 const PAPER_SHOWN_ON_KEY: &str = "paper_shown_on";
-/// `{"month": "YYYY-MM", "shown": n}`: how many of last month's podium
-/// pieces the splash has shown this account, and for which month. One
-/// key, overwritten in place; it never grows.
-const SPLASH_PODIUM_KEY: &str = "splash_podium";
 const TRANSLATE_TO_KEY: &str = "translate_to";
 const AUTO_TRANSLATE_KEY: &str = "auto_translate";
 const TRANSLATE_MINE_TO_EN_KEY: &str = "translate_mine_to_en";
@@ -529,7 +863,7 @@ impl User {
     /// Staff (admin/moderator) flags for the given users. Users with neither
     /// flag are omitted; values are `(is_admin, is_moderator)`.
     pub async fn staff_flags_by_ids(
-        client: &Client,
+        client: &impl GenericClient,
         user_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, (bool, bool)>> {
         if user_ids.is_empty() {
@@ -682,11 +1016,12 @@ impl User {
                           WHEN 'greendragon_dragon' THEN 'GDS'
                           WHEN 'darkroom_escape' THEN 'ADE'
                           WHEN 'darkroom_beacon' THEN 'ADB'
+                          WHEN 'deadchannel_old_signal' THEN 'SIG'
                           -- Monthly like the boards below, rankless like the
                           -- milestones above: one holder, so no rank digit
                           -- (`profile_award::is_rankless_award`).
-                          WHEN 'crown' THEN 'CRWN'
                           WHEN 'late_time' THEN 'LATE'
+                          WHEN 'top_drinkers' THEN 'DRNK'
                           ELSE (
                             CASE category
                               WHEN 'top_chips' THEN 'CHIP'
@@ -704,9 +1039,9 @@ impl User {
                                  CASE category
                                    WHEN 'arcade_wins' THEN 0
                                    WHEN 'top_chips' THEN 1
-                                   WHEN 'crown' THEN 5
                                    WHEN 'artboard' THEN 6
                                    WHEN 'late_time' THEN 7
+                                   WHEN 'top_drinkers' THEN 8
                                    WHEN 'tetris' THEN 2
                                    WHEN 'twenty_forty_eight' THEN 3
                                    WHEN 'snake' THEN 4
@@ -723,12 +1058,21 @@ impl User {
                                    WHEN 'brogue_mastery' THEN 20
                                    WHEN 'darkroom_escape' THEN 21
                                    WHEN 'darkroom_beacon' THEN 22
+                                   WHEN 'deadchannel_old_signal' THEN 23
                                    ELSE 99
                                  END
                     ) AS badges
                     FROM profile_awards pa
                     WHERE pa.user_id = u.id
                       AND pa.rank <= $4
+                      -- Badges the author hid in Settings, Tweaks, Chat badges
+                      -- (`extract_hidden_award_categories`). Hiding the top
+                      -- rung of a game ladder lets the next one show.
+                      AND NOT (COALESCE(u.settings->'hidden_award_categories', '[]'::jsonb) ? pa.category)
+                      -- The crown never joins the group: chat paints last
+                      -- month's winner as a glyph before the name instead
+                      -- (`profile_award::chat_award_categories`).
+                      AND pa.category <> $6
                       AND (
                         pa.period_month = (date_trunc('month', now() AT TIME ZONE 'UTC')::date - INTERVAL '1 month')::date
                         OR pa.category = ANY($5)
@@ -741,6 +1085,7 @@ impl User {
                     &CHAT_FLAG_SLOT,
                     &PROFILE_AWARD_RANK_LIMIT,
                     &milestone_categories,
+                    &CROWN_AWARD_CATEGORY,
                 ],
             )
             .await?;
@@ -860,9 +1205,9 @@ impl User {
         Ok(extract_audio_source(&settings))
     }
 
-    pub async fn icecast_stream(client: &Client, user_id: Uuid) -> Result<IcecastStream> {
+    pub async fn radio_slots(client: &Client, user_id: Uuid) -> Result<RadioSlots> {
         let settings = Self::settings_for_user(client, user_id).await?;
-        Ok(extract_icecast_stream(&settings))
+        Ok(extract_radio_slots(&settings))
     }
 
     pub async fn radio_station(client: &Client, user_id: Uuid) -> Result<RadioStation> {
@@ -1290,19 +1635,53 @@ impl User {
         Ok(())
     }
 
-    pub async fn set_icecast_stream(
+    /// Write one pinned slot: `Some(station)` pins it there and vacates any
+    /// other slot it held, `None` empties the slot. One statement against
+    /// the stored slots (the defaults when none are saved), never a whole
+    /// array from session memory, so two sessions pinning different slots
+    /// both land.
+    pub async fn set_radio_slot(
         client: &Client,
         user_id: Uuid,
-        stream: IcecastStream,
+        index: usize,
+        slot: Option<RadioStation>,
     ) -> Result<()> {
-        let value = stream.as_str();
+        if index >= RADIO_SLOTS {
+            bail!("radio slot {index} is out of range");
+        }
+        let position = index as i32 + 1;
+        let value = match slot {
+            Some(station) => Value::String(station.as_str().to_string()),
+            None => Value::Null,
+        };
         let updated = client
             .execute(
                 "UPDATE users
-                 SET settings = settings || jsonb_build_object($1::text, $2::text),
+                 SET settings = settings || jsonb_build_object($1::text, (
+                         SELECT jsonb_agg(
+                                    CASE
+                                        WHEN n = $4::int THEN $5::jsonb
+                                        WHEN stored.slots -> (n - 1) = $5::jsonb THEN 'null'::jsonb
+                                        ELSE coalesce(stored.slots -> (n - 1), 'null'::jsonb)
+                                    END
+                                    ORDER BY n)
+                         FROM generate_series(1, $6::int) AS n,
+                              (SELECT CASE
+                                          WHEN jsonb_typeof(settings -> $1::text) = 'array'
+                                          THEN settings -> $1::text
+                                          ELSE $2::jsonb
+                                      END AS slots) AS stored
+                     )),
                      updated = current_timestamp
                  WHERE id = $3",
-                &[&ICECAST_STREAM_KEY, &value, &user_id],
+                &[
+                    &RADIO_SLOTS_KEY,
+                    &RadioSlots::default().to_json(),
+                    &user_id,
+                    &position,
+                    &value,
+                    &(RADIO_SLOTS as i32),
+                ],
             )
             .await?;
         if updated == 0 {
@@ -1513,46 +1892,6 @@ impl User {
         Ok(updated == 1)
     }
 
-    /// Claim the next of `podium_size` splash slots for `month` (the podium's
-    /// `period_month`): the first login of a month gets slot 1, the next
-    /// slot 2, and so on up to the podium's size, after which the door
-    /// shows the coffee cup and this returns `None` without writing. Wins
-    /// once per login across every device and replica, the way the paper's
-    /// stamp does: the row is the only judge. A stored month past `month`
-    /// (a replica behind the calendar) never resets and never counts.
-    pub async fn claim_splash_podium_slot(
-        client: &Client,
-        user_id: Uuid,
-        month: chrono::NaiveDate,
-        podium_size: i64,
-    ) -> Result<Option<i64>> {
-        let value = month.format("%Y-%m").to_string();
-        let row = client
-            .query_opt(
-                "UPDATE users
-                 SET settings = settings || jsonb_build_object(
-                         $1::text,
-                         jsonb_build_object(
-                             'month', $2::text,
-                             'shown', CASE
-                                 WHEN settings->$1->>'month' = $2
-                                 THEN (settings->$1->>'shown')::bigint + 1
-                                 ELSE 1::bigint
-                             END
-                         )
-                     ),
-                     updated = current_timestamp
-                 WHERE id = $3
-                   AND (COALESCE(settings->$1->>'month', '') < $2
-                        OR (settings->$1->>'month' = $2
-                            AND (settings->$1->>'shown')::bigint < $4))
-                 RETURNING (settings->$1->>'shown')::bigint AS slot",
-                &[&SPLASH_PODIUM_KEY, &value, &user_id, &podium_size],
-            )
-            .await?;
-        Ok(row.map(|row| row.get("slot")))
-    }
-
     /// Take the paper's login stamp off (the admin `/paper reset` hook), so
     /// the next session pops the paper again whatever edition is printed.
     pub async fn clear_paper_shown(client: &Client, user_id: Uuid) -> Result<()> {
@@ -1660,19 +1999,21 @@ pub fn extract_audio_source(settings: &Value) -> AudioSource {
         .unwrap_or_default()
 }
 
-pub fn extract_icecast_stream(settings: &Value) -> IcecastStream {
-    settings
-        .get(ICECAST_STREAM_KEY)
-        .and_then(Value::as_str)
-        .map(IcecastStream::from_settings_str)
-        .unwrap_or_default()
-}
-
 pub fn extract_radio_station(settings: &Value) -> RadioStation {
     settings
         .get(RADIO_STATION_KEY)
         .and_then(Value::as_str)
         .map(RadioStation::from_settings_str)
+        .unwrap_or_default()
+}
+
+/// The user's pinned slots, or the defaults when they never pinned
+/// anything. The defaults do not depend on the current station, so a slot
+/// never moves because the user retuned.
+pub fn extract_radio_slots(settings: &Value) -> RadioSlots {
+    settings
+        .get(RADIO_SLOTS_KEY)
+        .and_then(RadioSlots::from_json)
         .unwrap_or_default()
 }
 
@@ -1805,6 +2146,20 @@ pub fn extract_right_sidebar_components(settings: &Value) -> Vec<RightSidebarCom
     normalize_right_sidebar_components(&parsed)
 }
 
+/// The user's bottom status bar. An absent key means "never customized" and
+/// yields the shipped defaults (Keyhints, station, voice, mentions), so this is also
+/// what every existing account reads until the customizer writes for the
+/// first time.
+pub fn extract_statusline_components(settings: &Value) -> Vec<StatusComponentSetting> {
+    let Some(values) = settings
+        .get(STATUSLINE_COMPONENTS_KEY)
+        .and_then(Value::as_array)
+    else {
+        return default_statusline_components();
+    };
+    parse_statusline_components(values)
+}
+
 pub fn extract_show_room_list_sidebar(settings: &Value) -> bool {
     settings
         .get(SHOW_ROOM_LIST_SIDEBAR_KEY)
@@ -1892,11 +2247,64 @@ pub fn extract_landing_page(settings: &Value) -> LandingPage {
     }
 }
 
+/// Tweak: what plays over the screen while the session is away. Absent or
+/// unreadable values play the default, earthrise.
+pub fn extract_screensaver(settings: &Value) -> Screensaver {
+    match settings.get(SCREENSAVER_KEY).and_then(Value::as_str) {
+        Some(key) => Screensaver::from_key(key).unwrap_or(Screensaver::DEFAULT),
+        None => Screensaver::DEFAULT,
+    }
+}
+
+/// Tweak: the award badges hidden from the user's chat label. Unknown
+/// categories are dropped, so the stored list only ever names real badges.
+pub fn extract_hidden_award_categories(settings: &Value) -> Vec<String> {
+    let Some(entries) = settings
+        .get(HIDDEN_AWARD_CATEGORIES_KEY)
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let known = super::profile_award::all_award_categories();
+    known
+        .into_iter()
+        .filter(|category| entries.iter().any(|entry| entry.as_str() == Some(category)))
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Tweak: how inline images reach the terminal. Absent or unreadable means
+/// `Auto`, the detected protocol.
+pub fn extract_terminal_images(settings: &Value) -> TerminalImagesMode {
+    match settings.get(TERMINAL_IMAGES_KEY).and_then(Value::as_str) {
+        Some(key) => TerminalImagesMode::from_key(key).unwrap_or(TerminalImagesMode::Auto),
+        None => TerminalImagesMode::Auto,
+    }
+}
+
 /// Tweak: open The Late Edition (the daily paper) once a day at login.
 /// Defaults to true; `/paper` still opens it by hand when off.
 pub fn extract_paper_at_login(settings: &Value) -> bool {
     settings
         .get(PAPER_AT_LOGIN_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Ask before displaying Artboard content on each visit. Enabled by default.
+pub fn extract_artboard_disclaimer(settings: &Value) -> bool {
+    settings
+        .get("artboard_disclaimer")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Whether a player sees their watchers' chat beside a running door game
+/// (toggled from the door's landing). Defaults to true; off hides it from
+/// the player only, the watchers keep talking.
+pub fn extract_show_watch_chat(settings: &Value) -> bool {
+    settings
+        .get(SHOW_WATCH_CHAT_KEY)
         .and_then(Value::as_bool)
         .unwrap_or(true)
 }
@@ -2185,7 +2593,7 @@ pub fn extract_langs(settings: &Value) -> Vec<String> {
         Vec::new()
     };
 
-    normalize_profile_tags(raw_tags.iter().map(String::as_str))
+    crate::vocab::normalize_langs(raw_tags.iter().map(String::as_str))
 }
 
 fn extract_trimmed_profile_text(settings: &Value, key: &str) -> Option<String> {
@@ -2195,30 +2603,6 @@ fn extract_trimmed_profile_text(settings: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-}
-
-fn normalize_profile_tags<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    for value in values {
-        for raw in value.split(|c: char| c == ',' || c.is_whitespace()) {
-            let tag: String = raw
-                .trim()
-                .trim_matches('#')
-                .to_ascii_lowercase()
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '-' | '_' | '.'))
-                .collect();
-            if tag.is_empty() || tag.len() > 24 || !seen.insert(tag.clone()) {
-                continue;
-            }
-            out.push(tag);
-            if out.len() >= 8 {
-                return out;
-            }
-        }
-    }
-    out
 }
 
 pub fn sanitize_username_input(username: &str) -> String {
@@ -2248,8 +2632,12 @@ pub fn sanitize_username_input(username: &str) -> String {
         return "user".to_string();
     }
 
+    // A trailing dot goes with the trailing underscores: "thanks @alice."
+    // must read as alice and a full stop, never as a longer handle.
     let truncated = truncate_to_boundary(normalized, USERNAME_MAX_LEN);
-    let truncated = truncated.trim_matches('_');
+    let truncated = truncated
+        .trim_start_matches('_')
+        .trim_end_matches(['_', '.']);
     if truncated.is_empty() {
         "user".to_string()
     } else {

@@ -1,46 +1,45 @@
 //! The crown: orchestration for the one slot everyone can see.
 //!
-//! Two commands (`/crown`, `/crown take`), one transaction, one glyph. This
-//! module owns every refusal, every log line, the #lounge story, and the
-//! process-shared holder that renderers read; `late_core::models::crown`
-//! owns the table and the price ladder underneath it.
+//! Two commands (`/crown`, `/crown take [N]`), one transaction, two glyphs
+//! (the live holder's and last month's laureate's). This module owns every
+//! refusal, every log line, the #lounge story, and the process-shared
+//! wearers that renderers read; `late_core::models::crown` owns the table and
+//! the price ladder underneath it.
 //!
 //! Distribution is the `StreamService` shape: a `watch` for the state every
-//! session reads once a second (the holder), and a `broadcast` for the
+//! session reads once a second (the wearers), and a `broadcast` for the
 //! answers to commands, which belong to one session each. A take lands on
 //! whichever replica the buyer is connected to and reaches every other one
 //! over the `crown_changed` Postgres notify, so there is exactly one code
-//! path that moves the glyph.
-
-use std::time::Duration;
+//! path that moves the glyphs.
 
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use late_core::{
-    db::{Db, DbConfig},
+    db::Db,
     models::{
         chips::{ChipMove, UserChips},
-        crown::{
-            CROWN_CHANGED_CHANNEL, CrownChange, CrownReign, crown_month, listen_for_crown_changes,
-            next_price,
-        },
+        crown::{CrownChange, CrownReign, crown_month, next_price, previous_crown_month},
         profile::fetch_username,
         user::User,
     },
 };
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{Instrument, info_span};
 use uuid::Uuid;
 
 use crate::{
-    app::activity::publisher::ActivityPublisher, app::common::primitives::thousands, metrics,
+    app::activity::publisher::ActivityPublisher,
+    app::common::primitives::thousands,
+    metrics,
+    pg_listener::{Channel, Refresh, Signal, read_until_ok},
 };
 
 /// Command answers are per-session and short-lived; a session that falls this
 /// far behind has bigger problems than a stale crown banner.
 const CROWN_EVENT_CAP: usize = 32;
 
-/// Who wears the glyph, and for which UTC month. The month travels with the
+/// Who wore the crown, and in which UTC month. The month travels with the
 /// holder because expiry is read-time: a reign left open across the rollover
 /// stops counting the moment the month does, with no sweeper and no notify
 /// to wake anyone up (see [`CrownHolder::if_current`]).
@@ -58,6 +57,59 @@ impl CrownHolder {
     }
 }
 
+/// The two people the crown marks in chat: the live holder (the small
+/// glyph after the name) and the laureate, last month's winner (the big
+/// crown before it). Both resolve at read time from `now`, so the rollover
+/// moves them with no refresh: the current month's last reign is already
+/// here when it becomes last month's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrownWearers {
+    /// The open reign, whatever month it belongs to.
+    pub open: Option<CrownHolder>,
+    /// The last reign of each of the two newest months anyone took the
+    /// crown in, newest first (`CrownReign::last_of_recent_months`).
+    pub month_ends: [Option<CrownHolder>; 2],
+}
+
+impl CrownWearers {
+    /// The user wearing the crown right now.
+    pub fn holder(self, now: DateTime<Utc>) -> Option<Uuid> {
+        self.open.and_then(|open| open.if_current(now))
+    }
+
+    /// Whoever wore the crown when last month ended: the same rule as the
+    /// `CRWN` award, read here so the glyph does not wait on the award
+    /// snapshot loop.
+    pub fn laureate(self, now: DateTime<Utc>) -> Option<Uuid> {
+        let last_month = previous_crown_month(now);
+        self.month_ends
+            .into_iter()
+            .flatten()
+            .find(|end| end.month == last_month)
+            .map(|end| end.user_id)
+    }
+}
+
+/// What a taker offers. `/crown take` pays the ladder's price; `/crown take
+/// N` pays exactly N, which may be any amount at or above it, so a taker can
+/// overpay on purpose to push the next rung out of a rival's reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrownBid {
+    AtPrice,
+    Offer(i64),
+}
+
+impl CrownBid {
+    /// What this bid charges against the current `price`, or why it cannot.
+    pub fn charge(self, price: i64) -> Result<i64, CrownRefusal> {
+        match self {
+            Self::AtPrice => Ok(price),
+            Self::Offer(offer) if offer >= price => Ok(offer),
+            Self::Offer(offer) => Err(CrownRefusal::BidTooLow { offer, price }),
+        }
+    }
+}
+
 /// Why a take did not happen. Every arm is a rule the caller can act on, and
 /// every arm costs nothing: a refused take never touches the ledger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +119,9 @@ pub enum CrownRefusal {
     AlreadyYours,
     /// The price would take the caller below the chip floor.
     InsufficientChips { price: i64 },
+    /// `/crown take N` with N under what the ladder asks, possibly because
+    /// someone took it between the caller's `/crown` and their bid.
+    BidTooLow { offer: i64, price: i64 },
 }
 
 impl CrownRefusal {
@@ -77,6 +132,11 @@ impl CrownRefusal {
             Self::InsufficientChips { price } => {
                 format!("Taking the crown costs {} chips", thousands(price))
             }
+            Self::BidTooLow { offer, price } => format!(
+                "A {}-chip bid is under the crown's {}-chip price",
+                thousands(offer),
+                thousands(price)
+            ),
         }
     }
 }
@@ -120,14 +180,16 @@ impl CrownStatus {
     pub fn line(&self) -> String {
         let price = thousands(self.price);
         let Some(holder) = &self.holder else {
-            return format!("The crown is vacant. /crown take claims it for {price} chips.");
+            return format!(
+                "The crown is vacant. /crown take claims it for {price} chips, /crown take N bids more."
+            );
         };
         let who = match holder.is_you {
             true => "You have worn the crown".to_string(),
             false => format!("{} has worn the crown", holder.username),
         };
         let held = short_duration(holder.held_for_secs);
-        format!("{who} for {held}. /crown take costs {price} chips.")
+        format!("{who} for {held}. /crown take costs {price} chips, /crown take N bids more.")
     }
 }
 
@@ -189,18 +251,18 @@ pub struct CrownService {
     /// runs without the activity broadcast; the take still lands, it just
     /// tells nobody.
     activity: Option<ActivityPublisher>,
-    holder_tx: watch::Sender<Option<CrownHolder>>,
+    wearers_tx: watch::Sender<CrownWearers>,
     evt_tx: broadcast::Sender<CrownEvent>,
 }
 
 impl CrownService {
     pub fn new(db: Db) -> Self {
-        let (holder_tx, _) = watch::channel(None);
+        let (wearers_tx, _) = watch::channel(CrownWearers::default());
         let (evt_tx, _) = broadcast::channel(CROWN_EVENT_CAP);
         Self {
             db,
             activity: None,
-            holder_tx,
+            wearers_tx,
             evt_tx,
         }
     }
@@ -210,10 +272,10 @@ impl CrownService {
         self
     }
 
-    /// The process-shared holder, read once a second by every session's tick
-    /// so no render ever queries for the glyph.
-    pub fn subscribe_holder(&self) -> watch::Receiver<Option<CrownHolder>> {
-        let mut rx = self.holder_tx.subscribe();
+    /// The process-shared holder and laureate, read once a second by every
+    /// session's tick so no render ever queries for a glyph.
+    pub fn subscribe_wearers(&self) -> watch::Receiver<CrownWearers> {
+        let mut rx = self.wearers_tx.subscribe();
         // `subscribe` marks the current value as seen, which would leave a
         // session connecting mid-reign with no glyph until the next take.
         rx.mark_changed();
@@ -224,98 +286,69 @@ impl CrownService {
         self.evt_tx.subscribe()
     }
 
-    /// Re-read the open reign and publish it. The startup seed and the
-    /// notify handler are the same call, so a replica that reconnects its
-    /// listener cannot be left holding a stale glyph.
-    pub async fn refresh_holder(&self) -> Result<()> {
+    /// Re-read the open reign and the last reigns of the newest two months,
+    /// and publish them. The startup seed and the notify handler are the
+    /// same call, so a replica that reconnects its listener cannot be left
+    /// holding a stale glyph. Only a take changes either read, so nothing
+    /// else has to call this: the rollover is resolved at read time.
+    pub async fn refresh_wearers(&self) -> Result<()> {
         let client = self.db.get().await?;
-        let holder = CrownReign::find_open(&client)
+        let open = CrownReign::find_open(&client)
             .await?
             .map(|reign| CrownHolder {
                 user_id: reign.holder_user_id,
                 month: reign.month,
             });
-        self.holder_tx.send_replace(holder);
+        let mut month_ends = [None; 2];
+        for (slot, reign) in month_ends
+            .iter_mut()
+            .zip(CrownReign::last_of_recent_months(&client).await?)
+        {
+            *slot = Some(CrownHolder {
+                user_id: reign.holder_user_id,
+                month: reign.month,
+            });
+        }
+        self.wearers_tx
+            .send_replace(CrownWearers { open, month_ends });
         Ok(())
     }
 
-    /// Keep every replica's glyph in step. One long-lived Postgres
-    /// connection LISTENs on [`CROWN_CHANGED_CHANNEL`]; a dropped connection
-    /// reconnects after five seconds and re-seeds, so a take committed
-    /// during the gap is not lost. Same shape as
-    /// `ChatService::start_message_listener_task`.
-    pub fn start_listener_task(&self, db_config: DbConfig) -> tokio::task::JoinHandle<()> {
+    /// What the notify worker subscribes to.
+    pub const CHANNELS: &'static [Channel] = &[Channel::CrownChanged];
+
+    /// Keep every replica's glyph in step with `crown_changed`. A resync
+    /// re-reads the holder, retrying until it lands, so a take committed
+    /// while the listener was reconnecting is not lost; every notify is
+    /// applied in order, since its payload names who was deposed.
+    pub fn start_notify_worker(
+        &self,
+        mut signals: mpsc::UnboundedReceiver<Signal>,
+    ) -> tokio::task::JoinHandle<()> {
         let service = self.clone();
         tokio::spawn(async move {
-            loop {
-                if let Err(error) = service.listen_once(&db_config).await {
-                    tracing::warn!(error = ?error, "crown postgres listener stopped");
+            while let Some(signal) = signals.recv().await {
+                match signal {
+                    Signal::Resync => {
+                        read_until_ok(Refresh::CrownHolder, || service.refresh_wearers()).await;
+                    }
+                    Signal::Notify { payload, .. } => service.apply_change(&payload).await,
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         })
     }
 
-    async fn listen_once(&self, db_config: &DbConfig) -> Result<()> {
-        let mut config = tokio_postgres::Config::new();
-        config.host(&db_config.host);
-        config.port(db_config.port);
-        config.user(&db_config.user);
-        config.password(&db_config.password);
-        config.dbname(&db_config.dbname);
-
-        let (client, mut connection) = config.connect(tokio_postgres::NoTls).await?;
-        let listen = listen_for_crown_changes(&client);
-        tokio::pin!(listen);
-        loop {
-            tokio::select! {
-                result = &mut listen => {
-                    result?;
-                    break;
-                }
-                message = std::future::poll_fn(|cx| connection.poll_message(cx)) => {
-                    let Some(message) = message else {
-                        return Ok(());
-                    };
-                    self.handle_notification(message?).await;
-                }
-            }
-        }
-
-        // Seeded after the LISTEN is live, so a take committed between the
-        // two is caught by this read rather than dropped.
-        self.refresh_holder().await?;
-
-        loop {
-            let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await else {
-                return Ok(());
-            };
-            self.handle_notification(message?).await;
-        }
-    }
-
-    async fn handle_notification(&self, message: tokio_postgres::AsyncMessage) {
-        let tokio_postgres::AsyncMessage::Notification(notification) = message else {
-            return;
-        };
-        if notification.channel() != CROWN_CHANGED_CHANNEL {
-            return;
-        }
-        self.apply_change(notification.payload()).await;
-    }
-
     /// One `crown_changed` notify, on every replica including the one that
-    /// sent it: re-read the holder for the glyph, then tell the deposed
+    /// sent it: re-read the wearers for the glyphs, then tell the deposed
     /// holder who took it if they are connected here.
     ///
     /// A failed re-read is this replica's glyph lagging until the next
-    /// take, not a reason to drop the LISTEN connection: propagating it
-    /// would lose every take committed during the reconnect window. A
+    /// take or resync, so it is logged and the worker keeps going. A
     /// payload that does not parse is logged for the same reason; the
     /// re-read does not depend on it.
     pub(super) async fn apply_change(&self, payload: &str) {
-        if let Err(error) = self.refresh_holder().await {
-            tracing::warn!(error = ?error, "failed to refresh the crown holder");
+        if let Err(error) = self.refresh_wearers().await {
+            tracing::warn!(error = ?error, "failed to refresh the crown wearers");
         }
         let change = match CrownChange::parse(payload) {
             Ok(change) => change,
@@ -369,12 +402,12 @@ impl CrownService {
     /// This is the orchestration layer: every refusal, every failure, the
     /// metrics and the #lounge line are decided here, and [`Self::take`]
     /// below does nothing but the transaction.
-    pub fn take_task(&self, user_id: Uuid, username: String) {
+    pub fn take_task(&self, user_id: Uuid, username: String, bid: CrownBid) {
         let service = self.clone();
-        let span = info_span!("crown.take_task", user_id = %user_id);
+        let span = info_span!("crown.take_task", user_id = %user_id, bid = ?bid);
         tokio::spawn(
             async move {
-                match service.take(user_id, &username).await {
+                match service.take(user_id, &username, bid).await {
                     Ok(outcome) => service.announce(user_id, outcome),
                     Err(CrownError::Refused(refusal)) => {
                         metrics::record_crown_take_refused(refusal);
@@ -479,19 +512,25 @@ impl CrownService {
     /// The one transaction: serialize every take, read the reign, close it,
     /// open the new one, burn the chips. Every early return drops the
     /// transaction, which rolls it back, so a refusal here is uncharged too.
+    ///
+    /// The bid is checked against the price under the lock, so an offer
+    /// that was enough when the taker typed it but was overtaken by a
+    /// racing take is refused rather than charged at a rung they never saw.
+    /// What the reign records is what was paid, so the next rung climbs from
+    /// the bid, not from the price.
     pub(super) async fn take(
         &self,
         user_id: Uuid,
         taker_username: &str,
+        bid: CrownBid,
     ) -> Result<CrownTakeOutcome, CrownError> {
-        let now = Utc::now();
         let mut client = self.db.get().await?;
         let tx = client.transaction().await.map_err(anyhow::Error::from)?;
-        let open = CrownReign::lock_open(&tx).await?;
+        let (open, taken_at) = CrownReign::lock_open(&tx).await?;
         // A reign from a previous month is stale rather than current: the
         // crown reads as vacant at the minimum price, and the row below is
         // closed on the way past.
-        let current = open.as_ref().filter(|reign| reign.is_current(now));
+        let current = open.as_ref().filter(|reign| reign.is_current(taken_at));
         // No hold: a reign is takeable the moment it exists, at the next
         // rung. Two takes racing for one crown both land, the second at 1.5x
         // the first, which is the auction working as designed; the price
@@ -501,12 +540,15 @@ impl CrownService {
         {
             return Err(CrownError::Refused(CrownRefusal::AlreadyYours));
         }
-        let price = next_price(current.map(|reign| reign.paid_chips));
+        let price = match bid.charge(next_price(current.map(|reign| reign.paid_chips))) {
+            Ok(price) => price,
+            Err(refusal) => return Err(CrownError::Refused(refusal)),
+        };
         let deposed = current.map(|reign| reign.holder_user_id);
         if let Some(open) = &open {
-            CrownReign::close_in_tx(&tx, open.id).await?;
+            CrownReign::close_in_tx(&tx, open.id, taken_at).await?;
         }
-        let reign = CrownReign::open_in_tx(&tx, user_id, price).await?;
+        let reign = CrownReign::open_in_tx(&tx, user_id, price, taken_at).await?;
         let Some(chips) = UserChips::apply(
             &*tx,
             user_id,
