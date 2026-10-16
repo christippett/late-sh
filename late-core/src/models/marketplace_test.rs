@@ -2150,9 +2150,15 @@ async fn hangover_cure_purchase_purges_drunk_points_and_deducts_dynamic_price() 
         .balance;
 
     // Get drunk first (2000 points)
-    UserDrinks::record_purchase(&client, user.id, 2_000)
-        .await
-        .expect("record drink");
+    UserDrinks::record_purchase(
+        &client,
+        user.id,
+        crate::models::drink_round::Bar::Tavern,
+        2_000,
+        true,
+    )
+    .await
+    .expect("record drink");
     let drinks_before = UserDrinks::find(&client, user.id)
         .await
         .expect("find")

@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    future::poll_fn,
-	sync::{Arc, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -9,7 +8,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use late_core::{
     MutexRecover,
-    db::{Db, DbConfig},
+    db::Db,
     models::{
         aquarium_shield::AquariumShield,
         bonsai_decay_protection::BonsaiDecayProtection,
@@ -39,7 +38,6 @@ use late_core::{
     },
 };
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio_postgres::{AsyncMessage, NoTls};
 use uuid::Uuid;
 
 use crate::pg_listener::{Channel, Refresh, Signal, read_until_ok};
