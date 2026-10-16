@@ -97,20 +97,18 @@ pub fn drunk_level(effective_points: i64) -> u8 {
 pub const HANGOVER_CURE_MIN_PRICE: i64 = 250;
 
 /// Calculate the dynamic price for Hangover Cure from current effective drunk points,
-/// lifetime drink spend (log-scaled multiplier for heavy drinkers), and random jitter (0.85 to 1.15).
+/// prior cure purchase count (progressive multiplier), and random jitter (0.85 to 1.15).
 /// If sober (0 points), returns 0.
-pub fn hangover_cure_price(effective_points: i64, lifetime_spent: i64, seed: u64) -> i64 {
+pub fn hangover_cure_price(effective_points: i64, prior_cure_purchases: i64, seed: u64) -> i64 {
     if effective_points <= 0 {
         return 0;
     }
-    // Lifetime tolerance/habituation multiplier: 1.0 + 0.18 * ln(1 + lifetime_spent / 1000)^2.15
-    // e.g. 0 spent -> 1.0x, 1000 spent -> ~1.08x, 5000 spent -> ~1.63x, 20000 spent -> ~2.97x, 50000 spent -> ~4.42x, 100000 spent -> ~5.82x
-    let ln_val = (1.0 + (lifetime_spent.max(0) as f64) / 1000.0).ln();
-    let lifetime_mult = 1.0 + 0.18 * ln_val.powf(2.15);
+    let count = prior_cure_purchases.max(0) as f64;
+    let multiplier = 1.0 + 0.35 * count + 0.15 * count.powf(1.5);
     // Jitter: 85% to 115% (85..=115 / 100)
     let jitter_pct = 85 + (seed % 31) as i64;
-    let base_with_lifetime = (effective_points as f64 * lifetime_mult).round() as i64;
-    let raw_price = (base_with_lifetime * jitter_pct + 50) / 100;
+    let base_with_mult = (effective_points as f64 * multiplier).round() as i64;
+    let raw_price = (base_with_mult * jitter_pct + 50) / 100;
     raw_price.max(HANGOVER_CURE_MIN_PRICE)
 }
 

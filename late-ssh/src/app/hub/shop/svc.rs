@@ -1105,10 +1105,10 @@ impl ShopService {
             BonsaiDecayProtection::for_user(&client, user_id).await?;
         let active_aquarium_shield = AquariumShield::for_user(&client, user_id).await?;
         let drinks = UserDrinks::find(&client, user_id).await?;
-        let (effective_drunk_points, lifetime_spent) = drinks
+        let effective_drunk_points = drinks
             .as_ref()
-            .map(|d| (d.effective_points(Utc::now()), d.lifetime_spent))
-            .unwrap_or((0, 0));
+            .map(|d| d.effective_points(Utc::now()))
+            .unwrap_or(0);
 
         let mut purchases_by_item = HashMap::with_capacity(purchases.len());
         for purchase in purchases {
@@ -1211,9 +1211,10 @@ impl ShopService {
                         && item.payload.get("effect_kind").and_then(|v| v.as_str())
                             == Some(HANGOVER_CURE_EFFECT_KIND)
                     {
+                        let prior_purchases = purchase.map(|p| p.quantity as i64).unwrap_or(0);
                         hangover_cure_price(
                             effective_drunk_points,
-                            lifetime_spent,
+                            prior_purchases,
                             hangover_cure_seed(),
                         )
                     } else {

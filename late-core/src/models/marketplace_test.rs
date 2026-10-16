@@ -2144,7 +2144,7 @@ async fn hangover_cure_purchase_purges_drunk_points_and_deducts_dynamic_price() 
     let test_db = test_db().await;
     let user = create_test_user(&test_db.db, "hangover-cure-test").await;
     let mut client = test_db.db.get().await.expect("db client");
-    let starting_balance = UserChips::admin_grant(&**client, user.id, 5_000)
+    let starting_balance = UserChips::admin_grant(&**client, user.id, 20_000)
         .await
         .expect("fund chips")
         .balance;
@@ -2165,19 +2165,43 @@ async fn hangover_cure_purchase_purges_drunk_points_and_deducts_dynamic_price() 
         .expect("drinks row exists");
     assert_eq!(drinks_before.drunk_points, 2_000);
 
-    // Buy Hangover Cure
+    // Buy Hangover Cure (1st time: 0 prior purchases -> 1.0x multiplier)
     let result = purchase_durable_item_by_sku(&mut client, user.id, "hangover_cure")
         .await
         .expect("purchase result")
         .expect("item available");
     assert_eq!(result.status, PurchaseStatus::Purchased);
-    // 2000 points * (1.0 + 0.18 * ln(1 + 2000/1000)^2.15 ≈ 1.222) * 0.85..=1.15 => ~2078..=2811 chips
-    let price_paid = starting_balance - result.balance;
+    // 2000 points * 1.0 multiplier * 0.85..=1.15 => 1700..=2300 chips
+    let price_paid_1 = starting_balance - result.balance;
     assert!(
-        (2000..=2900).contains(&price_paid),
-        "price paid ({price_paid}) should reflect points and lifetime_spent multiplier with jitter"
+        (1700..=2300).contains(&price_paid_1),
+        "first price paid ({price_paid_1}) should reflect 1.0x multiplier with jitter"
     );
 
+    // Get drunk again (2000 points)
+    UserDrinks::record_purchase(
+        &client,
+        user.id,
+        crate::models::drink_round::Bar::Tavern,
+        2_000,
+        true,
+    )
+    .await
+    .expect("record drink second time");
+
+    // Buy Hangover Cure (2nd time: 1 prior purchase -> 1.50x multiplier)
+    let balance_before_2 = result.balance;
+    let result_2 = purchase_durable_item_by_sku(&mut client, user.id, "hangover_cure")
+        .await
+        .expect("purchase result")
+        .expect("item available");
+    assert_eq!(result_2.status, PurchaseStatus::QuantityAdded);
+    // 2000 points * 1.50 multiplier * 0.85..=1.15 => 2550..=3450 chips
+    let price_paid_2 = balance_before_2 - result_2.balance;
+    assert!(
+        (2550..=3450).contains(&price_paid_2),
+        "second price paid ({price_paid_2}) should reflect 1.50x multiplier with jitter"
+    );
     // Verify drunk points purged
     let drinks_after = UserDrinks::find(&client, user.id)
         .await
@@ -2185,6 +2209,6 @@ async fn hangover_cure_purchase_purges_drunk_points_and_deducts_dynamic_price() 
         .expect("drinks row exists");
     assert_eq!(drinks_after.drunk_points, 0);
     assert_eq!(drinks_after.level(chrono::Utc::now()), 0);
-    assert_eq!(drinks_after.lifetime_spent, 2_000);
-    assert_eq!(drinks_after.drink_count, 1);
+    assert_eq!(drinks_after.lifetime_spent, 4_000);
+    assert_eq!(drinks_after.drink_count, 2);
 }

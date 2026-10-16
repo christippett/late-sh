@@ -99,12 +99,12 @@ fn effective_points_uses_last_drink_at() {
 fn hangover_cure_price_calculation() {
     // Sober has price 0
     assert_eq!(hangover_cure_price(0, 0, 0), 0);
-    assert_eq!(hangover_cure_price(-100, 1000, 123), 0);
+    assert_eq!(hangover_cure_price(-100, 5, 123), 0);
 
     // Minimum price floor applies when points * jitter < min price (250)
     assert_eq!(hangover_cure_price(100, 0, 0), HANGOVER_CURE_MIN_PRICE);
 
-    // 0 lifetime spent (1.0x multiplier):
+    // 0 prior purchases (1.0x multiplier):
     // seed % 31 = 0 => 85% jitter
     let price_85 = hangover_cure_price(1000, 0, 0);
     assert_eq!(price_85, 850);
@@ -113,12 +113,21 @@ fn hangover_cure_price_calculation() {
     let price_115 = hangover_cure_price(1000, 0, 30);
     assert_eq!(price_115, 1150);
 
-    // Heavy drinker with high lifetime spent pays more (log-scaled multiplier):
-    // 10,000 chips lifetime spent => 1.0 + ln(1 + 10) * 0.25 ≈ 1.60x base
-    let heavy_drinker_price = hangover_cure_price(1000, 10_000, 15); // jitter ~100%
+    // Progressive prior purchases multiplier:
+    // count = 1: 1.0 + 0.35 * 1 + 0.15 * 1^1.5 = 1.50x
+    // With 100% jitter (seed % 31 = 15): 1000 * 1.50 = 1500
+    let price_1_purchase = hangover_cure_price(1000, 1, 15);
+    assert_eq!(price_1_purchase, 1500);
+
+    // count = 2: 1.0 + 0.35 * 2 + 0.15 * 2^1.5 ≈ 2.124x
+    let price_2_purchases = hangover_cure_price(1000, 2, 15);
+    assert_eq!(price_2_purchases, 2124);
+
+    // Higher prior purchases scale up significantly:
+    let price_5_purchases = hangover_cure_price(1000, 5, 15);
     assert!(
-        heavy_drinker_price > price_115,
-        "heavy drinker price ({heavy_drinker_price}) should exceed basic 1.15x jitter ({price_115})"
+        price_5_purchases > price_2_purchases,
+        "5 purchases ({price_5_purchases}) should exceed 2 purchases ({price_2_purchases})"
     );
 }
 

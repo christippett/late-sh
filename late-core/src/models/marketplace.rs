@@ -376,10 +376,10 @@ async fn purchase_item_by_sku_inner(
             == Some(HANGOVER_CURE_EFFECT_KIND);
     if is_hangover_cure {
         let drinks = UserDrinks::find_in_tx(&tx, user_id).await?;
-        let (effective_points, lifetime_spent) = drinks
+        let effective_points = drinks
             .as_ref()
-            .map(|d| (d.effective_points(Utc::now()), d.lifetime_spent))
-            .unwrap_or((0, 0));
+            .map(|d| d.effective_points(Utc::now()))
+            .unwrap_or(0);
         if effective_points <= 0 {
             let balance = lock_user_chips_in_tx(&tx, user_id).await?;
             tx.commit().await?;
@@ -399,9 +399,19 @@ async fn purchase_item_by_sku_inner(
                 title_rental: None,
             });
         }
+        let prior_cure_purchases: i64 = tx
+            .query_opt(
+                "SELECT COALESCE(quantity, 0)::BIGINT
+                 FROM user_purchases
+                 WHERE user_id = $1 AND item_id = $2",
+                &[&user_id, &item.id],
+            )
+            .await?
+            .map(|row| row.get(0))
+            .unwrap_or(0);
         let seed = super::drinks::hangover_cure_seed();
         item.price_chips =
-            super::drinks::hangover_cure_price(effective_points, lifetime_spent, seed);
+            super::drinks::hangover_cure_price(effective_points, prior_cure_purchases, seed);
     }
     let is_repeatable = is_repeatable_purchase_item(&item);
     let balance = lock_user_chips_in_tx(&tx, user_id).await?;
