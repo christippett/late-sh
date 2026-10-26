@@ -4,18 +4,60 @@ use anyhow::Context;
 use askama::Template;
 use axum::{
     Router,
-    extract::{Query, State},
-    response::{Html, IntoResponse},
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use dartboard_core::{Canvas, CellValue, Pos};
-use late_core::models::artboard::{Snapshot, SnapshotSummary};
+use late_core::models::{
+    artboard::{Snapshot, SnapshotSummary},
+    artboard_piece::ArtboardPiece,
+};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use crate::{AppState, error::AppError, metrics};
+use crate::{
+    AppState,
+    error::AppError,
+    metrics,
+    pages::shared::{board_png, meta},
+};
 
 pub(crate) fn router() -> Router<AppState> {
-    Router::new().route("/gallery", get(handler))
+    Router::new()
+        .route("/gallery", get(handler))
+        .route("/gallery/{key}/image.png", get(image_handler))
+        .route("/gallery/pieces/{id}", get(piece_handler))
+        .route("/gallery/pieces/{id}/image.png", get(piece_image_handler))
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageQuery {
+    /// `x,y,width,height` in cells: the herald posts a board cropped to
+    /// its drawn area (`late-ssh/src/app/herald`). No crop is the whole
+    /// board, the preview card's picture.
+    crop: Option<String>,
+}
+
+/// One piece a member hung, on a page of its own: the herald's piece
+/// posts link here. The terminal's gallery is the wall; this is the
+/// piece alone, credited, with its applause.
+#[derive(Template)]
+#[template(path = "pages/gallery/piece.html")]
+struct PiecePage {
+    title: String,
+    artist: String,
+    /// `24 October 2026`.
+    hung: String,
+    applause: i64,
+    piece_json: String,
+    file_name: String,
+    page_url: String,
+    og_title: String,
+    og_description: String,
+    og_image: String,
+    og_image_alt: String,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +82,13 @@ struct Page {
     selected_cell_count: usize,
     selected_author_count: usize,
     snapshot_json: String,
+    /// The preview card a pasted link unfurls into (`shared/meta.html`):
+    /// the selected snapshot as its picture, the site's when none is.
+    page_url: String,
+    og_title: String,
+    og_description: String,
+    og_image: String,
+    og_image_alt: String,
 }
 
 #[derive(Debug)]
@@ -128,7 +177,14 @@ async fn handler(
     let show_daily_empty = daily_items.is_empty();
     let show_monthly_empty = monthly_items.is_empty();
     let show_curated_empty = curated_items.is_empty();
+    let base = state.config.public_base_url.as_str();
+    let (og_image, og_image_alt) = meta::site_image(base);
     let mut page = Page {
+        page_url: format!("{base}/gallery"),
+        og_title: "The late.sh Artboard".to_string(),
+        og_description: "The shared ASCII canvas, drawn cell by cell over SSH.".to_string(),
+        og_image,
+        og_image_alt,
         live_items,
         daily_items,
         monthly_items,
@@ -146,7 +202,16 @@ async fn handler(
     };
 
     if let Some(snapshot) = selected {
+        let key = snapshot.board_key.clone();
         let selected = build_selected_snapshot(snapshot)?;
+        page.page_url = format!("{base}/gallery?key={key}");
+        page.og_title = format!("Artboard: {}", selected.title);
+        page.og_description = format!(
+            "{} cells by {} people, saved {}.",
+            selected.cell_count, selected.author_count, selected.updated
+        );
+        page.og_image = format!("{base}/gallery/{key}/image.png");
+        page.og_image_alt = format!("The late.sh Artboard, {}", selected.title);
         page.has_selected = true;
         page.selected_title = selected.title;
         page.selected_updated = selected.updated;
@@ -156,6 +221,112 @@ async fn handler(
     }
 
     Ok(Html(page.render()?))
+}
+
+/// A snapshot as the picture a gallery link's preview card shows. An
+/// unknown key is 404 and the card falls back to the site's own picture.
+/// A `?crop=` the board cannot hold, or that does not parse, is 400.
+#[tracing::instrument(skip(state))]
+async fn image_handler(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(query): Query<ImageQuery>,
+) -> Result<Response, AppError> {
+    metrics::record_page_view("gallery_image", false);
+
+    let client = state
+        .db
+        .get()
+        .await
+        .context("failed to get db client for gallery image")?;
+    let Some(snapshot) = Snapshot::find_by_board_key(&client, &key)
+        .await
+        .with_context(|| format!("failed to load artboard snapshot {key}"))?
+    else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let canvas: Canvas =
+        serde_json::from_value(snapshot.canvas).context("failed to decode artboard canvas")?;
+    let canvas = match query.crop.as_deref() {
+        None => canvas,
+        Some(text) => {
+            match board_png::Crop::parse(text).and_then(|crop| board_png::crop(&canvas, crop)) {
+                Some(cropped) => cropped,
+                None => return Ok(StatusCode::BAD_REQUEST.into_response()),
+            }
+        }
+    };
+    let png = board_png::render_blocking(canvas)
+        .await
+        .context("failed to render artboard snapshot")?;
+    Ok(board_png::response(png))
+}
+
+/// A piece still up, by the id in its path; anything else is 404.
+async fn find_piece(state: &AppState, id: &str) -> Result<Option<ArtboardPiece>, AppError> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let client = state
+        .db
+        .get()
+        .await
+        .context("failed to get db client for a gallery piece")?;
+    Ok(ArtboardPiece::find(&client, Uuid::nil(), id)
+        .await
+        .with_context(|| format!("failed to load gallery piece {id}"))?)
+}
+
+#[tracing::instrument(skip(state))]
+async fn piece_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    metrics::record_page_view("gallery_piece", false);
+
+    let Some(piece) = find_piece(&state, &id).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let canvas: Canvas =
+        serde_json::from_value(piece.canvas).context("failed to decode piece canvas")?;
+    let base = state.config.public_base_url.as_str();
+    let path = format!("/gallery/pieces/{}", piece.id);
+    let page = PiecePage {
+        piece_json: canvas_json(&canvas)?,
+        file_name: format!("late-sh-{}.png", piece.id),
+        hung: piece.created.format("%-d %B %Y").to_string(),
+        applause: piece.applause,
+        page_url: format!("{base}{path}"),
+        og_title: format!("{} by ~{}", piece.title, piece.username),
+        og_description:
+            "A piece hung in the late.sh gallery, drawn on the shared ASCII canvas over SSH."
+                .to_string(),
+        og_image: format!("{base}{path}/image.png"),
+        og_image_alt: format!("ASCII art: {}, by ~{}", piece.title, piece.username),
+        title: piece.title,
+        artist: piece.username,
+    };
+    Ok(Html(page.render()?).into_response())
+}
+
+/// A piece as a PNG, the piece page's preview-card picture and the
+/// herald's picture for it.
+#[tracing::instrument(skip(state))]
+async fn piece_image_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    metrics::record_page_view("gallery_piece_image", false);
+
+    let Some(piece) = find_piece(&state, &id).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let canvas: Canvas =
+        serde_json::from_value(piece.canvas).context("failed to decode piece canvas")?;
+    let png = board_png::render_blocking(canvas)
+        .await
+        .context("failed to render gallery piece")?;
+    Ok(board_png::response(png))
 }
 
 struct SelectedSnapshot {

@@ -23,17 +23,14 @@ pub(crate) enum Bench {
     /// A save or burn this session sent is still out: the wall is read
     /// once it lands, so the draft opens on what the write left there and
     /// never on a read that raced it.
-    Waiting {
-        marks: i32,
-    },
+    Waiting { marks: i32 },
     /// The wall is being read; the brush will be cut to `marks`.
-    Reading {
-        marks: i32,
-    },
+    Reading { marks: i32 },
     /// The wall could not be read: nothing to paint on until the panel
     /// opens again.
     Unread,
-    Open(Draft),
+    /// Boxed: the draft dwarfs the data-less states.
+    Open(Box<Draft>),
 }
 
 /// The write that is out.
@@ -213,7 +210,7 @@ impl PosterSession {
             return;
         };
         self.hung = stored.is_some();
-        self.bench = Bench::Open(Draft::new(stored, marks));
+        self.bench = Bench::Open(Box::new(Draft::new(stored, marks)));
     }
 }
 

@@ -11,6 +11,7 @@
   "The playlist kept spinning while you were away",
   "IRC regular? Mint an access token in ctrl+o settings",
   "Back again, glad you're here!",
+  "With the late CLI, Enter on a YouTube link in chat plays it right in your terminal",
   "Looking for an old message? Ctrl+/ then ?query searches your chat history",
   "Unread DMs wait for you near the top of the room rail, under core",
   "Mid-dungeon in NetHack, DCSS, or Brogue? Press ` to step out to chat; the game keeps running and ` (or Enter on its hub card) drops you back in. Mid-adventure in Lateania, ` hops out with an autosave and hops back in for the next 5 minutes",
@@ -19,7 +20,8 @@
   "Missed a day? /paper opens The Late Edition, graybeard's grumpy digest of every public room; ← and → inside it leaf back through older ones",
   "/history opens right on your first unread message when a room has news for you",
   "Someone said something good? Select it and press g to gild it: two thirds of what you pay lands in their balance, and the marker never comes off",
-  "The crown costs 1.5x whatever the last holder paid, and it goes back to vacant every month",
   "The bottom statusline is yours: Ctrl+O, then the Statusline tab. Hide the shortcut hints or add a clock, quests, the pot, or who's online",
-  "A new realm rises within a day of the last one falling ~ page 3, Realm"
+  "A new realm rises within a day of the last one falling ~ page 3, Realm",
+  "Your work profile verifies on Mastodon: put your Mastodon profile URL (https://your.instance/@you) in its links, and late.sh/profiles/<slug> in your Mastodon profile links",
+  "The Late Edition is on the web too: late.sh/paper, with an RSS feed at late.sh/paper/feed.xml"
 ]

@@ -1,5 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -45,6 +47,11 @@ crate::user_scoped_model! {
     user_field = user_id;
     params = ArticleParams;
     struct Article {
+        @generated
+        // The share's card in #lounge (migration 250): set once the post
+        // lands (`Article::link_lounge_message`), `None` before cards, when
+        // the room refused the post, and once the message is deleted.
+        pub lounge_message_id: Option<Uuid>;
         @data
         pub user_id: Uuid,
         pub url: String,
@@ -82,16 +89,65 @@ impl Article {
                 &[&limit],
             )
             .await?;
-        rows.into_iter()
-            .map(|row| {
-                let status: Option<String> = row.get("body_status");
-                let word_count: Option<i32> = row.get("body_word_count");
-                Ok(FeedArticle {
-                    body: BodyStatus::from_columns(status.as_deref(), word_count)?,
-                    article: Self::from(row),
-                })
-            })
-            .collect()
+        rows.into_iter().map(FeedArticle::from_row).collect()
+    }
+
+    /// The newest `limit` shares that have a card in #lounge, each with
+    /// where its body stands: what chat draws those messages as. A #lounge
+    /// history holds far fewer shares than this, so every card a session
+    /// has loaded is among them.
+    pub async fn list_lounge_cards(client: &Client, limit: i64) -> Result<Vec<FeedArticle>> {
+        let rows = client
+            .query(
+                "SELECT a.*, b.status AS body_status, b.word_count AS body_word_count
+                 FROM articles a
+                 LEFT JOIN article_bodies b ON b.article_id = a.id
+                 WHERE a.lounge_message_id IS NOT NULL
+                 ORDER BY a.created DESC
+                 LIMIT $1",
+                &[&limit],
+            )
+            .await?;
+        rows.into_iter().map(FeedArticle::from_row).collect()
+    }
+
+    /// Point the sharer's share at its card in #lounge, the message the
+    /// share posted. The count of rows linked: 0 when the share is gone,
+    /// deleted while its card went up.
+    pub async fn link_lounge_message(
+        client: &Client,
+        user_id: Uuid,
+        article_id: Uuid,
+        message_id: Uuid,
+    ) -> Result<u64> {
+        let count = client
+            .execute(
+                "UPDATE articles SET lounge_message_id = $3 WHERE id = $2 AND user_id = $1",
+                &[&user_id, &article_id, &message_id],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    /// Whether `message_id` is a share's card in #lounge.
+    pub async fn is_lounge_card(client: &Client, message_id: Uuid) -> Result<bool> {
+        let row = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM articles WHERE lounge_message_id = $1)",
+                &[&message_id],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    /// Delete a share and hand back the row as it went, `None` when it was
+    /// already gone. The card pointer is read by the delete itself, so a
+    /// card linked while the delete ran is never missed.
+    pub async fn delete_returning(client: &Client, id: Uuid) -> Result<Option<Self>> {
+        let row = client
+            .query_opt("DELETE FROM articles WHERE id = $1 RETURNING *", &[&id])
+            .await?;
+        Ok(row.map(Self::from))
     }
 
     /// Articles shared inside `[floor, ceiling)` with the sharer's username,
@@ -217,7 +273,11 @@ impl Article {
 
 /// How many articles the shared news snapshot holds. Each session counts its
 /// unread badge from that snapshot, so the badge saturates here.
-pub const NEWS_FEED_LIMIT: i64 = 20;
+pub const NEWS_FEED_LIMIT: i64 = 40;
+
+/// How many #lounge cards the shared news snapshot holds
+/// ([`Article::list_lounge_cards`]).
+pub const NEWS_LOUNGE_CARD_LIMIT: i64 = 100;
 
 /// Cross-process refresh channel. Any write to `articles` fires it (migration
 /// 198 statement trigger, empty payload); every replica's listener re-reads
@@ -228,15 +288,33 @@ pub const ARTICLES_CHANGED_CHANNEL: &str = "articles_changed";
 pub struct ArticleSnapshot {
     pub user_id: Option<Uuid>,
     pub articles: Vec<ArticleFeedItem>,
+    /// The newest shares with a card in #lounge, by the card's message id.
+    /// Shared, so a session taking the snapshot copies a pointer.
+    pub lounge_cards: Arc<HashMap<Uuid, ArticleFeedItem>>,
 }
 
-/// One row of [`Article::list_feed`], before the sharer's name is attached.
+/// One row of [`Article::list_feed`] or a reader's shelf
+/// ([`super::article_save::ArticleSave::list_for_user`]), before the
+/// sharer's name is attached.
 pub struct FeedArticle {
     pub article: Article,
     pub body: BodyStatus,
 }
 
-#[derive(Clone)]
+impl FeedArticle {
+    /// A row of `articles.*` joined with the body's `status` and
+    /// `word_count` as `body_status` and `body_word_count`.
+    pub fn from_row(row: tokio_postgres::Row) -> Result<Self> {
+        let status: Option<String> = row.get("body_status");
+        let word_count: Option<i32> = row.get("body_word_count");
+        Ok(Self {
+            body: BodyStatus::from_columns(status.as_deref(), word_count)?,
+            article: Article::from(row),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ArticleFeedItem {
     pub article: Article,
     pub author_username: String,
@@ -271,5 +349,21 @@ pub enum ArticleEvent {
     ReadsLoaded {
         user_id: Uuid,
         reads: Vec<super::article_read::ArticleReadRow>,
+    },
+    /// This user's shelf (`article_saves`), newest save first and at most
+    /// [`super::article_save::NEWS_SAVED_LIMIT`] stories, loaded at session
+    /// start, on a News room visit, and after every save or unsave. The
+    /// shelf moves (a save, an unsave, a delete cascading), so each load
+    /// replaces what the session holds.
+    SavesLoaded {
+        user_id: Uuid,
+        saved: Vec<ArticleFeedItem>,
+    },
+    /// A save the shelf refused: it already held
+    /// [`super::article_save::NEWS_SAVED_LIMIT`] stories by the time the
+    /// write landed (another session of the user's filled it). It follows
+    /// the `SavesLoaded` that took the story back off the session's shelf.
+    SaveRefused {
+        user_id: Uuid,
     },
 }

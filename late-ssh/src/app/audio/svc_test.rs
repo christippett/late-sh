@@ -166,6 +166,69 @@ async fn submitting_a_track_already_in_the_queue_is_rejected() {
     assert_eq!(snapshot.len(), 2);
 }
 
+/// A favorite outlives its History row and still re-queues, for its owner
+/// only: another listener asking for it by id finds nothing.
+#[tokio::test]
+async fn a_favorite_requeues_after_its_history_row_is_gone_for_its_owner_only() {
+    use crate::app::audio::svc::RequeueSource;
+    use late_core::models::{
+        media_favorite::{FavoriteOutcome, MediaFavorite},
+        media_history_item::MediaHistoryItem,
+    };
+
+    let test = test_db().await;
+    let owner = create_test_user(&test.db, "audio_favorite_owner").await;
+    let other = create_test_user(&test.db, "audio_favorite_other").await;
+    let service = AudioService::new(
+        test.db.clone(),
+        None,
+        PairedClientRegistry::new("https://audio.late.sh"),
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    );
+    service
+        .submit_validated_video(owner.id, test_video("ggggggggggg", "kept"))
+        .await
+        .expect("play the track");
+    let client = test.db.get().await.expect("db client");
+    let history = MediaHistoryItem::list_recent(&client, 200)
+        .await
+        .expect("history");
+    assert_eq!(
+        service
+            .add_favorite(owner.id, history[0].id, uuid::Uuid::now_v7())
+            .await
+            .expect("add favorite"),
+        FavoriteOutcome::Added
+    );
+    service.force_skip().await.expect("end the track");
+    MediaHistoryItem::delete_by_id(&client, history[0].id)
+        .await
+        .expect("delete history row");
+    let favorite = MediaFavorite::list_for_user(&client, owner.id)
+        .await
+        .expect("favorites")
+        .remove(0);
+
+    let foreign = service
+        .requeue_track(other.id, RequeueSource::Favorite(favorite.id))
+        .await
+        .expect_err("another listener's favorite");
+    assert!(format!("{foreign:#}").contains("favorite not found"));
+
+    let response = service
+        .requeue_track(owner.id, RequeueSource::Favorite(favorite.id))
+        .await
+        .expect("requeue the favorite");
+    assert_eq!(response.position_in_queue, 0);
+    assert_eq!(response.title.as_deref(), Some("kept"));
+    let current = MediaQueueItem::current_playing(&client)
+        .await
+        .expect("current")
+        .expect("playing");
+    assert_eq!(current.external_id, "ggggggggggg");
+    assert_eq!(current.submitter_id, owner.id);
+}
+
 fn test_video(video_id: &str, title: &str) -> YoutubeVideo {
     YoutubeVideo {
         video_id: video_id.to_string(),
@@ -213,5 +276,73 @@ fn pair_radio_tracks_adds_the_house_mounts_to_the_radio_meta() {
             ("classical".to_string(), track("A pianist", "Nocturne")),
             ("chill".to_string(), track("", "untitled loop")),
         ])
+    );
+}
+
+/// The roll call writes every paired account on the radio down for the
+/// day under its station, once however many times it is called, and
+/// nothing for an account on YouTube or a replica with nobody paired.
+#[tokio::test]
+async fn the_roll_call_writes_each_radio_listener_down_once_a_day() {
+    use late_core::models::{
+        radio_listen::{RadioListen, StationListeners},
+        user::{AudioSource, RadioStation},
+    };
+
+    let test = test_db().await;
+    let listener = create_test_user(&test.db, "roll-call-listener").await;
+    let watcher = create_test_user(&test.db, "roll-call-watcher").await;
+    let registry = PairedClientRegistry::new("https://audio.late.sh");
+    let service = AudioService::new(
+        test.db.clone(),
+        None,
+        registry.clone(),
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    );
+    let now = chrono::Utc::now();
+    assert!(
+        service
+            .radio_roll_call(now)
+            .await
+            .expect("an empty roll call")
+            .is_empty()
+    );
+
+    let (cli_tx, _cli_rx) = tokio::sync::mpsc::channel(8);
+    let (watcher_tx, _watcher_rx) = tokio::sync::mpsc::channel(8);
+    registry
+        .register(
+            "tok-listener".to_string(),
+            cli_tx,
+            listener.id,
+            AudioSource::Radio,
+        )
+        .expect("register");
+    registry
+        .register(
+            "tok-watcher".to_string(),
+            watcher_tx,
+            watcher.id,
+            AudioSource::Youtube,
+        )
+        .expect("register");
+    let nightride = RadioStation::from_key("nightride").expect("nightride");
+    registry.set_stream_preferences(listener.id, nightride);
+
+    for _ in 0..2 {
+        assert_eq!(
+            service.radio_roll_call(now).await.expect("roll call"),
+            vec![(nightride, 1)]
+        );
+    }
+    let client = test.db.get().await.expect("db client");
+    assert_eq!(
+        RadioListen::top_stations_on(&client, now.date_naive(), 3)
+            .await
+            .expect("stations"),
+        vec![StationListeners {
+            station: "nightride".to_string(),
+            listeners: 1,
+        }]
     );
 }

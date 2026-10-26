@@ -220,6 +220,9 @@ pub struct SessionConfig {
     pub summary_service: crate::app::ai::summary::SummaryService,
     /// The Late Edition (`app/paper`): the newsstand this session reads from.
     pub paper_service: crate::app::paper::svc::PaperService,
+    /// The herald (`app/herald`): the social accounts' switch and press,
+    /// for an admin's `/herald`.
+    pub herald_service: crate::app::herald::svc::HeraldService,
     /// The job feed (`app/jobs`): the shelf snapshot this session copies.
     pub jobs_service: crate::app::jobs::svc::JobsService,
     pub notification_service: NotificationService,
@@ -343,6 +346,8 @@ pub struct SessionConfig {
     /// Accessor for the account's door rc files (.nethackrc / DCSS init.txt),
     /// edited from the Games hub config box and pushed to the hosts at launch.
     pub door_rc_service: crate::app::door::rc::DoorRcService,
+    /// The hub's door-opened write (`door_openings`), fired on every launch.
+    pub games_hub_service: crate::app::door::hub::svc::GamesHubService,
     /// The account's configured door rcs, preloaded at session init. Edits in
     /// this session update the in-App copy (`App::door_rcs`) alongside the DB.
     pub initial_door_rcs: Vec<(late_core::models::door_rc::DoorRcGame, String)>,
@@ -435,9 +440,6 @@ pub struct SessionConfig {
     /// Live 24h username effects, shared process-wide (snapshot-swap; see
     /// `common/username_effect.rs`).
     pub flair_directory: Option<crate::app::common::username_effect::NameFlairDirectory>,
-    /// The crown, `/crown` and `/crown take`. `None` in test harnesses that
-    /// build an app without one; the glyph then simply never appears.
-    pub crown_service: Option<crate::app::crown::svc::CrownService>,
     /// The pot, `/pot` and `/pot buy N`. `None` in test harnesses that build
     /// an app without one; the panel then renders dashes and the commands
     /// say so.
@@ -447,6 +449,9 @@ pub struct SessionConfig {
     /// Turns this session's input into active minutes while the account is
     /// young. Built from the account's creation time; inert in test apps.
     pub newcomer_clock: crate::app::referral::state::NewcomerClock,
+    /// When the account was created: `App::tenure` reads it on every
+    /// attention edge and at the session's end.
+    pub(crate) account_created: chrono::DateTime<chrono::Utc>,
     pub activity_feed_rx: Option<broadcast::Receiver<ActivityEvent>>,
     pub user_id: Uuid,
     pub permissions: Permissions,
@@ -478,6 +483,12 @@ pub struct SessionConfig {
 
     /// Server state
     pub is_draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// How long this session goes quiet before a draining pod moves it
+    /// (`Config::handoff_idle`).
+    pub handoff_idle: std::time::Duration,
+    /// Where this session was on the draining pod a CLI moved it off
+    /// (`app/handoff`), read from its `LATE_RESUME` env. `None` is a login.
+    pub resume: Option<crate::app::handoff::state::ResumePoint>,
 }
 
 /// Main application state
@@ -547,6 +558,11 @@ pub struct App {
     pub(crate) ultimate_cooldown_was_running: bool,
     /// The Late Edition: its modal, the login pop, and the `/paper` drain.
     pub(crate) paper: crate::app::paper::state::PaperState,
+    /// The herald: the `/herald` drain and its answers.
+    pub(crate) herald: crate::app::herald::state::HeraldState,
+    /// The watch player and setup box, and the session's one play on the
+    /// paired CLI (`app/video/`).
+    pub(crate) video: crate::app::video::state::State,
     /// The Jobs shelf: the replica's active postings, the selection, and
     /// the `/jobs` drain.
     pub(crate) jobs: crate::app::jobs::state::JobsState,
@@ -652,14 +668,12 @@ pub struct App {
     /// every real change).
     pub(super) last_username_directory: Option<Arc<HashMap<Uuid, String>>>,
     pub(super) flair_directory: Option<crate::app::common::username_effect::NameFlairDirectory>,
-    pub(super) crown_service: Option<crate::app::crown::svc::CrownService>,
-    /// The process-shared crown holder and laureate, read on the ~1s edge
-    /// and folded into `name_flair`, so no render ever queries for a glyph.
-    pub(super) crown_wearers_rx: Option<watch::Receiver<crate::app::crown::svc::CrownWearers>>,
-    pub(super) crown_events_rx: Option<broadcast::Receiver<crate::app::crown::svc::CrownEvent>>,
     pub(super) pot_service: Option<crate::app::pot::svc::PotService>,
     pub(super) referral_service: crate::app::referral::svc::ReferralService,
     pub(super) newcomer_clock: crate::app::referral::state::NewcomerClock,
+    /// When the account was created, for `App::tenure` (the newcomer
+    /// split on the attention and session counters).
+    pub(super) account_created: chrono::DateTime<chrono::Utc>,
     /// The process-shared pot, read on the ~1s edge into `pot_view` so no
     /// render ever queries for it.
     pub(super) pot_snapshot_rx: Option<watch::Receiver<Arc<crate::app::pot::svc::PotSnapshot>>>,
@@ -911,6 +925,7 @@ pub struct App {
     pub(crate) brogue_secret: String,
     pub(crate) arcade_handle_service: crate::app::door::arcade::ArcadeHandleService,
     pub(crate) door_rc_service: crate::app::door::rc::DoorRcService,
+    pub(crate) games_hub_service: crate::app::door::hub::svc::GamesHubService,
     /// The account's door rc files (.nethackrc / DCSS init.txt), keyed by
     /// game. Session-local copy of the DB truth: preloaded at init, updated by
     /// the hub config box, read at door launch. Another session's edits are
@@ -1066,6 +1081,8 @@ pub struct App {
 
     /// Server state
     pub(crate) is_draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The drain handoff to the new pod (`app/handoff`).
+    pub(crate) handoff: crate::app::handoff::state::HandoffState,
 
     /// Emoji + Nerd Font picker
     pub(crate) icon_picker_open: bool,
@@ -1145,7 +1162,7 @@ impl App {
     }
 
     /// The piece covering the screen while this session is away, `None`
-    /// while it is here, while the News watch modal is up, or with the
+    /// while it is here, while the watch modal is up, or with the
     /// Tweak off (Settings, Tweaks, `Screensaver`).
     pub(crate) fn screensaver(&self) -> Option<late_core::models::user::AsciiPiece> {
         if !self.screensaver_due() {
@@ -1187,7 +1204,7 @@ impl App {
     /// the screensaver waits for the modal to close; the 1Hz sync brings it
     /// up then.
     fn screensaver_due(&self) -> bool {
-        self.away && !self.chat.has_watch()
+        self.away && !self.video.is_open()
     }
 
     /// The rail modes this session renders from: this device's stored layout if
@@ -1617,11 +1634,18 @@ impl App {
         // "Land on" tweak sends returning users to Home or Zen instead; a
         // session with the tour still to walk (a first-ever one, or any
         // account after a house-wide reset of the flag) always starts in the
-        // clubhouse so the tutorial runs.
-        let landing = if config.is_new_user || !config.clubhouse_tutorial_done {
-            LandingPage::Clubhouse
-        } else {
-            config.landing_page
+        // clubhouse so the tutorial runs. A session a CLI moved here off a
+        // draining pod (`app/handoff`) is not a login: it lands where it was,
+        // with no splash and no paper pop, unless the tour still has to run.
+        let tour_pending = config.is_new_user || !config.clubhouse_tutorial_done;
+        let resume = match tour_pending {
+            true => None,
+            false => config.resume,
+        };
+        let landing = match (tour_pending, resume) {
+            (true, _) => LandingPage::Clubhouse,
+            (false, Some(point)) => point.landing(),
+            (false, None) => config.landing_page,
         };
         let landing_screen = match landing {
             LandingPage::Clubhouse => Screen::Clubhouse,
@@ -1651,7 +1675,7 @@ impl App {
             ),
             banner: aquarium_loss_banner,
             show_settings: false,
-            show_splash: true,
+            show_splash: resume.is_none(),
             splash_ticks: 0,
             marquee_tick: 0,
             started_at: Instant::now(),
@@ -1680,8 +1704,10 @@ impl App {
             // to "is anyone here?" and doubles as the room directory.
             paper: crate::app::paper::state::PaperState::new(
                 config.paper_service,
-                config.paper_at_login,
+                config.paper_at_login && resume.is_none(),
             ),
+            video: crate::app::video::state::State::default(),
+            herald: crate::app::herald::state::HeraldState::new(config.herald_service),
             jobs: crate::app::jobs::state::JobsState::new(config.jobs_service),
             help_modal_state: help_modal::state::HelpModalState::new(),
             leaderboard_page: crate::app::leaderboard::state::LeaderboardPageState::new(),
@@ -1756,15 +1782,6 @@ impl App {
             chat_ctx_epoch: 0,
             last_username_directory: None,
             flair_directory: config.flair_directory,
-            crown_wearers_rx: config
-                .crown_service
-                .as_ref()
-                .map(crate::app::crown::svc::CrownService::subscribe_wearers),
-            crown_events_rx: config
-                .crown_service
-                .as_ref()
-                .map(crate::app::crown::svc::CrownService::subscribe_events),
-            crown_service: config.crown_service,
             pot_snapshot_rx: config
                 .pot_service
                 .as_ref()
@@ -1776,6 +1793,7 @@ impl App {
             pot_service: config.pot_service,
             referral_service: config.referral_service.clone(),
             newcomer_clock: config.newcomer_clock,
+            account_created: config.account_created,
             pot_view: crate::app::pot::state::PotView::default(),
             active_users: active_users.clone(),
             username_directory: config.username_directory,
@@ -1942,6 +1960,7 @@ impl App {
             brogue_secret: config.brogue_secret,
             arcade_handle_service: config.arcade_handle_service,
             door_rc_service: config.door_rc_service,
+            games_hub_service: config.games_hub_service,
             door_rcs: config.initial_door_rcs.into_iter().collect(),
             door_rc_modal: None,
             usurper_state: None,
@@ -2028,6 +2047,7 @@ impl App {
             sent_away: false,
             away: false,
             is_draining: config.is_draining,
+            handoff: crate::app::handoff::state::HandoffState::new(config.handoff_idle),
             icon_picker_open: false,
             icon_picker_state: super::icon_picker::IconPickerState::default(),
             icon_catalog: None,
@@ -2043,15 +2063,16 @@ impl App {
         // below for all three). Zen: focus the first chat tile and size the
         // reef to its tile, as `Ctrl+F` would.
         match landing {
-            LandingPage::Clubhouse => app
-                .clubhouse
-                .enter_screen(crate::app::presence::svc::now_ms()),
+            LandingPage::Clubhouse => app.enter_clubhouse(),
             LandingPage::Home => app.chat.request_list(),
             LandingPage::Zen => {
                 app.zen.note_opened();
                 app.zen.enter(Instant::now(), &mut rand::thread_rng());
                 app.sync_aquarium_bounds();
             }
+        }
+        if let Some(point) = resume {
+            crate::app::handoff::svc::resume(&mut app, point);
         }
         app.chat
             .set_favorite_room_ids(app.profile_state.profile().favorite_room_ids.clone());
@@ -2576,6 +2597,17 @@ impl App {
         }
     }
 
+    /// The clubhouse's entry hook. An entry that begins a first visit's
+    /// tour counts its welcome box, the newcomer tour funnel's first stop.
+    fn enter_clubhouse(&mut self) {
+        if self
+            .clubhouse
+            .enter_screen(crate::app::presence::svc::now_ms())
+        {
+            crate::metrics::record_tour_stop(crate::app::clubhouse::state::Tutorial::Welcome);
+        }
+    }
+
     pub(crate) fn enter_directory(&mut self) {
         self.chat.work.list();
         self.chat.showcase.list();
@@ -2896,8 +2928,7 @@ impl App {
             self.enter_directory();
         }
         if self.screen == Screen::Clubhouse {
-            self.clubhouse
-                .enter_screen(crate::app::presence::svc::now_ms());
+            self.enter_clubhouse();
         }
         self.sync_visible_chat_room();
     }
@@ -4080,103 +4111,6 @@ impl App {
         changed
     }
 
-    /// The crown's commands and the answers to them. The glyph itself is
-    /// not handled here: it rides `name_flair`, resolved on the ~1s edge in
-    /// `tick.rs` from the process-shared holder, so a takeover on another
-    /// replica moves it with no event of any kind.
-    pub(crate) fn tick_crown(&mut self) -> bool {
-        let mut changed = false;
-
-        if let Some(command) = self.chat.take_requested_crown() {
-            changed = true;
-            match &self.crown_service {
-                // Only a test harness builds an app without one; saying so
-                // beats a command that silently does nothing.
-                None => {
-                    self.banner = Some(Banner::error("The crown is not available here."));
-                }
-                Some(service) => match command {
-                    crate::app::chat::state::CrownCommand::Status => {
-                        service.status_task(self.user_id);
-                    }
-                    crate::app::chat::state::CrownCommand::Take { bid } => {
-                        service.take_task(self.user_id, self.username.clone(), bid);
-                        self.banner = Some(Banner::success("Reaching for the crown..."));
-                    }
-                },
-            }
-        }
-
-        let mut events = Vec::new();
-        if let Some(rx) = &mut self.crown_events_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(event) => events.push(event),
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                        self.crown_events_rx = None;
-                        break;
-                    }
-                }
-            }
-        }
-
-        for event in events {
-            use crate::app::common::primitives::thousands;
-            use crate::app::crown::svc::CrownEvent;
-            match event {
-                CrownEvent::Status { user_id, line } if user_id == self.user_id => {
-                    changed = true;
-                    self.banner = Some(Banner::info(&line));
-                }
-                CrownEvent::Failed { user_id, message } if user_id == self.user_id => {
-                    changed = true;
-                    self.banner = Some(Banner::error(&message));
-                }
-                CrownEvent::Taken {
-                    taker_id,
-                    taker_balance,
-                    price,
-                    ref from,
-                } if taker_id == self.user_id => {
-                    changed = true;
-                    let cost = thousands(price);
-                    let balance = thousands(taker_balance);
-                    self.banner = Some(Banner::success(&match from {
-                        Some(from) => format!(
-                            "The crown is yours, taken from {from} for {cost} chips (balance {balance})"
-                        ),
-                        None => format!(
-                            "The crown is yours, claimed vacant for {cost} chips (balance {balance})"
-                        ),
-                    }));
-                }
-                // The deposed holder: a glyph vanishing off your own name
-                // with no explanation reads as a bug, so they are told who
-                // has it now. This arrives off the Postgres notify, so it
-                // lands whichever replica they are connected to.
-                CrownEvent::Deposed {
-                    user_id,
-                    ref taker_username,
-                    price,
-                } if user_id == self.user_id => {
-                    changed = true;
-                    self.banner = Some(Banner::error(&format!(
-                        "{taker_username} stole the crown from you for {} chips",
-                        thousands(price)
-                    )));
-                }
-                CrownEvent::Status { .. }
-                | CrownEvent::Failed { .. }
-                | CrownEvent::Taken { .. }
-                | CrownEvent::Deposed { .. } => {}
-            }
-        }
-
-        changed
-    }
-
     /// The pot's two commands and the answers to them. The panel itself is
     /// not handled here: it rides `pot_view`, resolved on the ~1s edge in
     /// `tick.rs` from the process-shared snapshot, so a buy on another
@@ -4498,7 +4432,7 @@ impl Drop for App {
             return;
         }
         // No mpv outlives the session that asked for it.
-        crate::app::chat::news::watch::svc::end_session(self);
+        crate::app::video::svc::end_session(self);
         // The paired registry keeps token-scoped state that outlives the
         // sockets (the once-per-session boot mute claim), so the session end
         // has to retire it or it accumulates a row per session forever.

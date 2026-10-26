@@ -87,7 +87,7 @@ If IRC is split later, the split must include a cross-process event/control desi
 Config:
 - Every profile sets `irc.enabled = true`; there is no `Default` impl.
 - The dev profiles enable plaintext IRC on 6667 (6668 for dev2); the Makefile only keeps the matching compose port mapping.
-- Docker Compose publishes the IRC port on `service-ssh`.
+- Docker Compose publishes the IRC port on `service-ssh`, the local edge, which forwards it to the ready late-ssh pod (`docker/fleet/haproxy.cfg`).
 - TLS is enabled only when the profile sets both `tls_cert_path` and `tls_key_path` (prod: the mounted `irc-tls` secret, port 6697; dev: none, plaintext).
 - A partial TLS cert/key pair is rejected by `Config::validate()` only when IRC itself is enabled, so disabled IRC must not break SSH/API startup.
 
@@ -277,7 +277,7 @@ Integration tests:
 - History regressions live beside `history.rs` and the core `irc_history.rs`, with capability/replay/DM/private-access TCP coverage in `serve_test.rs`.
 - Manual Halloy fixtures: `make seed-irc-history USERNAME=<local TUI username>` seeds numbered public/private channel and DM history, including more than one 300-message page. Reconnect and join `#history-lab` / `##history-lab`; fixture peers are `history_ada` / `history^lin`. Inserts are historical only and do not broadcast live events.
 
-Agents run targeted tests through the capped runner, `make test-llm ARGS="-p late-ssh -E 'test(ircd)'"`; `make check` stays with the human owner.
+Agents run targeted tests through the capped runner, `make test-llm ARGS="-p late-ssh --lib -E 'test(ircd)'"`; `make check` stays with the human owner.
 
 ---
 

@@ -235,8 +235,6 @@ fn a_rented_title_renders_after_the_author_name_in_chat() {
         crate::app::common::username_effect::ResolvedName {
             style: None,
             title: Some("the night clerk".to_string()),
-            crown: false,
-            laureate: false,
             milestone: None,
         },
     )]);
@@ -258,6 +256,7 @@ fn a_rented_title_renders_after_the_author_name_in_chat() {
         message_reactions: &message_reactions,
         message_gilds: &message_gilds,
         inline_images: &inline_images,
+        news_cards: &HashMap::new(),
         dividers: ChatDividers::default(),
         drunk_levels: &drunk_levels,
         name_flair: &name_flair,
@@ -360,6 +359,7 @@ fn plain_glyphs_drops_nerd_font_icons_from_the_body_and_the_reaction_chips() {
             message_reactions: &message_reactions,
             message_gilds: &message_gilds,
             inline_images: &inline_images,
+            news_cards: &HashMap::new(),
             dividers: ChatDividers::default(),
             drunk_levels: &drunk_levels,
             name_flair: &name_flair,
@@ -398,102 +398,6 @@ fn plain_glyphs_drops_nerd_font_icons_from_the_body_and_the_reaction_chips() {
     );
 }
 
-/// The live holder's crown is glued to the name, ahead of a rented title and
-/// ahead of the badge stack, and it never displaces either. Last month's
-/// crown leads the name, and someone who is both wears both.
-#[test]
-fn the_crown_glyphs_frame_the_author_name() {
-    theme::set_current_by_id("late");
-
-    let room_id = Uuid::from_u128(1);
-    let current_user_id = Uuid::from_u128(2);
-    let author_id = Uuid::from_u128(3);
-    let created = Utc::now();
-    let message = ChatMessage {
-        id: Uuid::from_u128(10),
-        created,
-        updated: created,
-        reply_to_message_id: None,
-        reply_to_user_id: None,
-        room_id,
-        user_id: author_id,
-        body: "mine now".to_string(),
-    };
-
-    let usernames = HashMap::from([
-        (current_user_id, "alice".to_string()),
-        (author_id, "bob".to_string()),
-    ]);
-    let countries = HashMap::new();
-    let bonsai_glyphs = HashMap::new();
-    let chat_badges = HashMap::from([(author_id, "🐱".to_string())]);
-    let friend_user_ids = HashSet::new();
-    let live_user_ids = HashSet::new();
-    let message_reactions = HashMap::new();
-    let message_gilds = HashMap::new();
-    let inline_images = HashMap::new();
-    let profile_award_badges = HashMap::new();
-    let drunk_levels = HashMap::new();
-    let name_flair = HashMap::from([(
-        author_id,
-        crate::app::common::username_effect::ResolvedName {
-            style: None,
-            title: Some("the night clerk".to_string()),
-            crown: true,
-            laureate: true,
-            milestone: None,
-        },
-    )]);
-    let away_user_ids = HashSet::new();
-    let translations = HashMap::new();
-    let translation_hidden = HashSet::new();
-    let username_lookup = UsernameLookup::new(&usernames, None);
-    let ctx = ChatRowsContext {
-        versions: ChatRowsVersions::default(),
-        current_user_id,
-        live_user_ids: &live_user_ids,
-        show_flag_fallback: false,
-        usernames: &username_lookup,
-        countries: &countries,
-        friend_user_ids: &friend_user_ids,
-        bonsai_glyphs: &bonsai_glyphs,
-        chat_badges: &chat_badges,
-        profile_award_badges: &profile_award_badges,
-        message_reactions: &message_reactions,
-        message_gilds: &message_gilds,
-        inline_images: &inline_images,
-        dividers: ChatDividers::default(),
-        drunk_levels: &drunk_levels,
-        name_flair: &name_flair,
-        away_user_ids: &away_user_ids,
-        name_flicker: None,
-        translations: &translations,
-        translation_hidden: &translation_hidden,
-        runner_looks: None,
-    };
-
-    let mut cache = ChatRowsCache::default();
-    ensure_chat_rows_cache(&mut cache, vec![&message], 60, ctx);
-
-    let rendered: Vec<String> = cache
-        .all_rows
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect();
-
-    assert!(
-        rendered
-            .iter()
-            .any(|row| row.contains("\u{1F451} bob \u{1F48E}, the night clerk 🐱")),
-        "no crowned author header in {rendered:#?}"
-    );
-}
-
 #[test]
 fn chat_rows_cache_key_changes_when_theme_changes() {
     let user_id = Uuid::from_u128(2);
@@ -528,6 +432,7 @@ fn chat_rows_cache_key_changes_when_theme_changes() {
         message_reactions: &message_reactions,
         message_gilds: &message_gilds,
         inline_images: &inline_images,
+        news_cards: &HashMap::new(),
         dividers: ChatDividers::default(),
         drunk_levels: &drunk_levels,
         name_flair: &name_flair,
@@ -567,6 +472,7 @@ fn chat_rows_cache_key_changes_with_any_version_counter() {
     let away_user_ids = HashSet::new();
     let translations = HashMap::new();
     let translation_hidden = HashSet::new();
+    let news_cards = HashMap::new();
     let username_lookup = UsernameLookup::new(&usernames, None);
 
     let base_versions = ChatRowsVersions {
@@ -589,6 +495,7 @@ fn chat_rows_cache_key_changes_with_any_version_counter() {
         message_reactions: &message_reactions,
         message_gilds: &message_gilds,
         inline_images: &inline_images,
+        news_cards: &news_cards,
         dividers: ChatDividers::default(),
         drunk_levels: &drunk_levels,
         name_flair: &name_flair,
@@ -682,6 +589,7 @@ fn editing_a_grouped_message_gives_it_its_own_header() {
         message_reactions: &message_reactions,
         message_gilds: &message_gilds,
         inline_images: &inline_images,
+        news_cards: &HashMap::new(),
         dividers: ChatDividers::default(),
         drunk_levels: &drunk_levels,
         name_flair: &name_flair,
@@ -893,6 +801,7 @@ fn mentions_and_replies_paint_a_background_wash() {
         message_reactions: &message_reactions,
         message_gilds: &message_gilds,
         inline_images: &inline_images,
+        news_cards: &HashMap::new(),
         dividers: ChatDividers::default(),
         drunk_levels: &drunk_levels,
         name_flair: &name_flair,
@@ -976,6 +885,7 @@ fn background_wash_fills_the_whole_row_width() {
         message_reactions: &message_reactions,
         message_gilds: &message_gilds,
         inline_images: &inline_images,
+        news_cards: &HashMap::new(),
         dividers: ChatDividers::default(),
         drunk_levels: &drunk_levels,
         name_flair: &name_flair,
@@ -1042,7 +952,9 @@ fn chat_view<'a>(
     composer: &'a TextArea<'static>,
     news_composer: &'a TextArea<'static>,
 ) -> ChatRenderInput<'a> {
-    static INLINE_IMAGES: OnceLock<HashMap<Uuid, InlineImagePreview>> = OnceLock::new();
+    static INLINE_IMAGES: OnceLock<HashMap<Uuid, InlinePreview>> = OnceLock::new();
+    static NEWS_CARDS: OnceLock<HashMap<Uuid, late_core::models::article::ArticleFeedItem>> =
+        OnceLock::new();
     static FRIEND_USER_IDS: OnceLock<HashSet<Uuid>> = OnceLock::new();
     static LIVE_USER_IDS: OnceLock<HashSet<Uuid>> = OnceLock::new();
     static IGNORED_USER_IDS: OnceLock<HashSet<Uuid>> = OnceLock::new();
@@ -1096,6 +1008,8 @@ fn chat_view<'a>(
         news_unread_count: 0,
         news_view: crate::app::chat::news::ui::ArticleListView {
             articles: &[],
+            saved_len: 0,
+            saved_count: 0,
             selected_index: 0,
             marker: NEWS_MARKER.get_or_init(HashSet::new),
             watch_positions: NEWS_WATCH_POSITIONS.get_or_init(HashMap::new),
@@ -1124,6 +1038,7 @@ fn chat_view<'a>(
         message_reactions,
         message_gilds: MESSAGE_GILDS.get_or_init(HashMap::new),
         inline_images: INLINE_IMAGES.get_or_init(HashMap::new),
+        news_cards: NEWS_CARDS.get_or_init(HashMap::new),
         afk_lines: AFK_LINES.get_or_init(HashMap::new),
         device_left_at: None,
         unread_counts,
@@ -2679,14 +2594,11 @@ fn header_segments_split_chat_flag_from_regular_badge() {
         prefix,
         segments: segs,
         author_range,
-        crown_range: _,
         title_range,
         runner_range: _,
     } = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
         is_friend: false,
         author: "bob",
-        crown: false,
-        laureate: false,
         title: None,
         milestone: None,
         special_badges: &[],
@@ -2718,14 +2630,11 @@ fn header_segments_show_a_burn_milestone_on_top_of_a_rented_badge_and_flag() {
         prefix,
         segments: segs,
         author_range: _,
-        crown_range: _,
         title_range: _,
         runner_range: _,
     } = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
         is_friend: false,
         author: "bob",
-        crown: false,
-        laureate: false,
         title: None,
         milestone: Some("\u{1F30B}"),
         special_badges: &[],
@@ -2744,21 +2653,18 @@ fn header_segments_show_a_burn_milestone_on_top_of_a_rented_badge_and_flag() {
 }
 
 /// A milestone owner who rents nothing still wears it, and it never displaces
-/// the crown or a title: those are marks on the name, this is a badge.
+/// a title: that is a mark on the name, this is a badge.
 #[test]
 fn header_prefix_wears_a_milestone_with_no_rentals_at_all() {
     let AuthorPrefix {
         prefix,
         segments: segs,
         author_range: _,
-        crown_range,
         title_range: _,
         runner_range: _,
     } = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
         is_friend: false,
         author: "bob",
-        crown: true,
-        laureate: false,
         title: Some("the night clerk"),
         milestone: Some("\u{1F9E8}"),
         special_badges: &[],
@@ -2768,50 +2674,9 @@ fn header_prefix_wears_a_milestone_with_no_rentals_at_all() {
         presence_badges: &[],
         runner_badge: None,
     });
-    assert_eq!(prefix, "bob \u{1F48E}, the night clerk \u{1F9E8}");
-    assert!(crown_range.is_some());
+    assert_eq!(prefix, "bob, the night clerk \u{1F9E8}");
     assert_eq!(segs.len(), 2);
     assert_eq!(segs[1].target, HeaderTarget::StoreMilestone);
-}
-
-/// Last month's crown sits before the name, after the friend heart, and
-/// shifts everything after it: the name's byte range (what the painter
-/// tints) and its click columns both start past the glyph. It has no
-/// segment of its own, and no `[CRWN]` joins the badge group.
-#[test]
-fn header_prefix_leads_the_name_with_last_months_crown() {
-    let AuthorPrefix {
-        prefix,
-        segments: segs,
-        author_range,
-        crown_range,
-        title_range: _,
-        runner_range: _,
-    } = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
-        is_friend: true,
-        author: "bob",
-        crown: false,
-        laureate: true,
-        title: None,
-        milestone: None,
-        special_badges: &[],
-        chat_badges: &[],
-        bonsai_glyph: None,
-        profile_award_badges: Some("LATE"),
-        presence_badges: &[],
-        runner_badge: None,
-    });
-    let lead = format!("{FRIEND_BADGE} \u{1F451} ");
-    assert_eq!(prefix, format!("{lead}bob [LATE]"));
-    assert_eq!(author_range, (lead.len(), lead.len() + 3));
-    assert_eq!(crown_range, None);
-    let name_col = 1 + UnicodeWidthStr::width(lead.as_str()) as u16;
-    let name_segment = segs
-        .iter()
-        .find(|seg| seg.start_col == name_col)
-        .expect("the name keeps its profile segment");
-    assert_eq!(name_segment.target, HeaderTarget::Profile);
-    assert_eq!(name_segment.end_col, name_col + 3);
 }
 
 #[test]
@@ -2821,14 +2686,11 @@ fn header_prefix_puts_a_rented_title_between_the_name_and_the_badges() {
         prefix,
         segments: segs,
         author_range,
-        crown_range: _,
         title_range,
         runner_range: _,
     } = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
         is_friend: false,
         author: "bob",
-        crown: false,
-        laureate: false,
         title: Some("the insufferable"),
         milestone: None,
         special_badges: &[],
@@ -2858,8 +2720,6 @@ fn header_prefix_puts_a_rented_title_between_the_name_and_the_badges() {
     } = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
         is_friend: false,
         author: "bob",
-        crown: false,
-        laureate: false,
         title: Some("   "),
         milestone: None,
         special_badges: &[],
@@ -2882,8 +2742,6 @@ fn header_prefix_orders_all_badge_classes() {
     let prefix = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
         is_friend: false,
         author: "alice",
-        crown: false,
-        laureate: false,
         title: None,
         milestone: None,
         special_badges: &["mod", "developer", "artist"],
@@ -2915,8 +2773,6 @@ fn header_prefix_leads_the_badge_stack_with_the_runner_badge() {
     } = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
         is_friend: false,
         author: "mira",
-        crown: false,
-        laureate: false,
         title: Some("the night clerk"),
         milestone: None,
         special_badges: &["mod"],
@@ -3395,6 +3251,7 @@ fn the_you_left_rule_draws_above_the_first_message_past_the_left_app_mark() {
             message_reactions: &message_reactions,
             message_gilds: &message_gilds,
             inline_images: &inline_images,
+            news_cards: &HashMap::new(),
             dividers,
             drunk_levels: &drunk_levels,
             name_flair: &name_flair,
@@ -3598,6 +3455,7 @@ fn the_wire_seats_a_runners_portrait_beside_their_message() {
         message_reactions: &message_reactions,
         message_gilds: &message_gilds,
         inline_images: &inline_images,
+        news_cards: &HashMap::new(),
         dividers: ChatDividers::default(),
         drunk_levels: &drunk_levels,
         name_flair: &name_flair,
@@ -3740,5 +3598,42 @@ fn embedded_chat_voice_strip_is_padded_like_its_messages() {
             voice_strip: None,
             messages: Rect::new(11, 5, 38, 12),
         }
+    );
+}
+
+/// A YouTube thumbnail gets the video's title on a row above it, cut to
+/// the picture's width, and the watch hint under it; without a title only
+/// the hint is added.
+#[test]
+fn video_preview_puts_the_title_above_the_picture() {
+    let picture: InlineImagePreview = vec![Line::from("x".repeat(48)); 2];
+    let texts = |lines: InlineImagePreview| -> Vec<String> {
+        lines.iter().map(|line| line.to_string()).collect()
+    };
+    let picture_row = "x".repeat(48);
+
+    assert_eq!(
+        texts(with_watch_hint(&picture, Some("Never Gonna Give You Up"))),
+        vec![
+            "Never Gonna Give You Up".to_string(),
+            picture_row.clone(),
+            picture_row.clone(),
+            "▶ YouTube · Enter to watch".to_string(),
+        ]
+    );
+    let cut = texts(with_watch_hint(
+        &picture,
+        Some("Keynote: After the AI Hype - What's Real, and What's Next - Richard Campbell - 2026"),
+    ))
+    .remove(0);
+    assert_eq!(cut, "Keynote: After the AI Hype - What's Real, and W…");
+    assert_eq!(UnicodeWidthStr::width(cut.as_str()), 48);
+    assert_eq!(
+        texts(with_watch_hint(&picture, None)),
+        vec![
+            picture_row.clone(),
+            picture_row,
+            "▶ YouTube · Enter to watch".to_string(),
+        ]
     );
 }

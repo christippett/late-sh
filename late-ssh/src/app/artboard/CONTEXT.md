@@ -14,10 +14,10 @@ Naming note: `Artboard` is the user-facing name. Code and upstream crates still 
 - Settings → Tweaks → Artboard content disclaimer hides the entire page behind a double-bordered NSFW warning. It is **per device**: stored as `artboard_disclaimer` on the SSH key the session authenticated with (`user_ssh_keys.settings`), falling back to the account's `artboard_disclaimer` (default true) for a key that never chose; `App::artboard_disclaimer_enabled` resolves it in session and `DeviceState::shows_artboard_disclaimer` for the login splash, and a failed key read at login fails closed to on (root `CONTEXT.md`, Per-device settings). Its choices are View (`V`, current visit), Always View (`A`, view and persist the tweak off for this device only, outside the tour; the tweak off is also what lets the login splash show a gallery piece, see §Gallery), and Back to Chat (`B`/Esc, Home screen 1). Leaving resets one-visit consent. One all-yellow warning symbol sits on each side with five spaces to the wording, NSFW is red, and the choices start with yellow/red/green initials; explanations use theme text with dim parentheses. Superscript aside/footer use the theme faint text color and sit under the warning and above the bottom border. Choices are clickable except in keyboard-only mode. `disclaimer.rs` owns this gate, before gallery/editor input and without drawing art underneath; app modals keep priority. The dialog does not draw during the tour: the tour gate owns input at the Artboard stop, the page stays cleared, and the stop's tour box offers `S` (show, one-visit consent through the same `artboard_content_accepted`) or Enter (skip to Profiles); neither touches the tweak.
 - Shared canvas: `dartboard_core::Canvas`, canonical size `384 x 192`.
 - Server: one in-process `dartboard_local::ServerHandle` per `late-ssh` process.
-- Session connection: created by `App::sync_dartboard_connection` (`disclaimer.rs`) once the page may show: on entry with the disclaimer off, on `V`/`A`/tour `S`, or on the tick that lands a saved tweak; a visitor on the prompt holds no seat. Dropped when leaving Artboard. `q` on the prompt is the global quit; `1`–`7` and the clickable page numbers in the top bar keep working without granting consent or changing the preference, with `4` staying on the prompt.
+- Session connection: created by `App::sync_dartboard_connection` (`disclaimer.rs`) once the page may show: on entry with the disclaimer off, on `V`/`A`/tour `S`, or on the tick that lands a saved tweak; a visitor on the prompt holds no seat. Dropped when leaving Artboard. `q` on the prompt is the global quit; `1`–`7`, Tab/Shift+Tab, and the clickable page numbers in the top bar keep working without granting consent or changing the preference, with `4` staying on the prompt.
 - Initial mode: `view`; `i`, `I`, `Enter`, or canvas left-click enters active edit mode.
 - Persistence: JSONB rows in `artboard_snapshots` through `late_core::models::artboard::Snapshot`.
-- Public gallery: `late-web/src/pages/gallery/`, read-only over saved DB snapshots, not live server memory. It does not list pieces yet.
+- Public gallery: `late-web/src/pages/gallery/`, read-only over saved DB snapshots, not live server memory. It does not list pieces; each piece still up has a page of its own (`/gallery/pieces/{id}`), which the herald's piece posts link to (`late-ssh/src/app/herald/CONTEXT.md`).
 - The gallery (`gallery/`): pieces hung off the live board, applause, the monthly `artboard` award, the page rail. See §Gallery below.
 
 Only canvas mutations are shared. Editor affordances stay local to the current SSH session.
@@ -146,7 +146,7 @@ Runtime behavior in `late-ssh/src/dartboard.rs`:
 - Failed saves mark the state dirty again and retry.
 
 Archive behavior:
-- Daily key: `daily:YYYY-MM-DD`.
+- Daily key: `daily:YYYY-MM-DD`, built by `Snapshot::daily_key` (the rollover, moderation and the herald all call it).
 - Daily rollover wakes at each UTC day boundary and archives the previous UTC day.
 - Daily retention keeps the newest 7 daily snapshots.
 - Monthly key: `monthly:YYYY-MM`.

@@ -28,7 +28,7 @@ use crate::app::state::{App, SessionConfig};
 use crate::app::voice::svc::{VoiceConfig, VoiceService};
 use crate::app::{LeaderboardService, QuestService, ShopService};
 use crate::authz::Permissions;
-use crate::config::{AiConfig, Config};
+use crate::config::{AiConfig, Config, HeraldConfig};
 use crate::paired_clients::{PairControlMessage, PairedClientRegistry};
 use crate::session::SessionRegistry;
 use crate::state::State;
@@ -167,6 +167,7 @@ pub fn test_config(db_config: late_core::db::DbConfig) -> Config {
         max_conns_global: 100,
         max_conns_per_ip: 3,
         ssh_idle_timeout: 60,
+        handoff_idle: std::time::Duration::from_secs(5 * 60),
         server_key_path: std::env::temp_dir().join(format!("late-ssh-test-key-{}", Uuid::now_v7())),
         frame_drop_log_every: 100,
         ssh_max_attempts_per_ip: 30,
@@ -179,6 +180,7 @@ pub fn test_config(db_config: late_core::db::DbConfig) -> Config {
             enabled: false,
             api_key: None,
         },
+        herald: HeraldConfig::disabled("http://localhost:3000".to_string()),
         youtube_api_key: None,
         voice: VoiceConfig::disabled(),
         irc: test_irc_config(),
@@ -262,8 +264,14 @@ pub fn test_app_state(db: Db, config: Config) -> State {
     let summary_service =
         crate::app::ai::summary::SummaryService::new(db.clone(), ai_service.clone());
     let paper_service = crate::app::paper::svc::PaperService::new(db.clone(), ai_service.clone());
+    let herald_service = crate::app::herald::svc::HeraldService::new(
+        db.clone(),
+        ai_service.clone(),
+        config.herald.clone(),
+        config.web_url.clone(),
+    );
     let jobs_service = crate::app::jobs::svc::JobsService::new(db.clone(), ai_service.clone());
-    let article_service = ArticleService::new(db.clone(), ai_service.clone());
+    let article_service = ArticleService::new(db.clone(), ai_service.clone(), chat_service.clone());
     let feed_service = crate::app::chat::feeds::svc::FeedService::new(db.clone());
     let showcase_service = crate::app::chat::showcase::svc::ShowcaseService::new(db.clone());
     let work_service = crate::app::chat::work::svc::WorkService::new(db.clone());
@@ -331,7 +339,6 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         lounge_service: test_lounge_service(db.clone(), chat_service.clone(), chip_service.clone()),
         username_directory,
         flair_directory: crate::app::common::username_effect::new_directory(),
-        crown_service: crate::app::crown::svc::CrownService::new(db.clone()),
         pot_service: crate::app::pot::svc::PotService::new(db.clone()),
         referral_service: crate::app::referral::svc::ReferralService::new(db.clone()),
         config,
@@ -350,6 +357,7 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         translation_service,
         summary_service,
         paper_service,
+        herald_service,
         jobs_service,
         article_service,
         calendar_service: crate::app::calendar::svc::CalendarService::new(db.clone()),
@@ -395,6 +403,7 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         arcade_handle_service: crate::app::door::arcade::ArcadeHandleService::new(db.clone()),
         live_games: crate::app::door::spectate::svc::LiveGamesService::new(db.clone()),
         door_rc_service: crate::app::door::rc::DoorRcService::new(db.clone()),
+        games_hub_service: crate::app::door::hub::svc::GamesHubService::new(db.clone()),
         daily_service: crate::app::lobby::daily::svc::DailyService::new(
             db.clone(),
             chip_service.clone(),
@@ -482,6 +491,9 @@ pub struct SessionWorld {
     /// The tour still to walk (the account's flag is unset), which also
     /// starts the session in the Clubhouse. Unset means walked.
     pub tour_pending: bool,
+    /// Where a session its CLI moved here was (`app/handoff`). Unset is a
+    /// login.
+    pub resume: Option<crate::app::handoff::state::ResumePoint>,
     /// One replica's chat service, shared the way production shares it:
     /// every session on it hears every other's `ChatEvent`s. Unset gives
     /// the session its own. Mention notifications ride the app's own
@@ -547,12 +559,22 @@ fn make_app_with_chat_service_and_permissions(
             db.clone(),
             AiService::new(false, None),
         ),
+        herald_service: crate::app::herald::svc::HeraldService::new(
+            db.clone(),
+            AiService::new(false, None),
+            HeraldConfig::disabled("http://localhost:3000".to_string()),
+            "http://localhost:3000".to_string(),
+        ),
         jobs_service: crate::app::jobs::svc::JobsService::new(
             db.clone(),
             AiService::new(false, None),
         ),
         notification_service: notification_service.clone(),
-        article_service: ArticleService::new(db.clone(), AiService::new(false, None)),
+        article_service: ArticleService::new(
+            db.clone(),
+            AiService::new(false, None),
+            chat_service.clone(),
+        ),
         calendar_service: crate::app::calendar::svc::CalendarService::new(db.clone()),
         feed_service: crate::app::chat::feeds::svc::FeedService::new(db.clone()),
         cyberspace_service: crate::app::chat::cyberspace::svc::CyberspaceService::new(
@@ -674,6 +696,7 @@ fn make_app_with_chat_service_and_permissions(
         arcade_handle_service: crate::app::door::arcade::ArcadeHandleService::new(db.clone()),
         live_games: crate::app::door::spectate::svc::LiveGamesService::new(db.clone()),
         door_rc_service: crate::app::door::rc::DoorRcService::new(db.clone()),
+        games_hub_service: crate::app::door::hub::svc::GamesHubService::new(db.clone()),
         initial_door_rcs: Vec::new(),
         dcss_enabled: false,
         dcss_host: String::new(),
@@ -740,10 +763,11 @@ fn make_app_with_chat_service_and_permissions(
         key_left_at: None,
         username_directory: None,
         flair_directory: None,
-        crown_service: None,
         pot_service: None,
         referral_service: crate::app::referral::svc::ReferralService::new(db.clone()),
         newcomer_clock: crate::app::referral::state::NewcomerClock::inert(),
+        // A regular: the newcomer counters are no-ops in tests either way.
+        account_created: chrono::DateTime::UNIX_EPOCH,
         activity_feed_rx: None,
         is_new_user: world.is_new_user,
         landing_page: match world.landing_page {
@@ -752,6 +776,8 @@ fn make_app_with_chat_service_and_permissions(
         },
         paper_at_login: false,
         is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        handoff_idle: Duration::from_secs(5 * 60),
+        resume: world.resume,
         initial_theme_id: "contrast".to_string(),
         initial_interaction_mode: None,
         initial_audio_source: late_core::models::user::AudioSource::default(),
@@ -763,7 +789,11 @@ fn make_app_with_chat_service_and_permissions(
     app.skip_splash_for_tests();
     // The suite starts on Home, but a test that sets the landing inputs is
     // asserting where the session landed, so it keeps that screen.
-    if world.landing_page.is_some() || world.is_new_user || world.tour_pending {
+    if world.landing_page.is_some()
+        || world.is_new_user
+        || world.tour_pending
+        || world.resume.is_some()
+    {
         app.screen = landed;
         app.sync_visible_chat_room();
     }
@@ -795,6 +825,7 @@ pub fn make_app_with_paired_client(
     // One shared instance between ChatService and SessionConfig, mirroring
     // main.rs (see make_app_with_chat_service_and_permissions).
     let notification_service = NotificationService::new(db.clone());
+    let chat_service = ChatService::new(db.clone(), notification_service.clone());
 
     let mut app = App::new(SessionConfig {
         cols: 100,
@@ -808,7 +839,7 @@ pub fn make_app_with_paired_client(
         ),
         voice_service: VoiceService::new(VoiceConfig::disabled()),
         stream_service: test_stream_service(db.clone(), activity_tx.clone()),
-        chat_service: ChatService::new(db.clone(), notification_service.clone()),
+        chat_service: chat_service.clone(),
         translation_service: crate::app::ai::translate::TranslationService::new(
             db.clone(),
             AiService::new(false, None),
@@ -821,12 +852,22 @@ pub fn make_app_with_paired_client(
             db.clone(),
             AiService::new(false, None),
         ),
+        herald_service: crate::app::herald::svc::HeraldService::new(
+            db.clone(),
+            AiService::new(false, None),
+            HeraldConfig::disabled("http://localhost:3000".to_string()),
+            "http://localhost:3000".to_string(),
+        ),
         jobs_service: crate::app::jobs::svc::JobsService::new(
             db.clone(),
             AiService::new(false, None),
         ),
         notification_service: notification_service.clone(),
-        article_service: ArticleService::new(db.clone(), AiService::new(false, None)),
+        article_service: ArticleService::new(
+            db.clone(),
+            AiService::new(false, None),
+            chat_service.clone(),
+        ),
         calendar_service: crate::app::calendar::svc::CalendarService::new(db.clone()),
         feed_service: crate::app::chat::feeds::svc::FeedService::new(db.clone()),
         cyberspace_service: crate::app::chat::cyberspace::svc::CyberspaceService::new(
@@ -952,6 +993,7 @@ pub fn make_app_with_paired_client(
         arcade_handle_service: crate::app::door::arcade::ArcadeHandleService::new(db.clone()),
         live_games: crate::app::door::spectate::svc::LiveGamesService::new(db.clone()),
         door_rc_service: crate::app::door::rc::DoorRcService::new(db.clone()),
+        games_hub_service: crate::app::door::hub::svc::GamesHubService::new(db.clone()),
         initial_door_rcs: Vec::new(),
         dcss_enabled: false,
         dcss_host: String::new(),
@@ -1018,15 +1060,18 @@ pub fn make_app_with_paired_client(
         key_left_at: None,
         username_directory: None,
         flair_directory: None,
-        crown_service: None,
         pot_service: None,
         referral_service: crate::app::referral::svc::ReferralService::new(db.clone()),
         newcomer_clock: crate::app::referral::state::NewcomerClock::inert(),
+        // A regular: the newcomer counters are no-ops in tests either way.
+        account_created: chrono::DateTime::UNIX_EPOCH,
         activity_feed_rx: None,
         is_new_user: false,
         landing_page: late_core::models::user::LandingPage::Clubhouse,
         paper_at_login: false,
         is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        handoff_idle: Duration::from_secs(5 * 60),
+        resume: None,
         initial_radio_station: late_core::models::user::RadioStation::default(),
         initial_radio_slots: late_core::models::user::RadioSlots::default(),
         initial_theme_id: "contrast".to_string(),

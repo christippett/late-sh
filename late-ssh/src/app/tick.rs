@@ -104,6 +104,10 @@ impl App {
         // The Late Edition: the login pop once the splash is down, `/paper`,
         // and the results of both.
         changed |= crate::app::paper::svc::tick(self);
+        // The drain handoff: move a quiet CLI session to the new pod.
+        crate::app::handoff::svc::tick(self);
+        // The herald: an admin's `/herald` and its answer.
+        changed |= crate::app::herald::svc::tick(self);
         // The job feed: the shelf snapshot copy, `/jobs`, and the admin's
         // press banners.
         changed |= crate::app::jobs::svc::tick(self);
@@ -127,7 +131,7 @@ impl App {
             changed = true;
         }
 
-        changed |= crate::app::chat::news::watch::svc::tick(self, now, one_hz);
+        changed |= crate::app::video::svc::tick(self, now, one_hz);
 
         self.sync_visible_chat_room();
         // Presence (`app/presence`): everyone's records into the tavern,
@@ -312,7 +316,6 @@ impl App {
         changed |= self.voice.tick();
         changed |= self.drain_voice_join_results();
         changed |= self.tick_stream();
-        changed |= self.tick_crown();
         changed |= self.bonsai.tick();
         changed |= self.fight.tick();
         changed |= self.tailor.tick();
@@ -402,7 +405,7 @@ impl App {
                     self.banner = Some(crate::app::common::primitives::Banner::error(&message));
                 }
                 SessionMessage::VideoState { play_id, report } => {
-                    crate::app::chat::news::watch::svc::apply_report(self, play_id, &report);
+                    crate::app::video::svc::apply_report(self, play_id, &report);
                 }
                 SessionMessage::Toast { message, error } => {
                     self.banner = Some(if error {
@@ -522,7 +525,6 @@ impl App {
         changed |= self.live.tick(
             &self.daily,
             &self.audio,
-            self.chat.news.all_articles(),
             &self.chat.live_streams,
             &self.live_games.live_rows(),
             &self.calendar,
@@ -934,19 +936,8 @@ impl App {
             if let Some(directory) = &self.flair_directory {
                 let now = chrono::Utc::now();
                 let phase = crate::app::common::username_effect::shimmer_phase(self.marquee_tick);
-                // The crown rides the same map, and lapses the same way: an
-                // entry from a finished UTC month resolves to nobody, which
-                // is what empties the slot at the rollover with no sweeper,
-                // and the same rollover hands the laureate's crown on.
-                let crown_wearers = match self.crown_wearers_rx.as_mut() {
-                    Some(rx) => *rx.borrow_and_update(),
-                    // Only a test harness builds an app without the crown.
-                    None => crate::app::crown::svc::CrownWearers::default(),
-                };
                 let name_flair = crate::app::common::username_effect::resolve_all(
                     &crate::app::common::username_effect::snapshot(directory),
-                    crown_wearers.holder(now),
-                    crown_wearers.laureate(now),
                     phase,
                     now,
                 );
@@ -1667,12 +1658,25 @@ impl App {
         let seconds = now.duration_since(self.attention_mark).as_secs_f64();
         self.attention_mark = now;
         let place = self.attention_place();
+        let tenure = self.tenure();
         let spot = Some((self.screen, place));
         if self.attention_spot != spot {
             self.attention_spot = spot;
-            crate::metrics::record_place_visit(self.screen, place);
+            crate::metrics::record_place_visit(self.screen, place, tenure);
         }
-        crate::metrics::record_attention(self.screen, place, self.attention_presence(), seconds);
+        crate::metrics::record_attention(
+            self.screen,
+            place,
+            self.attention_presence(),
+            tenure,
+            seconds,
+        );
+    }
+
+    /// How old the account behind this session is right now, for the
+    /// counters that split newcomers from regulars.
+    pub(crate) fn tenure(&self) -> crate::metrics::Tenure {
+        crate::metrics::Tenure::of(self.account_created, chrono::Utc::now())
     }
 
     /// Whether a key landed within [`ATTENTION_ACTIVE_WINDOW`], or the

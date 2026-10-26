@@ -207,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
         .with_username_directory(username_directory.clone())
         .with_session_registry(session_registry.clone())
         .with_irc_registry(irc_registry.clone());
-    let article_service = ArticleService::new(db.clone(), ai_service.clone());
+    let article_service = ArticleService::new(db.clone(), ai_service.clone(), chat_service.clone());
     let calendar_service = late_ssh::app::calendar::svc::CalendarService::new(db.clone())
         .with_activity(activity_publisher.clone());
     let _calendar_worker = calendar_service.start_notify_worker(
@@ -285,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
     let arcade_handle_service = late_ssh::app::door::arcade::ArcadeHandleService::new(db.clone());
     let live_games = late_ssh::app::door::spectate::svc::LiveGamesService::new(db.clone());
     let door_rc_service = late_ssh::app::door::rc::DoorRcService::new(db.clone());
+    let games_hub_service = late_ssh::app::door::hub::svc::GamesHubService::new(db.clone());
     let house_registry = late_ssh::app::lobby::house::registry::HouseTableRegistry::new(
         chip_service.clone(),
         late_ssh::app::lobby::house::blackjack::player::BlackjackPlayerDirectory::new(db.clone()),
@@ -354,6 +355,15 @@ async fn main() -> anyhow::Result<()> {
     let paper_service =
         late_ssh::app::paper::svc::PaperService::new(db.clone(), ai_service.clone());
     let _paper_sweeper_task = paper_service.start_sweeper_task();
+    // The herald: every replica checks, the day's row decides who posts.
+    // See `app/herald/svc.rs`.
+    let herald_service = late_ssh::app::herald::svc::HeraldService::new(
+        db.clone(),
+        ai_service.clone(),
+        config.herald.clone(),
+        config.web_url.clone(),
+    );
+    let _herald_task = herald_service.start_task();
     // The job feed's press: once a night, the run row decides which
     // replica; every replica keeps its own shelf snapshot. See
     // `app/jobs/svc.rs`.
@@ -398,14 +408,6 @@ async fn main() -> anyhow::Result<()> {
         pg_listener.subscribe(late_ssh::app::deadchannel::lounge::svc::LoungeService::CHANNELS),
     );
     let _lounge_spawner_task = lounge_service.start_spawner_task();
-    // The crown's glyph crosses replicas over Postgres, not over any
-    // in-process broadcast; the listener also seeds this replica's holder on
-    // every (re)connect. See `app/crown/svc.rs`.
-    let crown_service = late_ssh::app::crown::svc::CrownService::new(db.clone())
-        .with_activity(activity_publisher.clone());
-    let _crown_notify_task = crown_service.start_notify_worker(
-        pg_listener.subscribe(late_ssh::app::crown::svc::CrownService::CHANNELS),
-    );
     // The pot's panel and its winner banner cross replicas over Postgres,
     // and the draw is settled by a status transition so exactly one replica
     // pays however many are sweeping. See `app/pot/svc.rs`.
@@ -480,6 +482,7 @@ async fn main() -> anyhow::Result<()> {
         translation_service: translation_service.clone(),
         summary_service: summary_service.clone(),
         paper_service: paper_service.clone(),
+        herald_service: herald_service.clone(),
         jobs_service: jobs_service.clone(),
         audio_service: audio_service.clone(),
         voice_service,
@@ -510,6 +513,7 @@ async fn main() -> anyhow::Result<()> {
         arcade_handle_service,
         live_games,
         door_rc_service,
+        games_hub_service,
         daily_service,
         realm_service,
         bonsai_service,
@@ -535,7 +539,6 @@ async fn main() -> anyhow::Result<()> {
         scratchpad_registry,
         username_directory: username_directory.clone(),
         flair_directory: flair_directory.clone(),
-        crown_service: crown_service.clone(),
         pot_service: pot_service.clone(),
         referral_service: referral_service.clone(),
         activity_feed: activity_tx,

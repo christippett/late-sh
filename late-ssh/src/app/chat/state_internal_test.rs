@@ -80,54 +80,7 @@ fn parse_pot_command_only_admits_a_buyable_count() {
     // Not a pot command at all: a longer command that merely starts the same
     // way must fall through to its own parser.
     assert_eq!(parse_pot_command("/potato"), None);
-    assert_eq!(parse_pot_command("/crown take"), None);
     assert_eq!(parse_pot_command("hello"), None);
-}
-
-/// The crown's composer boundary: a bare take pays the ladder, a number is a
-/// bid, and only a positive whole number gets through. Whether the bid beats
-/// the price is not decided here: the price can move before the take lands.
-#[test]
-fn parse_crown_command_admits_a_ladder_take_or_a_positive_bid() {
-    use crate::app::crown::svc::CrownBid;
-
-    assert_eq!(
-        parse_crown_command("/crown"),
-        Some(Some(CrownCommand::Status))
-    );
-    assert_eq!(
-        parse_crown_command("  /crown take  "),
-        Some(Some(CrownCommand::Take {
-            bid: CrownBid::AtPrice
-        }))
-    );
-    assert_eq!(
-        parse_crown_command("/crown take 5000"),
-        Some(Some(CrownCommand::Take {
-            bid: CrownBid::Offer(5_000)
-        }))
-    );
-    assert_eq!(
-        parse_crown_command("/crown take   1"),
-        Some(Some(CrownCommand::Take {
-            bid: CrownBid::Offer(1)
-        }))
-    );
-
-    for junk in [
-        "/crown take 0",
-        "/crown take -500",
-        "/crown take lots",
-        "/crown take 5k",
-        "/crown take 1.5",
-        "/crown take 99999999999999999999",
-        "/crown give",
-    ] {
-        assert_eq!(parse_crown_command(junk), Some(None), "{junk}");
-    }
-
-    assert_eq!(parse_crown_command("/crowns"), None);
-    assert_eq!(parse_crown_command("/pot buy 5"), None);
 }
 
 #[test]
@@ -2135,6 +2088,59 @@ fn inline_image_url_in_body_accepts_image_url_with_query() {
     );
 }
 
+/// Every YouTube shape that names one video gets its thumbnail, trimmed
+/// the way image links are; channels, playlists and lookalikes do not.
+#[test]
+fn inline_preview_source_reads_one_video_from_youtube_links() {
+    let video = Some(InlinePreviewSource::Video {
+        video_id: "dQw4w9WgXcQ".to_string(),
+    });
+    for body in [
+        "look https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s",
+        "(https://youtu.be/dQw4w9WgXcQ?si=share).",
+        "https://youtube.com/shorts/dQw4w9WgXcQ!",
+        "https://m.youtube.com/embed/dQw4w9WgXcQ",
+        "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+    ] {
+        assert_eq!(inline_preview_source_in_body(body), video, "{body}");
+    }
+    for body in [
+        "https://www.youtube.com/@somechannel",
+        "https://www.youtube.com/playlist?list=PL123",
+        "https://youtu.be/tooshort",
+        "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
+        "no link here",
+    ] {
+        assert_eq!(inline_preview_source_in_body(body), None, "{body}");
+    }
+}
+
+/// A reply carries its parent's preview text as a `> @author: ...` first
+/// line. A link in that quote is the parent's: the reply gets no preview
+/// of its own, so Enter on it jumps to the parent instead. Its own text
+/// still previews.
+#[test]
+fn inline_preview_source_skips_the_reply_quote() {
+    for body in [
+        "> @fellshard: re: eMudhra: https://youtu.be/u8ccGjar4Es\nLETS GOO",
+        "> @mat: https://h.uguu.se/cat.png\nlook at him",
+    ] {
+        assert_eq!(inline_preview_source_in_body(body), None, "{body}");
+    }
+    assert_eq!(
+        inline_preview_source_in_body("> @mat: hello\nhttps://youtu.be/dQw4w9WgXcQ"),
+        Some(InlinePreviewSource::Video {
+            video_id: "dQw4w9WgXcQ".to_string(),
+        })
+    );
+    assert_eq!(
+        inline_preview_source_in_body("> @mat: hello\nhttps://h.uguu.se/cat.png"),
+        Some(InlinePreviewSource::Image(
+            "https://h.uguu.se/cat.png".to_string()
+        ))
+    );
+}
+
 #[test]
 fn inline_image_request_candidates_scan_newest_messages_first() {
     let now = Instant::now();
@@ -2155,8 +2161,48 @@ fn inline_image_request_candidates_scan_newest_messages_first() {
         requests,
         vec![(
             messages[0].id,
-            "https://files.example.com/newest.png".to_string()
+            InlinePreviewSource::Image("https://files.example.com/newest.png".to_string())
         )]
+    );
+}
+
+/// A YouTube link's preview is its thumbnail, fetched in the image's place;
+/// an image in the same message keeps the preview.
+#[test]
+fn inline_image_request_candidates_fetch_a_youtube_thumbnail() {
+    let now = Instant::now();
+    let mut video = make_msg(Uuid::from_u128(1));
+    video.body = "watch this https://youtu.be/dQw4w9WgXcQ?si=abc".to_string();
+    let mut both = make_msg(Uuid::from_u128(2));
+    both.body = "https://youtu.be/dQw4w9WgXcQ and https://files.example.com/cat.png".to_string();
+    let messages = vec![video.clone(), both.clone()];
+
+    let requests = inline_image_request_candidates(
+        &messages,
+        &HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        now,
+    );
+
+    assert_eq!(
+        requests,
+        vec![
+            (
+                video.id,
+                InlinePreviewSource::Video {
+                    video_id: "dQw4w9WgXcQ".to_string(),
+                }
+            ),
+            (
+                both.id,
+                InlinePreviewSource::Image("https://files.example.com/cat.png".to_string())
+            ),
+        ]
+    );
+    assert_eq!(
+        requests[0].1.fetch_url(),
+        "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
     );
 }
 
@@ -2202,7 +2248,7 @@ fn inline_image_request_candidates_respect_retry_backoff() {
         ),
         vec![(
             message.id,
-            "https://files.example.com/pending.png".to_string()
+            InlinePreviewSource::Image("https://files.example.com/pending.png".to_string())
         )]
     );
 
@@ -2407,7 +2453,7 @@ fn chat_state_with_cyberspace(
     let ai = crate::app::ai::svc::AiService::new(false, None);
     let translation = crate::app::ai::translate::TranslationService::new(db.clone(), ai.clone());
     let summary = crate::app::ai::summary::SummaryService::new(db.clone(), ai.clone());
-    let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai);
+    let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai, chat.clone());
     let (notifier, _outbox) = crate::app::notify::channel();
     // Dead base URL: state logic under test never talks to the network.
     let cyberspace = crate::app::chat::cyberspace::svc::CyberspaceService::new(
@@ -3335,7 +3381,7 @@ async fn auto_mode_requests_fire_without_a_pending_placeholder() {
     let translation = crate::app::ai::translate::TranslationService::new(db.clone(), ai.clone());
     let summary = crate::app::ai::summary::SummaryService::new(db.clone(), ai.clone());
     let mut translation_events = translation.subscribe();
-    let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai);
+    let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai, chat.clone());
     let (notifier, _outbox) = crate::app::notify::channel();
     let mut state = ChatState::new(
         ChatServices {
@@ -3438,7 +3484,7 @@ async fn a_name_hit_waits_for_its_message_then_lands() {
     let ai = crate::app::ai::svc::AiService::new(false, None);
     let translation = crate::app::ai::translate::TranslationService::new(db.clone(), ai.clone());
     let summary = crate::app::ai::summary::SummaryService::new(db.clone(), ai.clone());
-    let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai);
+    let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai, chat.clone());
     let (notifier, _outbox) = crate::app::notify::channel();
     let mut state = ChatState::new(
         ChatServices {
@@ -3589,7 +3635,7 @@ async fn author_shared_translations_show_without_auto_mode_or_t() {
     let translation = crate::app::ai::translate::TranslationService::new(db.clone(), ai.clone());
     let summary = crate::app::ai::summary::SummaryService::new(db.clone(), ai.clone());
     let mut translation_events = translation.subscribe();
-    let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai);
+    let articles = crate::app::chat::news::svc::ArticleService::new(db.clone(), ai, chat.clone());
     let (notifier, _outbox) = crate::app::notify::channel();
     let mut state = ChatState::new(
         ChatServices {
@@ -4426,4 +4472,115 @@ fn visual_order_moves_favorited_synthetic_entries_out_of_core() {
         order_for(HashSet::from([RoomSection::Favorites])),
         vec![RoomSlot::Room(lounge), RoomSlot::Notifications]
     );
+}
+
+/// Enter on a YouTube link hands the player the title oEmbed gave its
+/// thumbnail; before it lands, or without one, the player says
+/// `YouTube video`. A reply that only quotes the link watches nothing.
+#[tokio::test]
+async fn selected_video_carries_the_thumbnail_title() {
+    use late_core::models::chat_message::{ChatMessage, ChatMessageParams};
+    use late_core::models::chat_room::ChatRoom;
+    use late_core::models::chat_room_member::ChatRoomMember;
+
+    let test_db = crate::test_helpers::new_test_db().await;
+    let client = test_db.db.get().await.expect("db client");
+    let viewer = late_core::test_utils::create_test_user(&test_db.db, "video_viewer").await;
+    let lounge = ChatRoom::ensure_lounge(&client).await.expect("lounge");
+    ChatRoomMember::join(&client, lounge.id, viewer.id)
+        .await
+        .expect("join viewer");
+    let link = ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: lounge.id,
+            user_id: viewer.id,
+            body: "https://youtu.be/dQw4w9WgXcQ".to_string(),
+        },
+    )
+    .await
+    .expect("link message");
+    let reply = ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: lounge.id,
+            user_id: viewer.id,
+            body: "> @video_viewer: https://youtu.be/dQw4w9WgXcQ\nclassic".to_string(),
+        },
+    )
+    .await
+    .expect("reply message");
+
+    let mut state = counter_test_state(&test_db, viewer.id);
+    load_room_tail(&mut state, lounge.id, reply.id).await;
+    state.selected_message_id = Some(link.id);
+
+    let title = |state: &ChatState| {
+        state
+            .selected_video_in_room(lounge.id)
+            .map(|request| request.title)
+    };
+    assert_eq!(title(&state), Some("YouTube video".to_string()));
+
+    state.inline_image_cache.insert(
+        link.id,
+        InlinePreview::Video {
+            picture: Vec::new(),
+            title: Some("Never Gonna Give You Up".to_string()),
+        },
+    );
+    assert_eq!(title(&state), Some("Never Gonna Give You Up".to_string()));
+
+    state.selected_message_id = Some(reply.id);
+    assert_eq!(title(&state), None);
+}
+
+/// A room's tail can land before the room list that names the room: the
+/// join fires both loads at once, and the tail is the lighter query. The
+/// tail waits for its room instead of being dropped, or the pane says "No
+/// messages yet" until something asks again, which nothing does.
+#[tokio::test]
+async fn a_tail_that_lands_before_its_room_waits_for_the_room_list() {
+    use late_core::models::chat_message::{ChatMessage, ChatMessageParams};
+    use late_core::models::chat_room::ChatRoom;
+    use late_core::models::chat_room_member::ChatRoomMember;
+    use late_core::models::game_room::GameKind;
+
+    let test_db = crate::test_helpers::new_test_db().await;
+    let client = test_db.db.get().await.expect("db client");
+    let user = late_core::test_utils::create_test_user(&test_db.db, "early_tail").await;
+    let room = ChatRoom::get_or_create_game_room(&client, GameKind::Poker, "early-tail")
+        .await
+        .expect("game room");
+    ChatRoomMember::join(&client, room.id, user.id)
+        .await
+        .expect("join");
+    let message = ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: room.id,
+            user_id: user.id,
+            body: "dealt before the list".to_string(),
+        },
+    )
+    .await
+    .expect("message");
+
+    let (mut state, _cyberspace) = chat_state_with_cyberspace(&test_db, user.id);
+    assert!(
+        state.rooms.iter().all(|(known, _)| known.id != room.id),
+        "the room list has not landed yet"
+    );
+    state.merge_room_tail(room.id, vec![message.clone()]);
+
+    tick_until(&mut state, "the room list", |state| {
+        state.rooms.iter().any(|(known, _)| known.id == room.id)
+    })
+    .await;
+    let bodies: Vec<&str> = state
+        .messages_for_room(room.id)
+        .iter()
+        .map(|message| message.body.as_str())
+        .collect();
+    assert_eq!(bodies, vec!["dealt before the list"]);
 }

@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::marketplace::{CHAT_BADGE_SLOT, CHAT_FLAG_SLOT};
 use super::profile_award::{
-    CROWN_AWARD_CATEGORY, MILESTONE_AWARD_CATEGORIES, PROFILE_AWARD_RANK_LIMIT, top_badge_per_game,
+    MILESTONE_AWARD_CATEGORIES, PROFILE_AWARD_RANK_LIMIT, top_badge_per_game,
 };
 use super::statusline::{
     StatusComponentSetting, default_statusline_components, parse_statusline_components,
@@ -746,6 +746,7 @@ const START_WITH_MUSIC_MUTED_KEY: &str = "start_with_music_muted";
 const LANDING_PAGE_KEY: &str = "landing_page";
 const SCREENSAVER_KEY: &str = "screensaver";
 const PAPER_AT_LOGIN_KEY: &str = "paper_at_login";
+const AUTO_RESTART_KEY: &str = "auto_restart";
 const SHOW_WATCH_CHAT_KEY: &str = "show_watch_chat";
 const TERMINAL_IMAGES_KEY: &str = "terminal_images";
 /// Award categories the user keeps off their chat label. Read by the chat
@@ -1069,10 +1070,6 @@ impl User {
                       -- (`extract_hidden_award_categories`). Hiding the top
                       -- rung of a game ladder lets the next one show.
                       AND NOT (COALESCE(u.settings->'hidden_award_categories', '[]'::jsonb) ? pa.category)
-                      -- The crown never joins the group: chat paints last
-                      -- month's winner as a glyph before the name instead
-                      -- (`profile_award::chat_award_categories`).
-                      AND pa.category <> $6
                       AND (
                         pa.period_month = (date_trunc('month', now() AT TIME ZONE 'UTC')::date - INTERVAL '1 month')::date
                         OR pa.category = ANY($5)
@@ -1085,7 +1082,6 @@ impl User {
                     &CHAT_FLAG_SLOT,
                     &PROFILE_AWARD_RANK_LIMIT,
                     &milestone_categories,
-                    &CROWN_AWARD_CATEGORY,
                 ],
             )
             .await?;
@@ -2320,6 +2316,16 @@ pub fn extract_terminal_images(settings: &Value) -> TerminalImagesMode {
 pub fn extract_paper_at_login(settings: &Value) -> bool {
     settings
         .get(PAPER_AT_LOGIN_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Tweak: during a server update, move an idle `late` CLI session to the new
+/// version on its own (late-ssh `app/handoff`). Defaults to true; off keeps
+/// the update banner and the manual reconnect.
+pub fn extract_auto_restart(settings: &Value) -> bool {
+    settings
+        .get(AUTO_RESTART_KEY)
         .and_then(Value::as_bool)
         .unwrap_or(true)
 }

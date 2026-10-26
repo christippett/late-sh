@@ -43,6 +43,7 @@ fn wrap_chat_entry_to_lines_renders_report_card() {
         false,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -68,6 +69,7 @@ fn wrap_chat_entry_to_lines_renders_action_message() {
         Style::default(),
         false,
         false,
+        None,
         None,
         None,
         &[],
@@ -116,6 +118,7 @@ fn wrap_chat_entry_to_lines_appends_reaction_footer() {
         false,
         None,
         None,
+        None,
         &[
             ChatMessageReactionSummary {
                 icon: "🧡".to_string(),
@@ -152,6 +155,7 @@ fn wrap_chat_entry_to_lines_marks_a_gilded_message() {
         false,
         None,
         None,
+        None,
         &[],
         Some(ChatMessageGildSummary {
             top_tier: GildTier::Silver,
@@ -184,6 +188,7 @@ fn wrap_chat_entry_to_lines_marks_a_gilded_message() {
         Style::default(),
         false,
         false,
+        None,
         None,
         None,
         &[ChatMessageReactionSummary {
@@ -222,6 +227,7 @@ fn wrap_chat_entry_to_lines_renders_ready_translation_under_the_body() {
         false,
         None,
         None,
+        None,
         &[],
         None,
         Some(&translation),
@@ -248,6 +254,7 @@ fn wrap_chat_entry_to_lines_renders_no_translation_line_when_hidden() {
         Style::default(),
         false,
         false,
+        None,
         None,
         None,
         &[],
@@ -316,7 +323,6 @@ fn wrap_message_empty_body() {
 #[test]
 fn wrap_message_author_tint_splits_only_the_username() {
     let tint = AuthorTint {
-        crown_range: None,
         range: (4, 9), // "alice" inside "★ alice 🌱" ("★" is 3 bytes)
         title_range: None,
         runner: None,
@@ -356,7 +362,6 @@ fn wrap_message_author_tint_splits_only_the_username() {
 #[test]
 fn wrap_message_author_tint_ignores_bad_ranges() {
     let tint = AuthorTint {
-        crown_range: None,
         range: (0, 99),
         title_range: None,
         runner: None,
@@ -380,7 +385,6 @@ fn wrap_message_author_tint_ignores_bad_ranges() {
 #[test]
 fn wrap_message_name_style_paints_per_char_over_author_style() {
     let tint = AuthorTint {
-        crown_range: None,
         range: (0, 5),
         title_range: None,
         runner: None,
@@ -419,7 +423,6 @@ fn wrap_message_name_style_paints_per_char_over_author_style() {
 #[test]
 fn wrap_message_prints_drunk_word_between_name_and_stamp() {
     let tint = AuthorTint {
-        crown_range: None,
         range: (0, 5),
         title_range: None,
         runner: None,
@@ -456,7 +459,6 @@ fn wrap_message_prints_drunk_word_between_name_and_stamp() {
 fn wrap_message_omits_drunk_word_when_absent() {
     // A name_style-only tint with no drunk word: header stays lean.
     let tint = AuthorTint {
-        crown_range: None,
         range: (0, 5),
         title_range: None,
         runner: None,

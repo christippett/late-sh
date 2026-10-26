@@ -1,13 +1,12 @@
 use crate::app::ai::ghost::GRAYBEARD_MENTION_COOLDOWN;
 use crate::app::common::primitives::thousands;
 use crate::app::common::qr::{Barcode, HalfBlock};
-use crate::app::common::username_effect::{CROWN_GLYPH, CROWN_LAUREATE_GLYPH};
 use late_core::models::{
     article::{NEWS_SHARE_MAX_PAID_PER_DAY, NEWS_SHARE_REWARD_CHIPS},
+    article_save::NEWS_SAVED_LIMIT,
     asterion::ASTERION_DAILY_ESCAPE_PAYOUT,
     chat_message_gild::GildTier,
     chips::{CHIP_FLOOR, Difficulty, INITIAL_CHIP_BALANCE},
-    crown::CROWN_MIN_PRICE,
     media_queue_item::{SONG_QUEUE_MAX_PAID_PER_DAY, SONG_QUEUE_REWARD_CHIPS},
     pot::{POT_MAX_TICKETS_PER_DAY, POT_TICKET_PRICE},
     quest::{DAILY_QUEST_STREAK_BONUS_CHIPS_PER_LEVEL, MAX_DAILY_QUEST_STREAK_BONUS_LEVEL},
@@ -188,12 +187,12 @@ pub(crate) fn bot_app_context() -> String {
     let mut out = String::from(
         "APP CONTEXT:\n\
         CRITICAL FACTS:\n\
-        - Chat username badges render in this order: bracketed last-month leaderboard awards, special role badges, bonsai stage, chat badge, chat flag, burn milestone, then the LIVE tag and the away glyph (\u{1F4A4}), which shows on its own after 30 quiet minutes across every session, or at once with /brb. The crown prints immediately after the name, and a rented title after that, ahead of the whole stack, as \"name \u{1F451}, the night clerk\".\n\
+        - Chat username badges render in this order: bracketed last-month leaderboard awards, special role badges, bonsai stage, chat badge, chat flag, burn milestone, then the LIVE tag and the away glyph (\u{1F4A4}), which shows on its own after 30 quiet minutes across every session, or at once with /brb. A rented title prints immediately after the name, ahead of the whole stack, as \"name, the night clerk\".\n\
         - The Clubhouse (page 0, the Late Lounge tavern) is the landing screen: a walkable ASCII room where everyone online is present. Arrows/hjkl walk, i says something (it floats over your head and lands in #lounge), w waves, x dances, Enter interacts with a landmark. This is where you (@bartender) keep the bar. Out back, through the back door past the end of the counter (or n from anywhere in the Clubhouse), is Nightcap: a quiet six-stool bar with its own chat that only the seated may speak in (1-6 sit or stand, i talks once seated), a fixed drink menu on d (house beer 100, whiskey neat 250, old fashioned 500, top shelf 1,000 chips, r buys the other stools a round; a banked round credit only covers the house beer), c to carve one line into your stool for the next sitter to find, and Esc back inside. No bot, including you, ever answers out there, and what is said at the bar stays there: it is not on Home, not in search, and not in mentions.\n\
         - @bartender pours drinks for Late Chips: mention him (or press t at the bar) to order. There is no fixed menu; he invents each drink's name and prices it 100-1000 chips, never more than the patron can spend while keeping a 100-chip floor untouched. A brand-new patron's first-ever drink is free. He pours only for the person ordering; \"@bartender buy @user a drink\" (or \"I'll get @user a beer\", \"pour @user one\", \"one for @user\", \"@user's next one is on me\") costs 200 chips and puts one drink credit on someone else's tab to redeem when they order, even if they are offline. It expires after 24 hours; a patron can hold at most three. The bar rings it up only as a plain order naming exactly one person: the words have to start the sentence, it is never a question, and never in the same message as a round.\n\
         - @bartender remembers up to sixteen things about each patron from public rooms, copied so they outlast the chat log: recent exchanges (the order, his answer, and what the patron said right after), and anything the patron asked him to remember. Starting a message with \"@bartender remember\" and then the thing (\"@bartender remember I don't drink\") only writes it down: it never orders, pours or charges, and the newest eight of those stick ahead of everything else. \"@bartender forget me\", exactly that and nothing else, wipes everything he remembers about you.\n\
         - Drinking builds a buzz that levels up: 0 sober, 1 tipsy, 2 buzzed, 3 sloshed, 4 wasted. Every non-sober level prints its word beside the name. Once wasted, the bartender cuts a patron off to water or coffee instead of more drinks.\n\
-        - The buzz sobers up on its own over time, no action needed, whether the patron is online or not: it decays 334 points an hour, so reaching wasted wears off in about six hours and even a maxed-out binge is fully sober again half a day later.\n\
+        - The buzz sobers up on its own over time, no action needed, whether the patron is online or not: it decays 667 points an hour, so reaching wasted wears off in about three hours and even a maxed-out binge is fully sober again six hours later.\n\
         - A buzz also comes out in your typing, in public rooms only (never DMs or private rooms). Letters inside a word get shuffled, more of them the drunker you are, but the first and last letter of every word stay put so it always stays readable. Tipsy is the odd stumbled word; wasted is most of the sentence, plus a *hic* dropped mid-sentence in about a third of messages (and once in a while at sloshed). Handles, room slugs, links, and code in backticks are never touched. The slurring is saved with the message, so it does not clear up when you sober up later.\n\
         - There is no separate top-level Chat screen. Home/Dashboard owns the chat room rail and chat center; top-level screens are Clubhouse (0), Home (1), The Arcade (2), Games (3), Artboard (4), People (5), Leaderboards (6), and Calendars (7).\n\
         - Users constantly ask how to see their mentions. The answer: Mentions is an entry in the Home (page 1) room rail, so press 1 and pick Mentions there; or click the \"unread N\" counter in the bottom-left border of the frame, right of the key hints; or press Ctrl+/ and type mentions. The unread count lives in the bottom border, selecting Mentions marks it read, and Enter previews a mention with its surrounding messages (Enter again jumps to it).\n\
@@ -235,7 +234,7 @@ pub(crate) fn bartender_app_context() -> String {
     - Tab / Shift+Tab cycles screens; number keys 0-7 jump straight to one.\n\
     - Ctrl+F opens Zen from anywhere and the same chord hands you back (Esc does not leave it): Rice, your bonsai, the reef (live for everyone, fish once the Shop unlocks them), pet, the room Home has selected, music, a clock, and the lobby as tiles you arrange yourself: Tab and the arrows focus, space opens the tile picker for a tile, S splits, X closes, < > change width and { } height, F flips, z zooms it over the whole screen, b g t restyle borders, gaps, and titles, R resets, ? opens the Zen guide, the layout is saved per account; each tile names its own keys on the right of its title; up to ten chat tiles each bound to a room ([ ] rebind the focused one, Ctrl+/ or /picker picks its room from the list, i or Enter write in it, j k select in it; the focused chat is the active one, the others watch), w opens Bonsai Care as on every page, a feeds the tank (the first feed of the day pays 100 chips); the pet has no key: click it to pet it (the first pet of the day pays 100 chips), and it reads the rest of your session itself).\n\
     - Ctrl+O opens Settings from anywhere. Ctrl+G opens the Lobby (daily correspondence games plus the fixed house tables: Poker, Blackjack, Asterion, Tron, Super Snake). Ctrl+S opens the Shop (active games, profile/job editors, and Artboard input keep their local binding); /shop is its typed fallback.\n\
-    - The top of the #lounge chat on Home is the now strip (its `── now ──` rule), up whenever something just happened in the house; it cannot be turned off. Things take turns in the order they happened, links shared to News ahead of the rest: a link stays five minutes (o opens it, r replies to it in #lounge; shares are not posted into the chat itself), a track queued in the YouTube booth at least two, a daily move or result at least one, and with nothing waiting the last one stays up to five. A pool player lining up a shot is shown over anything but a link while the cue moves. o or a click on a match opens it; on a track it tunes you in to YouTube, or opens the booth if you are already there.\n\
+    - The top of the #lounge chat on Home is the now strip (its `── now ──` rule), up whenever something just happened in the house; it cannot be turned off. Things take turns in the order they happened: a track queued in the YouTube booth stays at least two minutes, a daily move or result at least one, and with nothing waiting the last one stays up to five. A pool player lining up a shot is shown over whatever is up while the cue moves. A link shared to News is not on the strip: it goes into #lounge as the sharer's own line, drawn as a card with the story's title, summary points and art, and Enter on the card opens the story. o or a click on a match opens it; on a track it tunes you in to YouTube, or opens the booth if you are already there.\n\
     - When a terminal swallows a chord, the composer has a typed fallback that does the same thing: /settings (Ctrl+O), /lobby (Ctrl+G), /zen (Ctrl+F), /redraw (Ctrl+R), /guide (?).\n\
     - Ctrl+/ opens jump search across rooms and DMs (/picker types it); typing ?query searches messages.\n\
     - Home's room rail also holds RSS, News, Cyberspace, Voice, Mentions, and Discover. When a patron asks where their mentions are: press 1, pick Mentions in the rail, or click the \"unread N\" counter in the bottom-left border, right of the key hints.\n\
@@ -515,23 +514,7 @@ fn chips_help_lines() -> Vec<String> {
         "  Every track pays, repeats included: putting a song on again is worth the same as putting on one nobody has heard.".to_string(),
         format!("  At most {SONG_QUEUE_MAX_PAID_PER_DAY} tracks a day (UTC) are paid, and that is the only limit there is. Tracks past that still queue, for nothing."),
         "".to_string(),
-        "9. The crown".to_string(),
-        format!("  One slot, one holder, one {CROWN_GLYPH} after their name in every message they send."),
-        "  /crown shows who wears it and what taking it costs. /crown take buys it at that price.".to_string(),
-        format!("  A vacant crown costs {}. After that it costs 1.5x whatever the holder paid, rounded up,", thousands(CROWN_MIN_PRICE)),
-        "  so the price ratchets on its own and nobody sets it.".to_string(),
-        "  /crown take N bids N chips instead, any amount at or above the price. You pay all of it,".to_string(),
-        "  and the next price is 1.5x your bid: overpay to put the crown out of a rival's reach.".to_string(),
-        "  A bid that the price has climbed past by the time it lands is refused, and nothing is charged.".to_string(),
-        "  Every chip is destroyed: the crown pays nobody, and none of it comes back into the economy.".to_string(),
-        "  There is no cooldown: anyone can take it off you the moment you have it, at 1.5x. You cannot take a crown you already wear.".to_string(),
-        "  It empties at the end of every UTC month: the crown goes back to vacant, and whoever wore it".to_string(),
-        format!("  when the month ended wears a {CROWN_LAUREATE_GLYPH} before their name in chat all the next month,"),
-        "  and keeps the permanent [CRWN] badge for that month on their profile.".to_string(),
-        "  Every takeover posts to #lounge, naming both players.".to_string(),
-        "  Like Shop spending, the crown does not count against Top Chips.".to_string(),
-        "".to_string(),
-        "10. Burn milestones".to_string(),
+        "9. Burn milestones".to_string(),
         format!("  Three permanent badges in the Shop's Ultimates tab: Wick {} \u{1F56F}\u{FE0F}, Fuse {} \u{1F9E8}, Furnace {} \u{1F30B}.",
             thousands(50_000),
             thousands(150_000),
@@ -540,9 +523,9 @@ fn chips_help_lines() -> Vec<String> {
         "  A milestone never expires and is never equipped: it shows on top of whatever badge and flag you are renting,".to_string(),
         "  so nothing you rent can hide one. Own two and the dearer one shows.".to_string(),
         "  Each unlock posts to #lounge, naming the price.".to_string(),
-        "  Like the crown and Shop spending, they do not count against Top Chips.".to_string(),
+        "  Like Shop spending, they do not count against Top Chips.".to_string(),
         "".to_string(),
-        "11. The pot".to_string(),
+        "10. The pot".to_string(),
         format!("  A raffle, drawn once a week, Monday 21:00 UTC. Tickets cost {} chips each.", thousands(POT_TICKET_PRICE)),
         "  /pot shows the pot, the tickets in it, what you hold and paid, how many more you can buy today, and how long is left.".to_string(),
         "  /pot buy N buys N tickets.".to_string(),
@@ -553,12 +536,12 @@ fn chips_help_lines() -> Vec<String> {
         "  The winner is announced in #lounge, so you can read it when you get back.".to_string(),
         "  The pot you win counts toward Top Chips; the tickets you buy, like any other spend, do not.".to_string(),
         "".to_string(),
-        "12. Gifts".to_string(),
+        "11. Gifts".to_string(),
         "  /gift @user <n>    send chips to someone, with an optional note after the amount".to_string(),
         format!("  A gift only goes through while it leaves you at or above {floor} chips."),
         "  Gifts move chips between players; they do not create new ones.".to_string(),
         "".to_string(),
-        "13. Inviting friends".to_string(),
+        "12. Inviting friends".to_string(),
         "  Settings (Ctrl+O) > Account > Invites shows your own command: ssh invite-<code>@late.sh".to_string(),
         "  A friend who joins with it is yours. Joined without it? Type the code there in your first week.".to_string(),
         format!(
@@ -585,7 +568,6 @@ fn chips_help_lines() -> Vec<String> {
         "  Poker and Blackjack bets.".to_string(),
         "  Gifts you send.".to_string(),
         "  Gilds you buy on other people's messages.".to_string(),
-        "  The crown (/crown take), which burns the whole price.".to_string(),
         format!("  Pot tickets (/pot buy N) at {} chips each, of which a fifth is burned at the draw.", thousands(POT_TICKET_PRICE)),
         "  Burn milestones and the two ultimate spells (1,000,000 each), the top of the Shop.".to_string(),
         "  Monthly Top Chips counts what you earned: dailies, quests, doors, the arena, prizes, the pot, gilds received. Table bets and wins, gifts, invite rewards, the starting chips, and every kind of spending stay off it.".to_string(),
@@ -634,7 +616,6 @@ pub(crate) fn chat_help_lines(keep_composer_focused: bool) -> Vec<String> {
         "  /active            list active users",
         "  /map               where people are, on a world map: the Map section of People",
         "  /gift @user <n>    send chips, with an optional note after the amount",
-        "  /crown             who wears the crown; /crown take buys it",
         "  /pot               the weekly pot; /pot buy N buys N tickets",
         "  /friends           list friends",
         "  /friend [@user]    list friends, or mark a user as a friend",
@@ -664,11 +645,15 @@ pub(crate) fn chat_help_lines(keep_composer_focused: bool) -> Vec<String> {
         "                     messages), rooms you are not in, what we were reading; pops",
         "                     once a day at login (after the tour, on a first visit)",
         "                     (Ctrl+O Tweaks → Daily paper at login turns the pop off)",
+        "                     on the web too: late.sh/paper (announcements, what we were",
+        "                     reading, outside; never the room columns), RSS at late.sh/paper/feed.xml",
         "  /paper 2026-09-14  an older edition, if graybeard printed one that day",
         "                     ←/→ (h/l) in the paper leaf to the previous/next edition",
         "                     j/k, ↑/↓ or wheel scroll; drag the scrollbar or click",
         "                     its track to page. Esc/q/Enter or [x] closes the paper.",
         "                     admins: /paper print, preview, reset",
+        "  /herald            admins: the social accounts' switch and press. on / off flip the",
+        "                     daily post; status, preview; post sends today's picture now",
         "",
         "Global chat keys",
         "  Ctrl+O             open your settings modal anywhere",
@@ -695,7 +680,8 @@ pub(crate) fn chat_help_lines(keep_composer_focused: bool) -> Vec<String> {
         "  f then f          list reaction owners",
         "  Enter              jump to loaded original for selected reply",
         "  Enter              open selected image when present",
-        "  g                  jump to a reply's original even if it has an image",
+        "  Enter              watch selected YouTube link when present",
+        "  G                  jump to a reply's original even if it has an image or video",
         "  r                  reply to selected message",
         "  e                  edit selected message",
         "  dd                 delete selected message (press d twice)",
@@ -886,7 +872,7 @@ fn social_help_lines() -> Vec<String> {
         "  s                 share selected entry through News processing",
         "  d                 dismiss selected entry",
         "  r                 refresh RSS now",
-        "  After sharing, the URL becomes a public News article and goes up on the #lounge now strip.",
+        "  After sharing, the URL becomes a public News article and its card goes up in #lounge.",
         "",
         "Cyberspace",
         "  cyberspace.online is a small, human social network like ours; late.sh",
@@ -1006,9 +992,13 @@ fn directory_help_lines() -> Vec<String> {
         "  /jobs             open the section from anywhere; /jobs post opens the form; admins: /jobs pull, /jobs release",
         "",
         "Public web profile",
-        "  /profiles         public index of work profiles; open first, then casual, then not-looking",
+        "  /profiles         public index of work profiles; most recent login first",
         "  /profiles/{slug}  detail page created from your work card's slug",
         "  Profile fields    headline, @username, status, work type, location, summary, skills, contact, links",
+        "  Verified on Mastodon  contact and links carry rel=\"me\": put your Mastodon profile URL",
+        "                    (https://your.instance/@you) in links, and late.sh/profiles/{slug} in your",
+        "                    Mastodon profile's links, and Mastodon shows the link verified",
+        "  Preview card      a pasted profile link unfurls into your runner's poster (late.sh/profiles/{slug}/poster.png)",
         "  Bio               comes from Settings > Bio; rendered as sanitized Markdown when non-empty",
         "  late.fetch        comes from identity settings: created date, theme, IDE, terminal, OS, languages",
         "  Showcases         all your projects appear below the profile when available",
@@ -1061,10 +1051,8 @@ fn arcade_help_lines() -> Vec<String> {
         "  [LA]      Lateris (Tetris)",
         "  [24#]     2048",
         "  [SN]      Snake",
-        "  [CRWN]    The Crown, to whoever wore it when the month ended.",
-        "            Profile only: in chat the winner wears a crown before their name.",
         "  [LATE]    Late Time, to whoever spent the most time online that month.",
-        "            First place only, so no rank digit either.",
+        "            First place only, so no rank digit.",
         "  [DRNK]    Top Drinkers, to whoever took the most buzz from drinks that month.",
         "            First place only, no rank digit, no chips.",
         "  [ART]     Artboard Gallery: your most applauded piece of the month. Top 3 by best piece,",
@@ -1115,16 +1103,16 @@ fn lobby_help_lines() -> Vec<String> {
         "  i                 type into it while it is shown; a clicked message takes the message keys until Esc lets it go",
         "",
         "The now strip heads #lounge on Home with one thing happening in the house:",
-        "  a link shared to News, a daily match move or result (yours included), or a track queued in the YouTube booth",
-        "  things take turns in the order they happened, links ahead of the rest",
-        "  a link stays five minutes, a track at least two, a move or a result (with the final board) at least one",
+        "  a daily match move or result (yours included), or a track queued in the YouTube booth",
+        "  things take turns in the order they happened",
+        "  a track stays at least two minutes, a move or a result (with the final board) at least one",
         "  with nothing waiting the last one stays up to five minutes, then the strip goes away on its own",
         "  anything that waited ten minutes for its turn is dropped",
-        "  a pool player lining up a shot is shown over anything but a link (you see their cue move)",
+        "  a pool player lining up a shot is shown over whatever is up (you see their cue move)",
         "  o                 open what it is showing (a click on it does the same):",
-        "                    read the link, watch the match, or tune in to YouTube (already there, it opens the booth)",
+        "                    watch the match, or tune in to YouTube (already there, it opens the booth)",
         "                    a result opens nothing",
-        "  r                 reply in #lounge to the link it is showing (shares are not posted into the chat)",
+        "  a link shared to News is never on the strip: it is its card in #lounge (Enter on it reads the story)",
         "",
         "Daily matches",
         "  c                 post an open chess, chess960, battleship, connect4, reversi, checkers, backgammon, briscola, cribbage, gin, 8ball, 9ball, or snooker challenge",
@@ -1180,7 +1168,7 @@ fn lobby_help_lines() -> Vec<String> {
         "  PageUp/PageDown   scroll embedded chat",
         "  r/e/d/p/c/f       reply, edit, delete, profile, copy, react selected chat message",
         "  t                 translate the selected chat message",
-        "  g                 jump to a reply's original even if it has an image",
+        "  G                 jump to a reply's original even if it has an image or video",
         "  Arrows            game gets first chance; otherwise embedded chat handles them",
         "",
         "Economy",
@@ -1320,7 +1308,8 @@ fn vintagestory_help_lines() -> Vec<String> {
         "Vintage Story",
         "",
         "late.sh runs a whitelist-only friends survival server for Vintage Story: the",
-        "official server, no mods. It is not played in the terminal: you join from the game.",
+        "official server plus a few mods. It is not played in the terminal: you join",
+        "from the game.",
         "  3                 open the Games hub, then select the Vintage Story card",
         "                    (the card shows the game version and world settings)",
         "  Ctrl+J / Ctrl+K   scroll the card when it is taller than your terminal",
@@ -1331,6 +1320,14 @@ fn vintagestory_help_lines() -> Vec<String> {
         "  account           your Vintage Story account; the server checks it with Anego",
         "  whitelist         DM a moderator (/dm) with your exact Vintage Story username",
         "  then              Multiplayer, add vs.late.sh as a server, and connect",
+        "",
+        "Mods (every player needs them; the game offers to download them when you join)",
+        "  Carry On          pick up and carry chests and other blocks",
+        "  ProspectTogether  prospecting results shared on everyone's map",
+        "  Auto Map Markers  map markers for ores, traders, and more, added for you",
+        "  QP's Chisel Tools better chiseling tools",
+        "  VS Roofing        gridless, vanilla-style roofs",
+        "  BetterRuins       many more ruins, above and below ground",
         "",
         "Land claims (built into the game)",
         "  /land claim new   start a claim, then mark two opposite corners:",
@@ -1439,7 +1436,7 @@ fn overview_lines() -> Vec<String> {
         "  Tab / Shift+Tab   next / previous screen",
         "  0-7               jump straight to a screen",
         "  ?                 open this guide",
-        "  q                 open quit confirm (press q again to leave)",
+        "  q                 open quit confirm (press q again to leave; r restarts the session in the late CLI)",
         "  Ctrl+O            open Settings",
         "  Ctrl+G            open / close the Lobby (daily games + house tables)",
         "  Ctrl+F            open / close Zen",
@@ -1576,6 +1573,9 @@ fn news_help_lines() -> Vec<String> {
         "  Full chip rules live in the Chips tab.".to_string(),
         "".to_string(),
     ];
+    let saved_shelf_line = format!(
+        "  s keeps up to {NEWS_SAVED_LIMIT} stories on your own shelf, on any device you sign in from."
+    );
     lines.extend(
         [
             "How it works",
@@ -1586,13 +1586,20 @@ fn news_help_lines() -> Vec<String> {
             "  Enter in composer submit link",
             "  Esc               cancel URL entry",
             "  j / k             browse stories",
+            "  s                 save the selected story for later, or let it go",
             "  r                 reply in #lounge quoting the selected story",
             "  d                 delete your own story",
             "  /                 toggle filter to only your stories",
-            "  o on now strip    open the reader on that story (a video plays, when it can)",
+            "  Enter on a card   open the reader from a story's #lounge card",
+            "",
+            "Saved for later",
+            saved_shelf_line.as_str(),
+            "  The shelf sits above the feed under a \"saved\" rule, newest save first, and a saved story",
+            "  stays readable after the feed has moved on. s on a saved story takes it off.",
+            "  The feed shows the newest forty stories, each with its link and summary.",
             "",
             "Watching",
-            "  A YouTube card reads \"watch\". w plays it right here, over the page.",
+            "  A YouTube video card reads \"watch\". w plays it right here, over the page.",
             "  Needs the late CLI, a Kitty-graphics terminal (kitty, Ghostty, WezTerm, Konsole, Rio),",
             "  no tmux or screen, and mpv 0.36+ with yt-dlp installed on your machine.",
             "  Missing something? w shows exactly what, and how to get it.",
@@ -1604,6 +1611,10 @@ fn news_help_lines() -> Vec<String> {
             "  f                 full screen / window",
             "  Esc               stop and close",
             "  Close partway through and the card reads where you left it; w resumes there.",
+            "  A YouTube link in chat plays the same way: Enter (or a click) on its message.",
+            "  Its thumbnail carries the video's title. A reply quoting the link has no thumbnail:",
+            "  Enter on it jumps to the original message, and Enter again plays it.",
+            "  Closed partway, Enter on it again picks up there until you log off.",
             "",
             "The reader",
             "  It shows the article's own text in the terminal once late.sh has fetched it.",
@@ -1617,6 +1628,7 @@ fn news_help_lines() -> Vec<String> {
             "  c                 copy the story's link",
             "  w                 watch it, on a YouTube story",
             "  r                 reply in #lounge quoting the story",
+            "  s                 save the story for later, or let it go",
             "  d                 delete your own story",
             "  N                 jump to News with story selected",
             "  Esc               close",
@@ -1625,7 +1637,7 @@ fn news_help_lines() -> Vec<String> {
             "  1. AI researches the link and writes a compact summary",
             "  2. ASCII art / preview is generated when possible",
             "  3. the story lands in the shared feed for everyone",
-            "  4. it heads the #lounge chat on Home as the now strip for five minutes (o reads it, r replies)",
+            "  4. its card goes up in #lounge as your line: title, summary, art (Enter on it opens the story)",
             "  5. the chips land in your balance",
             "  6. late.sh fetches the page's text for the reader (not for videos or X posts)",
             "",
@@ -1637,7 +1649,7 @@ fn news_help_lines() -> Vec<String> {
             "  RSS is a private inbox in the Home room rail.",
             "  RSS/Atom subscriptions are managed in Settings > RSS.",
             "  Sharing an RSS entry sends its URL through this News pipeline.",
-            "  Only shared entries become public News articles and go up on the #lounge now strip.",
+            "  Only shared entries become public News articles and post a card in #lounge.",
             "",
             "Notes",
             "  summaries are intentionally compact for terminal reading",
@@ -1830,6 +1842,8 @@ fn settings_help_lines() -> Vec<String> {
         "    Land on                       where a session starts: Clubhouse (default), Home, or Zen; first sessions always start in the Clubhouse"
             .to_string(),
         "    Daily paper at login          show or skip the daily paper pop after login".to_string(),
+        "    Auto restart on update        on (default): when the server updates and you have not typed for 5 minutes, the late CLI (native mode) reconnects you on its own, on the same page; the radio keeps playing, YouTube restarts. Voice, a video, or an unsent message or link keep you put. Off, or plain ssh: the update banner asks you to reconnect"
+            .to_string(),
         "".to_string(),
         "Statusline tab".to_string(),
         "  The bottom-left border of the app frame is a status bar you arrange yourself."
@@ -1842,7 +1856,7 @@ fn settings_help_lines() -> Vec<String> {
             .to_string(),
         "  Care counts the bonsai, tank, and pet still waiting on today's care; click it for Zen."
             .to_string(),
-        "  Now reads what the #lounge now strip shows (a stream, a match, a booth track, a shared link); click it to open that."
+        "  Now reads what the #lounge now strip shows (a stream, a match, a booth track, a board event); click it to open that."
             .to_string(),
         "  Status segments with a destination are clickable and jump to what they count."
             .to_string(),
@@ -2247,6 +2261,7 @@ Music Booth (v then v)
     PageUp/PageDown jump 8 rows
     /               filter the list
     Enter           queue selected track fresh
+    f               favorite the selected track, or unfavorite a starred one
     d               delete selected track (staff)
 
   Under Now Playing sits the track's YouTube link, so you can select it by hand if your terminal doesn't pass the copy through.
@@ -2254,6 +2269,7 @@ Music Booth (v then v)
   Bringing a track pays you 100 chips, whether you submit a URL or queue one from History, repeats included: at most 5 a day (UTC), and past that it still queues, it just pays nothing.
   The queue is ordered by score, so upvotes pull tracks toward the front. You can't vote on the track that's already playing, but you can skip-vote it.
   History keeps up to 200 unique played tracks, most recently played first, so whatever is playing right now sits at the top. There are no history votes. Requeued history tracks start with 0 live queue votes.
+  Your favorites (up to 20, yours alone, starred) sit on top of History and never fall off it, even once the track leaves the 200; unfavorite one with f to make room.
 
 Skip the current track
   v then s          add your vote to skip. The track skips once enough active YouTube-source users agree.

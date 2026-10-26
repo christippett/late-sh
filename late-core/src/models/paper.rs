@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 /// The room the paper prints verbatim at the top instead of as a column.
 pub const ANNOUNCEMENTS_SLUG: &str = "announcements";
+/// The most `#announcements` posts one edition carries, newest kept.
+pub const ANNOUNCEMENTS_LIMIT: i64 = 50;
 
 /// Where a page is in its life. Stored as text, parsed on read, and never
 /// defaulted: an unknown status in the table is a bug worth a crash.
@@ -57,9 +59,12 @@ impl PaperStatus {
 }
 
 /// The edition-level sections. A new section means a new variant, a wider
-/// CHECK constraint in a migration, and a printer for it in the sweeper.
+/// CHECK constraint in a migration (173, then 258), and a printer for it
+/// in the sweeper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaperSectionKind {
+    /// The covered day in numbers, from late.sh's own rows and no model.
+    Yesterday,
     /// What the clubhouse shared into News that day.
     Reading,
     /// The grounded look at the outside world.
@@ -69,13 +74,35 @@ pub enum PaperSectionKind {
 impl PaperSectionKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Yesterday => "yesterday",
             Self::Reading => "reading",
             Self::Outside => "outside",
         }
     }
 
+    /// The section's heading as the paper prints it, in every surface's
+    /// capitals: the terminal page, the web page and its card.
+    pub const fn heading(self) -> &'static str {
+        match self {
+            Self::Yesterday => "YESTERDAY ON LATE.SH",
+            Self::Reading => "WHAT WE WERE READING",
+            Self::Outside => "OUTSIDE",
+        }
+    }
+
+    /// The heading in a sentence: the feed's column titles, the herald's
+    /// alt text.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Yesterday => "Yesterday on late.sh",
+            Self::Reading => "What we were reading",
+            Self::Outside => "Outside",
+        }
+    }
+
     fn parse(value: &str) -> Result<Self> {
         match value {
+            "yesterday" => Ok(Self::Yesterday),
             "reading" => Ok(Self::Reading),
             "outside" => Ok(Self::Outside),
             other => bail!("unknown paper section {other:?}"),
@@ -162,6 +189,17 @@ pub struct PaperEdition {
 }
 
 impl PaperEdition {
+    /// The half-open window an edition covers: the whole UTC day before
+    /// it. Edition dated D reads the day D-1, on every surface that reads
+    /// one.
+    pub fn window(edition: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
+        let ceiling = edition
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight exists on every date")
+            .and_utc();
+        (ceiling - chrono::Duration::days(1), ceiling)
+    }
+
     /// Both tables for `edition`. Rooms come back only while still public:
     /// a room made private after its page was printed keeps the row and
     /// loses the reader, the same line `/summary` draws.
@@ -220,6 +258,17 @@ impl PaperEdition {
                 .sections
                 .iter()
                 .any(|section| section.status == PaperStatus::Ready)
+    }
+
+    /// The text of `kind`'s column when the press printed it, `None`
+    /// otherwise: the one rule for whether a column is out, for every
+    /// surface that shows one (the terminal paper, the web page and its
+    /// card, the herald).
+    pub fn ready_text(&self, kind: PaperSectionKind) -> Option<&str> {
+        self.sections
+            .iter()
+            .find(|section| section.section == kind && section.status == PaperStatus::Ready)
+            .and_then(|section| section.text.as_deref())
     }
 
     /// True once the sweeper has reached this edition: at least one row,
@@ -571,6 +620,29 @@ impl PaperSectionRow {
             );
         }
         Ok(())
+    }
+
+    /// The closest edition strictly before or after `from` with a printed
+    /// section of any kind: how the public web leafs, since it prints the
+    /// sections and never a room's column. Swept days with only quiet
+    /// sections, or only room pages, are stepped over.
+    pub async fn nearest_ready(
+        client: &Client,
+        from: NaiveDate,
+        step: EditionStep,
+    ) -> Result<Option<NaiveDate>> {
+        let query = match step {
+            EditionStep::Earlier => {
+                "SELECT MAX(edition) AS edition FROM paper_sections
+                 WHERE status = 'ready' AND edition < $1"
+            }
+            EditionStep::Later => {
+                "SELECT MIN(edition) AS edition FROM paper_sections
+                 WHERE status = 'ready' AND edition > $1"
+            }
+        };
+        let row = client.query_one(query, &[&from]).await?;
+        Ok(row.get("edition"))
     }
 
     /// The newest `limit` printed pages of `section` from editions before

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use late_core::models::article::NEWS_SHARE_REWARD_CHIPS;
+use late_core::models::article::{ArticleFeedItem, NEWS_SHARE_REWARD_CHIPS};
 use late_core::models::chat_message_gild::ChatMessageGildSummary;
 use late_core::models::chat_message_reaction::ChatMessageReactionSummary;
 use late_core::models::chat_poll::{ActiveChatPoll, ChatPollOptionSummary};
@@ -9,7 +9,7 @@ use late_core::models::{
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
@@ -27,7 +27,7 @@ use crate::app::common::{
     overlay::{Overlay, draw_overlay},
     primitives::row_with_hint,
     theme,
-    username_effect::{CROWN_GLYPH, CROWN_LAUREATE_GLYPH, ResolvedName},
+    username_effect::ResolvedName,
 };
 use crate::app::deadchannel::runner::state::PORTRAIT_WIDTH;
 use crate::app::files::{
@@ -40,10 +40,10 @@ use crate::app::hub::shop::svc::ActiveChatRoomEffect;
 use crate::usernames::UsernameLookup;
 
 use super::state::{
-    MatchPresence, MentionMatch, ROOM_JUMP_KEYS, RoomSection, RoomSlot, RoomVisualOrderInput,
-    SelectedRoomSlotState, SelectionScroll, TranslationDisplay, compare_dm_rooms_for_nav,
-    dm_is_promoted_unread, dm_peer_is_ignored, is_chat_list_room, is_deadchannel_room,
-    is_selected_slot, synthetic_favorite_id, synthetic_slot_for_favorite_id,
+    InlinePreview, MatchPresence, MentionMatch, ROOM_JUMP_KEYS, RoomSection, RoomSlot,
+    RoomVisualOrderInput, SelectedRoomSlotState, SelectionScroll, TranslationDisplay,
+    compare_dm_rooms_for_nav, dm_is_promoted_unread, dm_peer_is_ignored, is_chat_list_room,
+    is_deadchannel_room, is_selected_slot, synthetic_favorite_id, synthetic_slot_for_favorite_id,
     visual_order_for_rooms,
 };
 use super::ui_text::{
@@ -167,7 +167,6 @@ pub struct DashboardChatView<'a> {
     pub name_flicker: Option<(Uuid, u64)>,
     pub translations: &'a HashMap<Uuid, TranslationDisplay>,
     pub translation_hidden: &'a HashSet<Uuid>,
-    pub active_room_effects: &'a [ActiveChatRoomEffect],
     pub active_poll: Option<&'a ActiveChatPoll>,
     /// The #lounge live strip (`app/live/`): one thing that just happened
     /// in the house, drawn above the poll strip. `None` when nothing is
@@ -179,7 +178,10 @@ pub struct DashboardChatView<'a> {
     /// which take the #lounge topic row for the day. `None` elsewhere and
     /// on any other day.
     pub board_day: Option<String>,
-    pub inline_images: &'a HashMap<Uuid, InlineImagePreview>,
+    pub inline_images: &'a HashMap<Uuid, InlinePreview>,
+    /// News shares' #lounge cards by message id: those messages draw as
+    /// the card.
+    pub news_cards: &'a HashMap<Uuid, ArticleFeedItem>,
     pub keep_composer_focused: bool,
     /// Cell that, when present, receives the composer block rect so mouse
     /// hit-testing in `app::input` can detect double-clicks into the bar.
@@ -200,7 +202,7 @@ pub struct DashboardChatView<'a> {
 pub struct ImageModalView<'a> {
     pub message_id: Uuid,
     pub url: &'a str,
-    pub preview: Option<&'a InlineImagePreview>,
+    pub preview: Option<&'a InlinePreview>,
     pub terminal_image: Option<&'a TerminalImageData>,
     pub terminal_image_protocol: Option<TerminalImageProtocol>,
 }
@@ -761,122 +763,6 @@ fn draw_activity_ticker(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_room_page_effects(frame: &mut Frame, area: Rect, effects: &[ActiveChatRoomEffect]) {
-    if effects.is_empty() || area.is_empty() {
-        return;
-    }
-    if has_room_effect(effects, "room_glow") {
-        draw_room_glow(frame, area);
-    }
-    if has_room_effect(effects, "room_pulse") {
-        draw_room_pulse(frame, area);
-    }
-    if has_room_effect(effects, "room_spark") {
-        draw_room_sparkles(frame, area);
-    }
-}
-
-fn draw_room_glow(frame: &mut Frame, area: Rect) {
-    if area.width < 4 || area.height < 2 {
-        return;
-    }
-    // A warm halo that breathes in from the edges. It only tints the
-    // background of the outer ring, never stamps glyphs, so text (including
-    // the first message) stays fully readable underneath the light.
-    let phase = Utc::now().timestamp_millis().rem_euclid(2600) as f32 / 2600.0;
-    let breath = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
-    let glow = theme::AMBER_GLOW();
-    let buf = frame.buffer_mut();
-    let max_x = area.right().saturating_sub(1);
-    let max_y = area.bottom().saturating_sub(1);
-    for y in area.y..area.bottom() {
-        for x in area.x..area.right() {
-            let left = x.saturating_sub(area.x);
-            let right = max_x.saturating_sub(x);
-            let top = y.saturating_sub(area.y);
-            let bottom = max_y.saturating_sub(y);
-            let edge_distance = left.min(right).min(top).min(bottom);
-            if edge_distance > 1 {
-                continue;
-            }
-            let base = if edge_distance == 0 { 0.30 } else { 0.14 };
-            let strength = base + 0.10 * breath;
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_bg(blend_room_glow(cell.bg, glow, strength));
-            }
-        }
-    }
-}
-
-fn blend_room_glow(base: Color, glow: Color, t: f32) -> Color {
-    let base = match base {
-        Color::Rgb(..) => base,
-        _ => theme::BG_CANVAS(),
-    };
-    match (base, glow) {
-        (Color::Rgb(br, bg, bb), Color::Rgb(gr, gg, gb)) => {
-            let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-            Color::Rgb(mix(br, gr), mix(bg, gg), mix(bb, gb))
-        }
-        _ => base,
-    }
-}
-
-fn draw_room_pulse(frame: &mut Frame, area: Rect) {
-    if area.width < 4 || area.height < 2 {
-        return;
-    }
-    let tick = Utc::now().timestamp_millis().div_euclid(120) as u16;
-    let wave_x = area.x + tick.wrapping_mul(3) % area.width;
-    let wave_y = area.y + tick % area.height;
-    let buf = frame.buffer_mut();
-    for x in area.x..area.right() {
-        if x.wrapping_add(tick) % 2 == 0
-            && let Some(cell) = buf.cell_mut((x, wave_y))
-        {
-            cell.set_symbol("·").set_fg(theme::SUCCESS());
-        }
-    }
-    for y in area.y..area.bottom() {
-        if y.wrapping_add(tick) % 2 == 0
-            && let Some(cell) = buf.cell_mut((wave_x, y))
-        {
-            cell.set_symbol("·").set_fg(theme::AMBER_DIM());
-        }
-    }
-}
-
-fn draw_room_sparkles(frame: &mut Frame, area: Rect) {
-    if area.width < 4 || area.height < 2 {
-        return;
-    }
-    const GLYPHS: [&str; 4] = ["*", "+", "✦", "·"];
-    let seed = Utc::now().timestamp_millis().div_euclid(180) as u64;
-    let cell_count = u64::from(area.width) * u64::from(area.height);
-    let sparkle_count = (cell_count / 70).clamp(8, 36);
-    let buf = frame.buffer_mut();
-    for index in 0..sparkle_count {
-        let mixed = seed
-            .wrapping_mul(1_103_515_245)
-            .wrapping_add(index.wrapping_mul(2_654_435_761))
-            .wrapping_add(12_345);
-        let x = area.x + (mixed % u64::from(area.width)) as u16;
-        let y = area.y + ((mixed / 97) % u64::from(area.height)) as u16;
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            let glyph = GLYPHS[(mixed as usize) % GLYPHS.len()];
-            cell.set_symbol(glyph).set_fg(room_sparkle_color(mixed));
-        }
-    }
-}
-
-fn room_sparkle_color(seed: u64) -> Color {
-    match seed % 3 {
-        0 => theme::AMBER_GLOW(),
-        1 => theme::SUCCESS(),
-        _ => theme::TEXT_BRIGHT(),
-    }
-}
-
 fn split_poll_and_messages(area: Rect, poll: Option<&ActiveChatPoll>) -> (Option<Rect>, Rect) {
     let Some(poll) = poll else {
         return (None, area);
@@ -1332,6 +1218,7 @@ pub fn draw_dashboard_chat_card(
                 message_reactions: view.message_reactions,
                 message_gilds: view.message_gilds,
                 inline_images: view.inline_images,
+                news_cards: view.news_cards,
                 dividers: view.dividers,
                 drunk_levels: view.drunk_levels,
                 name_flair: view.name_flair,
@@ -1362,7 +1249,6 @@ pub fn draw_dashboard_chat_card(
         draw_poll_strip(frame, poll_area, poll);
     }
     frame.render_widget(Paragraph::new(lines), messages_area);
-    draw_room_page_effects(frame, messages_area, view.active_room_effects);
     // Only publish the chat-scroll hit layout when nothing is painted on
     // top of the messages (overlay or image modal) — those intercept
     // clicks via their own input paths, so a stale layout here would
@@ -1425,7 +1311,10 @@ struct ChatRowsContext<'a> {
     profile_award_badges: &'a HashMap<Uuid, String>,
     message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
     message_gilds: &'a HashMap<Uuid, ChatMessageGildSummary>,
-    inline_images: &'a HashMap<Uuid, InlineImagePreview>,
+    inline_images: &'a HashMap<Uuid, InlinePreview>,
+    /// News shares' #lounge cards by message id (`news::State::lounge_cards`):
+    /// those messages draw as the card.
+    news_cards: &'a HashMap<Uuid, ArticleFeedItem>,
     dividers: ChatDividers,
     /// Per-author drunk levels (1-4) for the tavern glow under usernames.
     drunk_levels: &'a HashMap<Uuid, u8>,
@@ -1731,6 +1620,29 @@ fn replies_to_user(
         == Some(user_id)
 }
 
+/// A YouTube thumbnail's rows in the chat: the video's title when YouTube
+/// named it (cut to the picture's width), the picture, then the hint row. Built
+/// with the rows cache, so their colours follow the theme. All are `Image`
+/// rows, so a click on any is the image click, which watches.
+fn with_watch_hint(picture: &InlineImagePreview, title: Option<&str>) -> InlineImagePreview {
+    let mut lines = Vec::with_capacity(picture.len() + 2);
+    if let Some(title) = title {
+        let picture_width = picture.iter().map(Line::width).max().unwrap_or(0);
+        lines.push(Line::from(Span::styled(
+            truncate_cells(title, picture_width),
+            Style::default()
+                .fg(theme::AMBER())
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.extend(picture.iter().cloned());
+    lines.push(Line::from(Span::styled(
+        "▶ YouTube · Enter to watch",
+        Style::default().fg(theme::AMBER_DIM()),
+    )));
+    lines
+}
+
 fn ensure_chat_rows_cache(
     cache: &mut ChatRowsCache,
     messages: Vec<&ChatMessage>,
@@ -1868,14 +1780,11 @@ fn ensure_chat_rows_cache(
             prefix,
             segments,
             author_range,
-            crown_range,
             title_range,
             runner_range,
         } = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
             is_friend,
             author: &author,
-            crown: flair.is_some_and(|flair| flair.crown),
-            laureate: flair.is_some_and(|flair| flair.laureate),
             title: flair.and_then(|flair| flair.title.as_deref()),
             milestone: flair.and_then(|flair| flair.milestone.as_deref()),
             special_badges: special_list,
@@ -1899,12 +1808,10 @@ fn ensure_chat_rows_cache(
         };
         let author_tint = (drunk_word.is_some()
             || name_style.is_some()
-            || crown_range.is_some()
             || title_range.is_some()
             || runner_tint.is_some())
         .then_some(AuthorTint {
             range: author_range,
-            crown_range,
             title_range,
             runner: runner_tint,
             word: drunk_word,
@@ -2016,7 +1923,18 @@ fn ensure_chat_rows_cache(
             .filter(|_| is_continuation && left_app_here.is_none() && !afk_here);
 
         let row_start = all_rows.len();
-        let image_lines = ctx.inline_images.get(&msg.id).map(Vec::as_slice);
+        // A YouTube thumbnail gets the watch hint row under its picture.
+        let video_preview = match ctx.inline_images.get(&msg.id) {
+            Some(InlinePreview::Video { picture, title }) => {
+                Some(with_watch_hint(picture, title.as_deref()))
+            }
+            Some(InlinePreview::Image(_)) | None => None,
+        };
+        let image_lines = match (&video_preview, ctx.inline_images.get(&msg.id)) {
+            (Some(lines), _) => Some(lines.as_slice()),
+            (None, Some(preview)) => Some(preview.picture().as_slice()),
+            (None, None) => None,
+        };
         let translation = ctx
             .translations
             .get(&msg.id)
@@ -2050,6 +1968,7 @@ fn ensure_chat_rows_cache(
             is_continuation,
             system_text,
             image_lines,
+            ctx.news_cards.get(&msg.id),
             reactions,
             gild,
             translation,
@@ -2488,7 +2407,7 @@ fn centered_rect_in(anchor: Rect, width: u16, height: u16) -> Rect {
 
 fn image_modal_fallback_lines(view: ImageModalView<'_>) -> Vec<Line<'static>> {
     if let Some(preview) = view.preview {
-        return preview.clone();
+        return preview.picture().clone();
     }
 
     vec![
@@ -2762,8 +2681,6 @@ fn build_author_prefix_and_segments(
     let built = build_author_prefix_and_segments_with_chat_badges(AuthorPrefixInput {
         is_friend,
         author,
-        crown: false,
-        laureate: false,
         title: None,
         milestone: None,
         special_badges,
@@ -2782,14 +2699,10 @@ fn build_author_prefix_and_segments(
 struct AuthorPrefixInput<'a> {
     is_friend: bool,
     author: &'a str,
-    /// Whether this author currently wears the crown.
-    crown: bool,
-    /// Whether this author wore the crown when last month ended.
-    laureate: bool,
     title: Option<&'a str>,
     /// The dearest burn milestone this author owns. A badge, not a mark on
     /// the name, so it joins the badge stack rather than trailing the
-    /// username the way the crown and title do.
+    /// username the way the title does.
     milestone: Option<&'a str>,
     special_badges: &'a [&'a str],
     chat_badges: &'a [(HeaderTarget, &'a str)],
@@ -2804,15 +2717,13 @@ struct AuthorPrefixInput<'a> {
 
 /// The built author header prefix: the string, the clickable column
 /// segments, the bare username's byte range, and the byte ranges of the
-/// decorations that trail it. The crown follows the username directly, the
-/// title follows the crown, and the runner badge opens the badge stack
-/// after the title, so all four runs are adjacent and the painter can
-/// walk them in order.
+/// decorations that trail it. The title follows the username directly, and
+/// the runner badge opens the badge stack after the title, so all three
+/// runs are adjacent and the painter can walk them in order.
 struct AuthorPrefix {
     prefix: String,
     segments: Vec<HeaderSegment>,
     author_range: (usize, usize),
-    crown_range: Option<(usize, usize)>,
     title_range: Option<(usize, usize)>,
     /// The ` ▚7` run: the space that opens the badge stack and the badge.
     runner_range: Option<(usize, usize)>,
@@ -2823,8 +2734,6 @@ fn build_author_prefix_and_segments_with_chat_badges(input: AuthorPrefixInput<'_
     let AuthorPrefixInput {
         is_friend,
         author,
-        crown,
-        laureate,
         title,
         milestone,
         special_badges,
@@ -2856,16 +2765,6 @@ fn build_author_prefix_and_segments_with_chat_badges(input: AuthorPrefixInput<'_
         col += 1;
     }
 
-    // Last month's crown leads the name: a title held for the whole month,
-    // so it stands apart from the live holder's glyph that trails the name.
-    // Painted in the author style (an emoji keeps its own colors), and the
-    // name beside it opens the profile, so it carries no segment.
-    if laureate {
-        prefix.push_str(CROWN_LAUREATE_GLYPH);
-        prefix.push(' ');
-        col += UnicodeWidthStr::width(CROWN_LAUREATE_GLYPH) as u16 + 1;
-    }
-
     let author_w = UnicodeWidthStr::width(author) as u16;
     if author_w > 0 {
         segments.push(HeaderSegment {
@@ -2880,19 +2779,6 @@ fn build_author_prefix_and_segments_with_chat_badges(input: AuthorPrefixInput<'_
     prefix.push_str(author);
     let author_range = (author_range_start, prefix.len());
     col += author_w;
-
-    // The crown follows the name after one space, ahead of the title and
-    // the badge stack: a mark on the person, not another badge. It carries
-    // no clickable segment of its own; the name beside it already opens the
-    // profile. The range starts at the space so it stays adjacent to the
-    // name for the painter, which walks the trailing runs in order.
-    let crown_range = crown.then(|| {
-        let crown_start = prefix.len();
-        prefix.push(' ');
-        prefix.push_str(CROWN_GLYPH);
-        col += 1 + UnicodeWidthStr::width(CROWN_GLYPH) as u16;
-        (crown_start, prefix.len())
-    });
 
     // The rented title reads as an aside on the name (`mira, the
     // insufferable`), so it sits between the name and the badge stack and is
@@ -2981,7 +2867,6 @@ fn build_author_prefix_and_segments_with_chat_badges(input: AuthorPrefixInput<'_
         prefix,
         segments,
         author_range,
-        crown_range,
         title_range,
         runner_range,
     }
@@ -3160,7 +3045,10 @@ pub struct ChatRenderInput<'a> {
     pub friend_user_ids: &'a HashSet<Uuid>,
     pub message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
     pub message_gilds: &'a HashMap<Uuid, ChatMessageGildSummary>,
-    pub inline_images: &'a HashMap<Uuid, InlineImagePreview>,
+    pub inline_images: &'a HashMap<Uuid, InlinePreview>,
+    /// News shares' #lounge cards by message id: those messages draw as
+    /// the card.
+    pub news_cards: &'a HashMap<Uuid, ArticleFeedItem>,
     /// This session's AFK line per room; the `new messages` divider
     /// draws before the first message from someone else past it.
     pub afk_lines: &'a HashMap<Uuid, DateTime<Utc>>,
@@ -3351,7 +3239,10 @@ pub struct EmbeddedRoomChatView<'a> {
     pub live_user_ids: &'a HashSet<Uuid>,
     pub message_reactions: &'a HashMap<Uuid, Vec<ChatMessageReactionSummary>>,
     pub message_gilds: &'a HashMap<Uuid, ChatMessageGildSummary>,
-    pub inline_images: &'a HashMap<Uuid, InlineImagePreview>,
+    pub inline_images: &'a HashMap<Uuid, InlinePreview>,
+    /// News shares' #lounge cards by message id: those messages draw as
+    /// the card.
+    pub news_cards: &'a HashMap<Uuid, ArticleFeedItem>,
     pub dividers: ChatDividers,
     pub current_user_id: Uuid,
     /// Voice channel for this view, drawn as a strip at the top when present.
@@ -3573,6 +3464,7 @@ fn draw_embedded_messages(
             message_reactions: view.message_reactions,
             message_gilds: view.message_gilds,
             inline_images: view.inline_images,
+            news_cards: view.news_cards,
             dividers: view.dividers,
             drunk_levels: view.drunk_levels,
             name_flair: view.name_flair,
@@ -5551,14 +5443,7 @@ fn draw_selected_content(
         {
             draw_poll_strip(frame, poll_area, poll);
         }
-        let mut selected_room_effects: &[ActiveChatRoomEffect] = &[];
         let message_lines: Vec<Line> = if let Some((room, messages)) = selected_room {
-            let active_effects = view
-                .active_room_effects
-                .get(&room.id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            selected_room_effects = active_effects;
             let height = message_render_area.height.max(1) as usize;
             let width = message_render_area.width.max(1) as usize;
 
@@ -5585,6 +5470,7 @@ fn draw_selected_content(
                     message_reactions: view.message_reactions,
                     message_gilds: view.message_gilds,
                     inline_images: view.inline_images,
+                    news_cards: view.news_cards,
                     dividers: ChatDividers {
                         afk_line: view.afk_lines.get(&room.id).copied(),
                         left_app: view.device_left_at,
@@ -5627,7 +5513,6 @@ fn draw_selected_content(
 
         let messages_paragraph = Paragraph::new(message_lines);
         frame.render_widget(messages_paragraph, message_render_area);
-        draw_room_page_effects(frame, message_render_area, selected_room_effects);
         if let (Some(slot), Some(hits)) = (view.chat_hit_slot, chat_hits)
             && view.overlay.is_none()
             && view.image_modal.is_none()
@@ -5826,7 +5711,7 @@ fn draw_selected_content(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::BORDER()));
             let hint_text = Paragraph::new(Line::from(Span::styled(
-                " j/k navigate · Enter read · c copy link · r reply in #lounge · i paste URL · / filter mine",
+                " j/k navigate · Enter read · s save for later · c copy link · r reply in #lounge · i paste URL · / filter mine",
                 Style::default().fg(theme::TEXT_DIM()),
             )))
             .block(hint_block);

@@ -5,7 +5,7 @@
 Chat in the SSH app: Home chat rooms, DMs, public/private topic rooms, game-backed room chat, the Home/Dashboard chat center and room rail, and the embedded game-chat surfaces (house tables, daily match boards, the door watch view). Also message actions, reactions, ignores, overlays, the service's refresh/tail/event contracts and the DB model constraints.
 
 - Synthetic chat entries: RSS, News, Mentions/Notifications, and Discover. Voice is not a synthetic room slot: the dedicated `#voice` room is a real, permanent, public chat room pinned at the bottom of Core (above Discover). Any voice-enabled chat/game room (including `#voice`) renders an embedded voice strip and exposes `/voice`/`/mute` controls while you are inside it. Showcase/Projects and Work/Profiles keep their feed services and state here, but their UI and their editor (`app/directory/editor`) live on Profiles page 5.
-- Companion docs here: `COMMANDS.md` (the composer, every slash command, the keys), `RENDERING.md` (the rows cache, message rendering, images, layout rules), `MARKS.md` (the AFK line and the left-app device mark). Sub-domains with their own context: `cyberspace/`, `gild/`, `news/`, and `../crown/`; the round, translation and `/summary` are `../ai/CONTEXT.md`.
+- Companion docs here: `COMMANDS.md` (the composer, every slash command, the keys), `RENDERING.md` (the rows cache, message rendering, images, layout rules), `MARKS.md` (the AFK line and the left-app device mark). Sub-domains with their own context: `cyberspace/`, `gild/`, and `news/`; the round, translation and `/summary` are `../ai/CONTEXT.md`. A YouTube link in a message opens the watch player, `../video/CONTEXT.md`.
 - The session shell, global keys and notifications are in `late-ssh/CONTEXT.md`; repo-wide rules in the root `CONTEXT.md`.
 
 ---
@@ -30,7 +30,7 @@ late-ssh/src/app/chat/
 |-- feeds/                       # Synthetic RSS entry: private per-user RSS/Atom inbox
 |-- gild/                        # Gild tier picker: state/input/ui for the `g` message action
 |-- history_modal/               # `/history` scroll-back modal: state/input/ui (§14 History Modal)
-|-- news/                        # Synthetic News entry: articles, the reader (`reader/`), body fetch (`body.rs`), live strip body (`live.rs`)
+|-- news/                        # Synthetic News entry: articles, the reader (`reader/`), body fetch (`body.rs`), the #lounge card (`ui.rs::lounge_card_lines`)
 |-- notifications/               # Synthetic Mentions entry: mention notifications
 |-- polls/                       # /poll modal state/input/UI
 |-- showcase/                    # Projects service/state/UI reused by Directory page 5
@@ -48,7 +48,7 @@ Tests live beside the file they exercise as `<file>_test.rs`, wired with
 
 Core models used by chat live in `late-core/src/models/`:
 `chat_room.rs`, `chat_room_member.rs`, `chat_message.rs`, `chat_message_reaction.rs`,
-`chat_message_gild.rs`, `crown.rs`,
+`chat_message_gild.rs`,
 `notification.rs`, `rss_feed.rs`, `rss_entry.rs`, `article.rs`, `article_read.rs`, `cyberspace_account.rs`, `showcase.rs`,
 `showcase_feed_read.rs`, `work_profile.rs`, `work_feed_read.rs`, and `chat_poll.rs`.
 Chat-owned moderation commands also use `room_ban.rs`,
@@ -95,7 +95,7 @@ Normal display flow:
    - The `· ` activity lines are excluded by comparing the author id against the system bot id that `ChatService::set_system_user_id` receives from the #lounge feed task at startup. Do not go back to reading `users.settings->>'system'` per message: that made Postgres hash the whole users table per query.
 3. Snapshots intentionally carry empty message vectors. They do not load history; activity timestamps are summary metadata used for stable room ordering.
 4. Visible-room changes call `App::sync_visible_chat_room()`, which stores `visible_room_id`, marks the room read, and requests a room tail.
-5. `load_room_tail_task` fetches the newest 500 messages, reaction summaries, author usernames, and author bonsai glyphs. Render-time display names prefer the app-wide username directory over this per-session chat cache when both know the same UUID.
+5. `load_room_tail_task` fetches the newest 500 messages, reaction summaries, author usernames, and author bonsai glyphs. A tail that lands before the snapshot naming its room (a game-room join fires both loads at once, and the tail is the lighter query) is held in `ChatState::early_tails` and merged when the room arrives; nothing asks for a tail twice. Render-time display names prefer the app-wide username directory over this per-session chat cache when both know the same UUID.
 6. Broadcast `MessageCreated`/`MessageEdited`/`MessageDeleted`/reaction events patch local state; tail/search/discover results arrive on the per-session targeted channel. Broadcast lag triggers a tail reload for the visible room (the targeted mpsc is unbounded and cannot lag).
 
 Room tails deliberately carry **no** read cursor. Render inserts one synthetic `new messages` divider before the first message from someone else past this session's **AFK line** (`ChatState::afk_lines`), and one dim `you left` divider before the first past the **left-app mark** (`ChatState::device_left_at`), never past `chat_room_members.last_read_at`; see `MARKS.md` for why. The divider is render-only state in the chat row cache; do not persist it or count it as a chat message.
@@ -179,10 +179,9 @@ Selection deltas are message-based, not row-based. Positive means older, negativ
 
 ---
 
-## 9b. Gilds, the Crown, the Round
+## 9b. Gilds, the Round
 
 - Gilds, the paid name colour for a public message: `gild/CONTEXT.md`.
-- The Crown, the one-holder 💎 slot bought with `/crown take`: `../crown/CONTEXT.md`. Chat owns only the command and the glyph.
 - The Round, a drink or a whole-bar round from @bartender (the chips, the pour, the drunk points, the trigger phrase): `../ai/ROUND.md`, beside the bartender that runs it.
 
 ## 9e. Bartender Memory
@@ -209,7 +208,7 @@ Ignores:
 - Ignore filtering applies to DMs too. An ignored peer's DM messages are filtered, and the DM room is hidden from the room rail/navigation while the peer is ignored (both mirrors skip DMs whose `dm_peer_id` is ignored: `visual_order_for_rooms` and the rail's own DM filter, via the shared `dm_peer_is_ignored`), so a new DM from the ignored user can't resurface the room or its unread badge. Unignoring restores the DM on the next render/snapshot.
 - `IgnoreListUpdated` refilters local messages in place (all rooms, including DMs and `reply_to_user_id` matches) with no DB refetch, then refreshes the Mentions list/unread count.
 - `unignore` does not retroactively restore already-filtered local messages until a future tail/snapshot naturally reloads them.
-- Ignores cover messages only. A News article is not a message: the News room and the #lounge live strip show every share, whoever shared it (§11 News).
+- Ignores cover messages only. A News article is not a message: the News room shows every share, whoever shared it. Its #lounge card is the sharer's own line, so ignoring the sharer hides the card like the rest of their lines (§11 News).
 
 ---
 
@@ -219,7 +218,7 @@ Synthetic entries are selected from the room list but are not normal `ChatRoom`s
 
 ### News
 
-Shared links, the News room, reader and live strip: `news/CONTEXT.md`.
+Shared links, their #lounge cards, the News room and the reader: `news/CONTEXT.md`.
 
 ### Showcase
 
@@ -304,6 +303,7 @@ In `COMMANDS.md`, Keybindings: Home chat center, the dashboard lounge, and the s
 A patron deep enough into the tavern's drinks types like it. `ChatService::slurred_body` runs `chat/slur.rs` over the body as the last step of `send_message`, immediately before the row is written.
 
 - **Stored, not rendered.** The slurred text *is* the message body, so IRC, search, replies, and every viewer agree on one version. This is deliberate: the drunk level is decay-based, so a render-time transform would re-evaluate against the reader's *current* level and quietly sober up an old message hours later. The level at the moment of typing is the only one that ever made sense. The cost is that the original is unrecoverable, including for moderation.
+- **The patron's own words only.** A line sent as `Wording::Quoted` (a News card, whose title is the page's, not the sharer's) is stored as built and creates no mention notifications; everything a patron types is `Wording::Typed`.
 - **Public rooms only** (`room.visibility == "public"`). DMs and private rooms can carry something that genuinely needs reading. The `UserDrinks::find` level lookup only runs where it can matter, and sober users and the ghost bots (who never drink) short-circuit to an unchanged body.
 - **Runs last**, so report markers, `contains_link` cooldown, and slow mode all judged the sober text. `create_mentions_task` gets the slurred body so the notification preview matches the room.
 - **Readability rests on one rule:** a word's first and last character never move. Only interior letters are reordered (never added or dropped), which is the typoglycemia effect and is why level 4 stays legible at all. Two dials climb per level: what share of words get scrambled (6/32/60/85%) and how far each goes (one swap, one swap, one-or-two swaps, full interior shuffle). Tipsy and buzzed deliberately share a depth: the same fumble, just far more often. The change in *kind* lands at sloshed. Measured over ordinary prose that is roughly 3/21/34/54% of *all* words visibly changed, since short words are ineligible; `each_drink_reads_harder_than_the_last` pins those bands.
@@ -333,7 +333,7 @@ Scroll-driven room history (`history_modal/`), opened by `/history` or by a sear
 
 ### Room Membership Commands
 
-1. `/public #room` gets or creates a public topic room, forces `auto_join=false`, and joins only caller. `/join #room` is an alias for it, parsed in the same `parse_public_room_command` so the two can never drift; it exists because IRC users type `/join` first. Public rooms are hosted, not owned: opening one grants nothing, and a brand-new one posts two plain system-bot lines (deliberately without the system-line prefix, so they render as messages), one in the room asking the creator to describe it and one in #moderators reporting it.
+1. `/public #room` gets or creates a public topic room and joins only the caller. A new room starts with `auto_join=false`; an existing room keeps its flag, so `/join` on a room a mod filled never unfills it. `/join #room` is an alias for it, parsed in the same `parse_public_room_command` so the two can never drift; it exists because IRC users type `/join` first. Public rooms are hosted, not owned: opening one grants nothing, and a brand-new one posts two plain system-bot lines (deliberately without the system-line prefix, so they render as messages), one in the room asking the creator to describe it and one in #moderators reporting it.
 2. `/private #room` opens the room-info form (`app/room_info_modal`) and creates the room with its topic/rules and `created_by` in one go.
 3. `/roominfo` opens the same form for the selected room. Authority is decided once in `ChatService::set_room_info`: mods for any room, otherwise the derived owner of a private topic room. `ChatState::room_info_authority` mirrors the rule for what the UI offers (and what the refusal banner says); DMs and game rooms have no info at all. A successful write broadcasts `RoomInfoUpdated`, which banners for the editor and refreshes the room list of every session sitting in that room, so no header waits on the 10s snapshot.
 4. `/rules` shows the selected room's rules in the shared overlay (`Overlay`, the same surface `/active` uses), titled `#slug rules`, one entry per stored line: rules are multi-line and a banner is one line. A room with no rules answers with a banner instead of an empty overlay.
@@ -377,11 +377,11 @@ Never load every room's history per session on a timer.
 
 Repo-wide rule from the root context still applies:
 - Every test, pure or DB-backed, lives beside the file it exercises as `<file>_test.rs`, wired with `#[cfg(test)] mod <file>_test;`. No inline test modules, no crate `tests/` folder.
-- Targeted runs go through `make test-llm ARGS="-p late-ssh -E 'test(chat)'"` (memory-capped `cargo nextest` with the check DB). The full sweep is `make check` and stays with the human owner.
+- Targeted runs go through `make test-llm ARGS="-p late-ssh --lib -E 'test(chat)'"` (memory-capped `cargo nextest` with the check DB). The full sweep is `make check` and stays with the human owner.
 
 Where the coverage sits:
 - `svc_test.rs` is the DB-backed service suite (send, reactions, tails, ignores, discover, search scoping, gilds and each gild refusal); `svc_internal_test.rs` covers the pure service helpers (link detection and cooldown tiers, report kinds, poll copy).
-- `state_internal_test.rs` reaches `pub(crate)` `ChatState` internals (command parsing, autocomplete ranking, visual order, reply helpers, translation display); `state_test.rs` is a placeholder.
+- `state_internal_test.rs` reaches `pub(crate)` `ChatState` internals (command parsing, autocomplete ranking, visual order, reply helpers, translation display, inline preview links and YouTube link shapes); `state_test.rs` is a placeholder.
 - `commands_test.rs` pins the command registry and popup ranking; `ui_test.rs`/`ui_text_test.rs` the layout, wrapping and hit testing; `slur_test.rs` the drunk-text contract (§14 Drunk Text).
 - Each synthetic entry (`news/`, `showcase/`, `work/`, ...) and `../ai/` carries its own `*_test.rs`, and the chat models' tests sit beside them in `late-core/src/models/`.
 
@@ -409,8 +409,8 @@ Test gaps:
 - Poll create/vote tasks are async; `ChatEvent::PollUpdated` patches the local active-poll map and `ChatSnapshot.active_polls` refreshes authoritative visibility. Successful poll creation spawns a sleep-until-expiry finalizer that atomically claims the expired poll in Postgres, marks it inactive, and posts compact results into the room as the poll creator. `ChatService::start_poll_finalizer_recovery_task` runs a coarse 10-minute recovery scan for expired active polls so restarts/redeploys do not strand result posts; the DB claim is the cross-replica duplicate guard.
 - Poll vote shortcuts use `va/vb/vc` when the selected/visible real room has an active poll, leaving music `v1`..`v5` selectors available.
 - Room visual order must stay consistent between state and UI hit-testing/row-building.
-- Mouse hit-testing reconstructs a temporary `ChatRenderInput`; room-list layout changes must keep hit tests in sync.
+- Room-list mouse hit-testing reconstructs a temporary `ChatRoomListView` (`app/input.rs`); room-list layout changes must keep hit tests in sync.
 - Chat-scroll mouse hit-testing is driven by `ChatRowsCache` extras (`row_message`, `row_kind`, `header_segments`) and a per-frame `ChatHitLayout` published into `ChatState::last_chat_hit_layout`. If you change how author headers, inline images, or reaction footers contribute rows in `ensure_chat_rows_cache` / `wrap_chat_entry_to_lines`, update both the parallel `row_*` vectors and the segment math in `build_author_prefix_and_segments` so a click still resolves to the right message/segment.
-- Showcase, Work, and News posts do not create chat messages. A News share goes up on the #lounge live strip instead (§11 News).
+- Showcase and Work posts do not create chat messages. A News share posts one #lounge line as the sharer, which chat draws as the story's card (§11 News).
 - Game rooms must remain opt-in and `auto_join=false`.
 - Private `kind='game'` rooms (daily match chat) are membership-fixed at creation; no join path may admit a third user, and they stay hidden from the rail/Mentions/IRC like all game rooms. The daily sweeper hard-deletes them 30 days after the match ends.

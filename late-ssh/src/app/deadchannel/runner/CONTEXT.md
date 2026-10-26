@@ -38,7 +38,7 @@ chat's rows builder takes `runner_looks: Option<&HashMap<Uuid, RunnerEntry>>`,
 `Some` only while the rendered room is #deadchannel: a runner's author
 header opens its badge stack with the level badge (`runner/ui.rs::badge_text`,
 `▚7`, painted in the level's band through `AuthorTint.runner`; the
-first badge, so it sits right after the name, crown, and title),
+first badge, so it sits right after the name and title),
 every entry in the room wraps `PORTRAIT_GUTTER` (6) cells short, and a block-opening message by a
 runner gets `attach_portrait` (the face right-aligned on the entry's
 first rows, the hood level with the header, wearing what the entry has
@@ -47,11 +47,15 @@ and hands the coat to the first row of a continuation right under it
 (none, or a divider between them, and it goes bare), anything taller
 wears the coat itself, so no message grows a row for its face). The blank separator above a block stays blank, so two faces
 stacked down the wire never touch. The profile modal grows a runner
-column beside the late.fetch grid for a standing runner, for every viewer
+column beside the late.fetch grid for a standing runner, shown to a
+viewer who is a runner too (`App::is_runner`, passed to
+`profile_modal::ui::draw`)
 (`ProfileSnapshot.runner`, loaded by `ProfileService::do_find_profile` from
 the row; no frame, its own heading carrying the badge, the face wounded by
 the missing signal at the top left and the poster from PRINTS beside it, the
-test card without one; `late-ssh/src/app/profile_modal/CONTEXT.md`).
+test card without one or with a bare one; `late-ssh/src/app/profile_modal/CONTEXT.md`). A
+civilian sees only a poster with ink, alone under a `poster` heading, so
+the art is public and the wire is not.
 Continuations and system lines carry no face; every other room renders
 without runner chrome.
 

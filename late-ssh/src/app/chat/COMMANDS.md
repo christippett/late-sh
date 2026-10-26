@@ -31,7 +31,7 @@ Submit flow in `ChatState::submit_composer`:
 - `/leave` and `/invite` resolve through the active composer room or selected real room. Synthetic entries do not fall back to stale `selected_room_id` values; `/leave` on a selected synthetic entry exits that entry back to the last real room.
 - `/members` uses the same real-room resolver as `/leave` and `/invite`.
 - Normal send calls `send_message_with_reply_task`.
-- Edit calls `edit_message_task`. There is no edited flag: a message counts as edited when `updated > created`, which appends `(edited)` to the author header's stamp. Because of that, an edited message never groups as a continuation under the message above it (`ensure_chat_rows_cache`): it takes its own author header back so the marker has somewhere to live. Editing the second message in a run visibly breaks the run; that is the intent.
+- Edit calls `edit_message_task`. A News share's #lounge card is never edited (`news/CONTEXT.md`, the #lounge card): the edit key banners `A story's card can't be edited.` and `ChatService::edit_message` refuses it too (a line linked as a card after its edit began). There is no edited flag: a message counts as edited when `updated > created`, which appends `(edited)` to the author header's stamp. Because of that, an edited message never groups as a continuation under the message above it (`ensure_chat_rows_cache`): it takes its own author header back so the marker has somewhere to live. Editing the second message in a run visibly breaks the run; that is the intent.
 - An image upload started from the composer carries its reply target with it (`PendingUrlUpload`/`PendingClipboardImageUpload`, then `image_upload_reply_target`), because both `/upload` and `/paste-image` clear the composer at submit and the finished URL reopens it through `start_composing_in_room`. `tick.rs` restores the target after reopening, and drops it on a failed upload.
 - Enter submits and closes.
 - `Alt+S` submits and keeps the composer open.
@@ -47,7 +47,7 @@ Reply mode:
 - Enters compose mode and clears edit.
 - On submit, stores `reply_to_message_id` and prefixes the stored body with a visible quote line for backward-compatible rendering.
 - Enter on a selected reply jumps only if the target is already loaded in the current room tail.
-- `G` on a selected reply also jumps to the loaded target. Enter is overloaded (the image modal takes precedence), so a reply that contains an inline image can only be followed with `G`, not Enter. Lowercase `g` is the gild key.
+- `G` on a selected reply also jumps to the loaded target. Enter is overloaded (an inline image opens first, then a YouTube link plays), so a reply whose own text carries either can only be followed with `G`, not Enter. A link inside the quote line does not count: it is the parent's, so Enter jumps there and a second Enter opens it. Lowercase `g` is the gild key.
 
 Edit mode:
 - Allowed for the message author or admins.
@@ -72,7 +72,8 @@ Image uploads and inline rendering:
 - Non-admin uploads use a per-session `ChatState` cooldown. This is intentionally lightweight, not a server-side quota.
 - URL downloads for upload and inline rendering must go through `files::image_upload::download_url_bytes`: validate `http(s)`, reject localhost/private/link-local/reserved resolved IPs, pin reqwest DNS to the validated addresses, disable redirects, and stream with a hard byte cap. Do not add new ad hoc `reqwest.get(url).bytes()` paths for chat images. Fetchers that must follow redirects (RSS feeds) use `download_url_bytes_following_redirects`, which re-validates every hop.
 - Paired clipboard uploads are request-gated: `PairedClientRegistry::request_clipboard_image` records an outstanding request per token, and the pair WS handler drops any inbound `clipboard_image`/`clipboard_image_failed` payload whose token has no outstanding request (`take_clipboard_request`). This keeps a rogue paired client from queuing multi-MB decoded images into the bounded per-session channel.
-- Inline image rendering detects likely image URLs in visible room messages, fetches them through the same secure downloader, rejects oversized decoded dimensions, retries transient failures with backoff, and caches an `InlineImagePreview` by message id. Inline previews are only the RGB block fallback used by scrolling chat rows. Kitty/iTerm2/Sixel native image data is fetched separately, lazily, only while the explicit selected-message image modal is open on a supported terminal. Inline previews are best-effort; failures are intentionally silent/noisy only at trace level.
+- A YouTube video link gets the same inline preview, drawn from its thumbnail (`audio::thumbnail::thumbnail_url`, `i.ytimg.com/vi/<id>/mqdefault.jpg`) with the video's title on a row above it and a `▶ YouTube · Enter to watch` row under it: the title comes from YouTube's public oEmbed endpoint (`audio::youtube::fetch_oembed_title`, through `download_url_bytes`), fetched with the thumbnail and cached with it as `state::InlinePreview::Video`, and cut to the picture's width; when oEmbed names nothing (a private or deleted video) the title row is left out. Each session fetches its own, like the thumbnail; nothing is stored. An image link in the same message takes the preview instead (`state::inline_preview_source_in_body`; both scan the body through one `body_links`, and the video id is the player's rule, `video::state::youtube_video_id`). A reply's quote line is the parent's text, so a link there previews nothing (`state::body_without_reply_quote`). Enter on the message or a click on the thumbnail opens the watch player on any chat surface (`input::watch_selected_video`, `../video/CONTEXT.md`), the setup box when the session cannot play.
+- Inline image rendering detects likely image URLs in visible room messages, fetches them through the same secure downloader, rejects oversized decoded dimensions, retries transient failures with backoff, and caches an `InlinePreview` by message id (an image's picture, or a video's thumbnail and title). Inline previews are only the RGB block fallback used by scrolling chat rows. Kitty/iTerm2/Sixel native image data is fetched separately, lazily, only while the explicit selected-message image modal is open on a supported terminal. Inline previews are best-effort; failures are intentionally silent/noisy only at trace level.
 - Kitty, iTerm2, and Sixel image support is intentionally narrow and modal-only. `files::terminal_image` detects Kitty-family terminals from PTY `TERM`, XTVERSION, and forwarded env hints: Kitty, Ghostty, Rio, Warp, and Konsole. It detects iTerm2-family support from `TERM_PROGRAM`/`LC_TERMINAL`, XTVERSION, `TERM_FEATURES`, `OSC 1337;Capabilities`, and env hints for iTerm2, WezTerm, mintty, and hterm-style identities. It detects Sixel from explicit identities (`windows terminal`, `foot`, `contour`, `mlterm`, `sixel`), `WT_SESSION`/`WT_PROFILE_ID` env hints, and DA1 (Primary Device Attributes) replies advertising attribute 4 — the DA1 probe is sent last at alt-screen entry and only fills in Sixel when no richer protocol was detected, so Kitty/iTerm2 always win over Sixel. If `TERM` is tmux, full image previews are intentionally disabled and chat uses the RGB block fallback; no tmux graphics passthrough is attempted. Unsupported or undetected terminals, including stock Alacritty, keep the RGB block preview. The Settings → Tweaks "Terminal images" row (`TerminalImagesMode`, user setting `terminal_images`) sits on top of all of that: `Auto` uses the detected protocol, `Off` forces the RGB block preview, and `Sixel` forces Sixel even where nothing was detected (tmux included), for terminals that misreport. Detection writes `App.detected_image_protocol`; every reader goes through `App::terminal_image_protocol()`, which applies the tweak live. Kitty images use late.sh-owned ids in the `0x4C000000..0x4CFFFFFF` range plus a dedicated z-index so cleanup can target them by range/z-index as well as by visible placement. Sixel payloads are generated only for Sixel sessions, use adaptive palette fallback, and fail back to the RGB block preview if the final payload still exceeds the hard byte cap. Because Sixel has no terminal-side scaling, the image modal reports its image cell capacity into `TerminalImageFrame` during draw, the render loop feeds it back into chat state, and Sixel fetches encode to fit that capacity (first fetch is deferred one frame after the modal opens until capacity is known; a cached Sixel encode that no longer fits, e.g. after shrink, is re-fetched at the new capacity). A forced repaint resets terminal image placement state so modal images are re-emitted after clear/resize/drop recovery. Direct terminals get Kitty cleanup commands on enter/leave alt-screen. Alt-screen enter/leave and forced full repaint begin with an ST terminator so a killed session that left iTerm2/Sixel inside an unterminated DCS/OSC image payload can recover before normal clear/repaint bytes. Closing an iTerm2 or Sixel image modal forces a full repaint because those inline images are not tracked/deleted like Kitty placements.
 
 ## Slash commands
@@ -87,7 +88,6 @@ User commands:
 - `/dm @user` opens/creates a DM.
 - `/exit` opens quit confirm.
 - `/golive [title]` registers this user's "watch me" stream (`/golive stop` ends it) and `/watch @user` opens a live stream. Both are parsed in `submit_composer` (`parse_golive_command` / `parse_user_command`) and drained by `App::tick_stream`, which owns the stream service, the publisher URL modal, and the paired-CLI `open_url` control; the domain contract is `late-ssh/src/app/stream/CONTEXT.md`.
-- `/crown` prints who wears the crown, how long they have, and what taking it costs; `/crown take` buys it at that price, `/crown take N` bids N (at least the price). Parsed in `submit_composer` (`parse_crown_command`) and drained by `App::tick_crown`, which owns the crown service and both banners. See `../crown/CONTEXT.md`.
 - `/pot` prints the weekly pot's size, the tickets in it, what you hold and what it cost, how many more you may buy today, and the time to the draw; `/pot buy N` buys N tickets. Parsed in `submit_composer` (`parse_pot_command`, which is also the boundary that rejects any count outside `1..=10`, the daily cap) and drained by `App::tick_pot`, which owns the pot service and the banners. The status line is answered straight from the process-shared snapshot, so `/pot` costs no query; the domain contract is `late-ssh/src/app/pot/CONTEXT.md`.
 - `/icons` opens the icon picker (same as `Ctrl+]`).
 - `/picker` opens the room picker (same as `Ctrl+/`); drained via `take_requested_room_picker` into `open_room_search_modal_globally`. On Zen with a chat tile focused, the pick binds that tile (see the Zen CONTEXT).
@@ -118,7 +118,7 @@ User commands:
 - `/private #room` creates a private topic room and joins the caller.
 - `/profile [@user]` opens a user's read-only profile modal. Bare `/profile` opens the caller's own profile as others see it. `@username` autocompletion is available after `/profile `. `/chips [@user]` is the same modal opened on its chips ledger (`ProfileSection::Chips` rides on `OpenProfileResolved` and the `requested_open_profile` handoff; the modal scrolls there on its first measured draw).
 - `/onboard` starts the first-visit tour again from the tavern door (`app/clubhouse/CONTEXT.md` §5).
-- `/public #room` (alias `/join #room`) opens or creates an opt-in public room for the caller only (`auto_join=false`).
+- `/public #room` (alias `/join #room`) opens or creates an opt-in public room for the caller only. A new room starts with `auto_join=false`; an existing room keeps its flag.
 - `/sheet [@user]` (room-scoped to `#dnd`) opens the character sheet modal: bare form opens your own sheet editable (name + freeform body, saved per user per room on field submit via `ChatService::save_sheet_task`); targeted form opens another user's sheet read-only, or banners if they have none. Resolution and fetch happen in `ChatService::open_sheet_task`; saves and reads validate the shared `RoomScopedCommand` metadata plus room membership in `ChatService::ensure_room_scoped_command_access`; the modal lives in `app/sheet_modal`.
 - `/settings` opens settings.
 - `/shop` opens the Shop modal, as does Ctrl+S outside profile/job editors and active Artboard input. Locked-feature nudges use the same entry point.
@@ -167,7 +167,7 @@ Admin commands:
   directory, look and level per standing runner): a runner's author
   header opens its badge stack with the level badge (`▚7`, the mark and
   the level, `AuthorPrefixInput.runner_badge`, painted in the level's
-  band through `AuthorTint.runner`, adjacent to the name, crown, and
+  band through `AuthorTint.runner`, adjacent to the name and
   title so the same painter tints it), the wire wraps every entry six cells short and seats the
   author's three-row portrait in that gutter beside a block-opening
   message: the hood level with the header, the eyes and the coat on the
@@ -231,8 +231,8 @@ and `permanent` is also accepted for `perma` slow-mode duration.
 | `Ctrl+D` / `Ctrl+U` | Approximate half-page message selection |
 | `i` | Start composing in selected room, or start News composer when selected |
 | `/` | Start command composer in selected room |
-| `Enter` | Submit composer; jump reply target; open the reader in News; join Discover; jump Mention |
-| `G` | Jump a selected reply to its loaded original, even when the reply contains an inline image (Enter opens the image instead) |
+| `Enter` | Submit composer; jump reply target; open the reader in News; join Discover; jump Mention; on a selected message, open its image, else watch its YouTube link (`../video/CONTEXT.md`) |
+| `G` | Jump a selected reply to its loaded original, even when the reply contains an inline image or a YouTube link (Enter opens the image or watches the video instead) |
 | `Alt+Enter` / `Ctrl+J` | Insert newline in main chat composer |
 | `Ctrl+R` | Redo in the main chat composer (ratatui-textarea's keymap via `ctrl_byte_to_input`). An open composer takes it ahead of the global repaint chord in `app/input.rs::handle_reserved_global_chord`; `/redraw` repaints from inside one |
 | `Alt+S` | Submit main chat composer and keep it open. Dropped (no-op) while the `keep_composer_focused` Tweaks setting is on; Enter then owns send-and-stay. |
@@ -257,7 +257,7 @@ and `permanent` is also accepted for `perma` slow-mode duration.
 | Click username (or special / friend / bonsai / monthly award / brb badge) | Open that author's profile modal. Debounced ~280 ms so a fast double-click can promote to a mention instead. |
 | Double-click username | Insert `@username ` into the composer for the current room. Cancels the debounced profile-open. |
 | Click equipped chat-shop badge | Open Hub Shop on the Badges sub-store. |
-| Click inline image preview | Select the message and open the image viewer modal. |
+| Click inline image preview | Select the message and open the image viewer modal; on a YouTube thumbnail, the watch player. |
 
 The composer rect is captured during `chat::ui` draw into `ChatState::last_composer_rect`
 (a `Cell<Option<Rect>>` reset at the top of every frame in `app/render.rs`).
@@ -295,8 +295,8 @@ modals and the icon picker). Username profile-opens are debounced via
 
 | Entry | Keys |
 |-------|------|
-| News | `j/k` navigate, `i` paste URL, Enter open the reader (submit while composing), `c` copy URL, `r` reply in #lounge to the selected article, `d` delete own/admin article, `/` toggle filter to mine, `Esc` cancel |
-| News reader | `j/k`/arrows/wheel scroll, `Space`/`b` page, `g`/`G` top/bottom, `1`-`9` copy link `[n]`, `c` copy the story's link, `r` reply in #lounge, `d` delete own/admin, `N` select it in News, `Esc`/`[x]` close |
+| News | `j/k` navigate, `i` paste URL, Enter open the reader (submit while composing), `s` save for later or let go, `c` copy URL, `r` reply in #lounge to the selected article, `w` watch a video story, `d` delete own/admin article, `/` toggle filter to mine, `Esc` cancel |
+| News reader | `j/k`/arrows/wheel scroll, `Space`/`b` page, `g`/`G` top/bottom, `1`-`9` copy link `[n]`, `c` copy the story's link, `s` save for later or let go, `r` reply in #lounge, `w` watch a video story, `d` delete own/admin, `N` select it in News, `Esc`/`[x]` close |
 | Directory Projects | `j/k` navigate, `i` create, `e` edit own/admin, `d` delete own/admin, Enter copy/submit, Tab cycle fields while composing, `/` toggle filter to mine, `Esc` cancel |
 | Directory Profiles | `j/k` navigate, `i` create/edit own, `e` edit own/admin, `d` delete own/admin, Enter/`c` copy public profile link, Tab cycle fields while composing, `/` toggle filter to mine, `Esc` cancel |
 | Cyberspace feeds | `j/k` navigate, Enter open thread (or link modal when unlinked), `p` post, `c` copy entry link, `n` notifications, `r` refresh/reply, `b` back |
@@ -305,6 +305,6 @@ modals and the icon picker). Username profile-opens are debounced via
 | Mentions | `j/k` navigate, Enter open the Ctrl+/ single-message preview (Enter again jumps to the room) |
 | Discover | `j/k` navigate, Enter join selected public room, `/` open slug filter (type to narrow, Enter join, `Esc` clear) |
 
-Directory Projects and Profiles reshuffle their listing on page/tab entry. News keeps its chronological order — only mine-only filtering applies. The slash-command composer in `app/input.rs` skips itself when News is selected so `/` reaches the synthetic-entry handler; Directory page 5 routes `/` directly to Projects/Profiles filtering.
+Directory Projects and Profiles reshuffle their listing on page/tab entry. News lists the reader's saved stories first, then the feed in chronological order without them; only mine-only filtering applies (`news/CONTEXT.md`). The slash-command composer in `app/input.rs` skips itself when News is selected so `/` reaches the synthetic-entry handler; Directory page 5 routes `/` directly to Projects/Profiles filtering.
 
 When changing keybindings, follow the keybinding checklist in `late-ssh/CONTEXT.md`.

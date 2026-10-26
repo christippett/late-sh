@@ -28,7 +28,11 @@ CHECK_PACKAGES = -p late-cli -p late-core -p late-ssh -p late-web -p late-webvie
 # it to build scripts, and tikv-jemalloc-sys's nested make then parses ARGS'
 # words as targets and dies on a fresh build. Cargo gives build scripts its
 # own jobserver, so dropping make's costs no parallelism.
-CHECK_CARGO_ENV = env -u MAKEFLAGS -u MFLAGS CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+# Incremental, since a check or a test-llm run is usually a rerun after a
+# small edit: a warm late-ssh test rebuild after a one-line edit takes about
+# 25s and 5G, a cold one about 70s and 7.5G. CI runs cargo itself, without
+# incremental.
+CHECK_CARGO_ENV = env -u MAKEFLAGS -u MFLAGS CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 # Cap parallel compile/link jobs locally; 16-way builds spike past RAM on a
 # swapless machine and freeze the desktop. CI overrides via CHECK_BUILD_JOBS.
 CHECK_BUILD_JOBS ?= 8
@@ -85,17 +89,42 @@ check-db-down:
 	$(CHECK_DB_STOP)
 
 # Targeted, memory-capped test run for LLM agents.
-# Usage: make test-llm ARGS="-p late-ssh -E 'test(chat)'"
-# MemoryHigh throttles the build before the desktop starves; MemoryMax kills
-# the scope outright instead of freezing a swapless machine.
-TEST_LLM_MEM_HIGH ?= 10G
-TEST_LLM_MEM_MAX ?= 12G
+# Usage: make test-llm ARGS="-p late-ssh --lib -E 'test(chat)'"
+# (`--lib` on a crate with a lib and a main: without it nextest builds the lib
+# a second time for the binary's empty test target, doubling the heaviest
+# compile.)
+# Each `-p` set builds its own late-ssh test binary with its own incremental
+# cache, so a set the machine has not built yet starts cold. The cold peak is
+# rustc's frontend holding the whole late-ssh crate: 4 build jobs instead of 8
+# saves under 0.5G of it.
+# The run is a scope in background.slice, whose CPU weight (30, to app.slice's
+# 100) lets the browser, audio and other sessions win the CPU. Its memory cap
+# follows what is free at launch: MemAvailable less TEST_LLM_HEADROOM_G, never
+# above TEST_LLM_MEM_MAX_G. A fixed cap larger than what is free never trips
+# on a loaded swapless machine, and the global OOM killer takes the browser
+# instead. MemoryMax kills inside the scope, not the desktop, and systemd then
+# stops the whole scope (exit 143, which test-llm names). There is no
+# MemoryHigh: with no swap a build over it cannot be reclaimed, only
+# throttled, and it stalls for half an hour instead of failing. Under
+# TEST_LLM_MEM_MIN_G the run refuses to start, since a cold build needs it.
+TEST_LLM_MEM_MAX_G ?= 12
+TEST_LLM_HEADROOM_G ?= 3
+TEST_LLM_MEM_MIN_G ?= 9
 .PHONY: test-llm
 test-llm: .env
 	@set -e; \
+	avail_g=$$(awk '/^MemAvailable:/ {print int($$2 / 1048576)}' /proc/meminfo); \
+	max_g=$$((avail_g - $(TEST_LLM_HEADROOM_G))); \
+	if [ $$max_g -gt $(TEST_LLM_MEM_MAX_G) ]; then max_g=$(TEST_LLM_MEM_MAX_G); fi; \
+	if [ $$max_g -lt $(TEST_LLM_MEM_MIN_G) ]; then \
+		echo "test-llm: $${avail_g}G free, needs $$(($(TEST_LLM_MEM_MIN_G) + $(TEST_LLM_HEADROOM_G)))G; free some memory and retry" >&2; \
+		exit 1; \
+	fi; \
+	echo "test-llm: memory cap $${max_g}G ($${avail_g}G free)"; \
 	trap 'status=$$?; $(CHECK_DB_STOP); exit $$status' EXIT; \
 	$(CHECK_DB_START); \
-	TEST_DATABASE_URL="$(CHECK_TEST_DATABASE_URL)" $(CHECK_CARGO_ENV) systemd-run --user --scope -q -p MemoryHigh=$(TEST_LLM_MEM_HIGH) -p MemoryMax=$(TEST_LLM_MEM_MAX) cargo nextest run --build-jobs $(CHECK_BUILD_JOBS) --no-fail-fast --failure-output final $(ARGS)
+	TEST_DATABASE_URL="$(CHECK_TEST_DATABASE_URL)" $(CHECK_CARGO_ENV) systemd-run --user --scope -q --slice=background.slice -p MemoryMax=$${max_g}G cargo nextest run --build-jobs $(CHECK_BUILD_JOBS) --no-fail-fast --failure-output final $(ARGS) \
+		|| { status=$$?; case $$status in 137|143) echo "test-llm: killed at the $${max_g}G memory cap; free some memory and retry" >&2;; esac; exit $$status; }
 
 # The Lateania battle arena: every balance contract and both report parts
 # (late-ssh/target/lateania-arena*.md). Thousands of real engine fights, so
@@ -103,7 +132,7 @@ test-llm: .env
 # change. Serial (-j1): the report tests each need most of a CPU-minute budget.
 .PHONY: arena
 arena:
-	$(MAKE) test-llm ARGS="-p late-ssh --run-ignored all -j1 -E 'test(lateania::svc::arena)'"
+	$(MAKE) test-llm ARGS="-p late-ssh --lib --run-ignored all -j1 -E 'test(lateania::svc::arena)'"
 
 # The deadchannel balance arena (late-ssh/src/app/deadchannel/fight/BALANCE.md):
 # every contract plus the report, every table for the live rules, written to
@@ -111,21 +140,21 @@ arena:
 # rules change.
 .PHONY: deadchannel-arena
 deadchannel-arena:
-	$(MAKE) test-llm ARGS="-p late-ssh --run-ignored all --no-capture -E 'test(deadchannel::fight::arena) and not test(arena_sweep) and not test(arena_crystals)'"
+	$(MAKE) test-llm ARGS="-p late-ssh --lib --run-ignored all --no-capture -E 'test(deadchannel::fight::arena) and not test(arena_sweep) and not test(arena_crystals)'"
 
 # The balance sweep: one reading per candidate set of rules in
 # arena_test.rs::SWEEP, side by side, written to
 # late-ssh/target/deadchannel-sweep.md. Edit SWEEP, run this, read the table.
 .PHONY: deadchannel-sweep
 deadchannel-sweep:
-	$(MAKE) test-llm ARGS="-p late-ssh --run-ignored all --no-capture -E 'test(arena_sweep)'"
+	$(MAKE) test-llm ARGS="-p late-ssh --lib --run-ignored all --no-capture -E 'test(arena_sweep)'"
 
 # The crystal question (fight/BALANCE.md, "What a crystal buys"): the crystal
 # players side by side under the live rules and with pours priced in bits,
 # written to late-ssh/target/deadchannel-crystals.md.
 .PHONY: deadchannel-crystals
 deadchannel-crystals:
-	$(MAKE) test-llm ARGS="-p late-ssh --run-ignored all --no-capture -E 'test(arena_crystals)'"
+	$(MAKE) test-llm ARGS="-p late-ssh --lib --run-ignored all --no-capture -E 'test(arena_crystals)'"
 
 # Whole simulated runs, start to finish: one seeded climb a player from a
 # fresh row to the first mark, every shop visit, step, and turn, written to
@@ -133,11 +162,12 @@ deadchannel-crystals:
 # rules is like.
 .PHONY: deadchannel-run
 deadchannel-run:
-	$(MAKE) test-llm ARGS="-p late-ssh --run-ignored all --no-capture -E 'test(arena_run)'"
+	$(MAKE) test-llm ARGS="-p late-ssh --lib --run-ignored all --no-capture -E 'test(arena_run)'"
 
-# Full pre-merge sweep, and the only place the otel feature is exercised:
-# clippy + tests run the whole workspace WITH --features otel, so the real
+# Full pre-merge sweep, and the only place the otel feature is compiled:
+# clippy lints the whole workspace WITH --features otel, so the real
 # telemetry/metrics code (the config prod ships) is compiled and linted here.
+# The tests run without it.
 # CI deliberately skips otel to stay cheap (see .github/workflows/ci.yml), so
 # this is where otel breakage is caught before release. fmt stays scoped to
 # first-party packages: `cargo fmt --all` also reaches vendored path deps like
@@ -151,8 +181,14 @@ check: .env
 	$(CHECK_CARGO_ENV) cargo clippy -j $(CHECK_BUILD_JOBS) --workspace --all-targets --features otel -- -D warnings; \
 	TEST_DATABASE_URL="$(CHECK_TEST_DATABASE_URL)" $(CHECK_CARGO_ENV) cargo nextest run --build-jobs $(CHECK_BUILD_JOBS) --workspace --all-targets --no-fail-fast --failure-output final
 
+# late-ssh runs as pods behind an edge, the way prod runs it (scripts/fleet.sh,
+# docker-compose.yml). `make start` brings the stack up on the working tree and
+# rolls out a new generation for every change that rebuilds the binary; Ctrl-C
+# stops the stack. Prod runs one replica, and more pair badly until pair
+# websockets route to the owning pod (SCALE.md, Pain Point 2).
+REPLICAS ?= 1
 start: .env keys
-	docker compose -f docker-compose.yml up --build
+	scripts/fleet.sh start $(REPLICAS) plain
 
 # Drop the per-test databases that killed test runs leave behind. Each test
 # makes its own and drops it on the way out, but a cancelled or timed-out run
@@ -172,18 +208,36 @@ start-amd64: .env keys
 		postgres:18 \
 		libretime/icecast:2.4.4 \
 		savonet/liquidsoap:v2.4.0 \
-		livekit/livekit-server:latest; do \
+		livekit/livekit-server:latest \
+		haproxy:2.9-alpine; do \
 		docker pull --platform linux/amd64 "$$image"; \
 	done
-	DOCKER_DEFAULT_PLATFORM=linux/amd64 docker compose -f docker-compose.yml up --build
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 scripts/fleet.sh start $(REPLICAS) plain
 
 startm: .env keys
-	docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up --build
+	scripts/fleet.sh start $(REPLICAS) monitoring
+# `down` takes the containers away and keeps the database (the named
+# `postgres-data` volume); `remove` wipes the database too. Not `down -v`:
+# that also drops the cargo caches and forces a full rebuild.
 down:
-	docker compose -f docker-compose.yml -f docker-compose.monitoring.yml down
+	scripts/fleet.sh down
 stop:
-	docker compose -f docker-compose.yml -f docker-compose.monitoring.yml stop
+	scripts/fleet.sh stop
 remove: down
+	docker volume rm -f "$$(docker compose -f docker-compose.yml config | sed -n 's/^name: //p')_postgres-data"
+
+# Working the pods of a running `make start` from another terminal: roll the
+# working tree out now (a deploy, even when the binary is unchanged), list the
+# pods, follow them, or kill the draining ones as the 6 h grace deadline does.
+.PHONY: fleet-rollout fleet-ps fleet-logs fleet-expire
+fleet-rollout:
+	scripts/fleet.sh rollout $(REPLICAS) always
+fleet-ps:
+	@scripts/fleet.sh ps
+fleet-logs:
+	@scripts/fleet.sh logs
+fleet-expire:
+	scripts/fleet.sh expire
 
 # Stops every running container on this machine, not just this project's.
 .PHONY: stop-all

@@ -136,6 +136,7 @@ pub(crate) fn dashboard_home_selected(
 /// non-image render still draws the existing prompt + footer.
 fn push_quit_confirm_sayonara_placement(
     modal_area: Rect,
+    can_restart: bool,
     protocol: Option<crate::app::files::terminal_image::TerminalImageProtocol>,
     terminal_images: &mut crate::app::files::terminal_image::TerminalImageFrame,
 ) {
@@ -146,7 +147,7 @@ fn push_quit_confirm_sayonara_placement(
     let Some(protocol) = protocol else {
         return;
     };
-    let Some(area) = sayonara_scene_area(modal_area) else {
+    let Some(area) = sayonara_scene_area(modal_area, can_restart) else {
         return;
     };
     let data = match sayonara_terminal_image(protocol) {
@@ -349,6 +350,8 @@ struct DrawContext<'a> {
     show_settings: bool,
     settings_modal_state: &'a settings_modal::state::SettingsModalState,
     show_quit_confirm: bool,
+    /// The quit modal offers `r restart` (`handoff::svc::can_request_move`).
+    quit_confirm_can_restart: bool,
     show_mod_modal: bool,
     show_hub_modal: bool,
     aquarium_state: &'a crate::app::hub::aquarium::state::AquariumState,
@@ -360,6 +363,9 @@ struct DrawContext<'a> {
     mod_modal_state: &'a mod_modal::state::ModModalState,
     show_profile_modal: bool,
     profile_modal_state: &'a profile_modal::state::ProfileModalState,
+    /// This session's user is a standing runner: the profile's runner
+    /// column shows only to the wire's own.
+    is_runner: bool,
     show_sheet_modal: bool,
     sheet_modal_state: &'a sheet_modal::state::SheetModalState,
     show_poll_modal: bool,
@@ -418,6 +424,7 @@ struct DrawContext<'a> {
     booth_modal_open: bool,
     booth_modal_state: &'a crate::app::audio::booth::state::BoothModalState,
     booth_snapshot: crate::app::audio::svc::QueueSnapshot,
+    booth_favorites: &'a [crate::app::audio::svc::FavoriteItemView],
     booth_submit_enabled: bool,
     stations_modal_open: bool,
     stations_modal_state: &'a crate::app::audio::stations_modal::state::StationsModalState,
@@ -438,7 +445,7 @@ struct DrawContext<'a> {
     user_id: uuid::Uuid,
     pet_species: late_core::models::pet::PetSpecies,
     news_reader: Option<&'a chat::news::reader::state::ReaderModal>,
-    news_watch: Option<&'a chat::news::watch::state::WatchModal>,
+    video_modal: Option<&'a crate::app::video::state::WatchModal>,
     is_draining: bool,
     icon_picker_open: bool,
     icon_picker_state: &'a icon_picker::IconPickerState,
@@ -498,7 +505,8 @@ impl App {
             Some(state) => self.live_games.watchers_of(state.key()),
             None => 0,
         };
-        let games_hub_roster = HubGame::roster(self.is_runner());
+        let is_runner = self.is_runner();
+        let games_hub_roster = HubGame::roster(is_runner);
         // Away with the Tweak on: the piece covers everything this frame.
         let screensaver = self.screensaver();
         let ascii_clock = crate::app::ascii::piece::clock_now();
@@ -673,6 +681,9 @@ impl App {
         let eq_state =
             crate::app::audio::viz::eq_state(paired_client.as_ref(), self.audio.live_bands());
         let paired_cli_supports_voice = self.paired_cli_supports_voice();
+        // Asked only while the modal is up: it takes the registry lock.
+        let quit_confirm_can_restart =
+            self.show_quit_confirm && crate::app::handoff::svc::can_request_move(self);
         let banner = self.active_banner().cloned();
         // First contact, stage 1 (`app/deadchannel/haunt`): a live glitch
         // burst swaps a clock character or two for the glyph alphabet.
@@ -762,10 +773,6 @@ impl App {
             .unwrap_or(&[]);
         let dashboard_selected_image_message = shell_active_room
             .is_some_and(|room_id| self.chat.selected_message_has_inline_image_in_room(room_id));
-        let dashboard_room_effects = shell_active_room
-            .and_then(|room_id| self.shop_state.active_room_effects().get(&room_id))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         let dashboard_active_poll =
             shell_active_room.and_then(|room_id| self.chat.active_poll_for_room(room_id));
         // The live games on the watchable doors: the hub rail's live rows,
@@ -791,7 +798,6 @@ impl App {
                 &self.daily,
                 &self.audio,
                 self.paired_source,
-                self.chat.news.all_articles(),
                 &self.chat.live_streams,
                 &live_rows,
                 &self.live_games,
@@ -848,7 +854,6 @@ impl App {
                     &self.daily,
                     &self.audio,
                     self.paired_source,
-                    self.chat.news.all_articles(),
                     &self.chat.live_streams,
                     &live_rows,
                     &self.live_games,
@@ -876,7 +881,7 @@ impl App {
         };
         // The lounge's spawn (`deadchannel/lounge`) as the scene above the
         // #lounge card's composer, for a runner only.
-        let dashboard_lounge = if home_selected && self.is_runner() {
+        let dashboard_lounge = if home_selected && is_runner {
             let now_ms = crate::app::presence::svc::now_ms();
             self.lounge.showing(now_ms).map(|spawn| {
                 crate::app::deadchannel::lounge::ui::scene(
@@ -944,7 +949,6 @@ impl App {
             name_flicker,
             translations: &self.chat.translations,
             translation_hidden: &self.chat.translation_hidden,
-            active_room_effects: dashboard_room_effects,
             active_poll: dashboard_active_poll,
             live_strip: dashboard_live_strip,
             live_strip_hit: &self.live.hit,
@@ -958,6 +962,7 @@ impl App {
                 None
             },
             inline_images: &self.chat.inline_image_cache,
+            news_cards: self.chat.news.lounge_cards(),
             keep_composer_focused: self.profile_state.profile().keep_composer_focused,
             composer_rect_slot: Some(&self.chat.last_composer_rect),
             composer_viewport_top_slot: Some(&self.chat.last_composer_viewport_top),
@@ -966,6 +971,8 @@ impl App {
         };
         let news_view = chat::news::ui::ArticleListView {
             articles: self.chat.news.displayed_articles(),
+            saved_len: self.chat.news.saved_len(),
+            saved_count: self.chat.news.saved_count(),
             selected_index: self.chat.news.selected_index(),
             marker: self.chat.news.marker(),
             watch_positions: self.chat.news.watch_positions(),
@@ -1012,7 +1019,7 @@ impl App {
         };
         let work_unread_count = self.chat.work.unread_count();
         let news_reader = self.chat.reader();
-        let news_watch = self.chat.watch();
+        let video_modal = self.video.modal();
         let selected_image_message = self
             .chat
             .selected_room_id
@@ -1062,6 +1069,7 @@ impl App {
             message_reactions,
             message_gilds,
             inline_images: &self.chat.inline_image_cache,
+            news_cards: self.chat.news.lounge_cards(),
             afk_lines: &self.chat.afk_lines,
             device_left_at: self.chat.device_left_at(),
             unread_counts: &self.chat.unread_counts,
@@ -1146,6 +1154,7 @@ impl App {
                     message_reactions,
                     message_gilds,
                     inline_images: &self.chat.inline_image_cache,
+                    news_cards: self.chat.news.lounge_cards(),
                     dividers: crate::app::chat::ui::ChatDividers {
                         afk_line: self.chat.afk_lines.get(&chat_room_id).copied(),
                         left_app: self.chat.device_left_at(),
@@ -1211,6 +1220,7 @@ impl App {
                     message_reactions,
                     message_gilds,
                     inline_images: &self.chat.inline_image_cache,
+                    news_cards: self.chat.news.lounge_cards(),
                     dividers: crate::app::chat::ui::ChatDividers {
                         afk_line: self.chat.afk_lines.get(&chat_room_id).copied(),
                         left_app: self.chat.device_left_at(),
@@ -1281,6 +1291,7 @@ impl App {
                     message_reactions,
                     message_gilds,
                     inline_images: &self.chat.inline_image_cache,
+                    news_cards: self.chat.news.lounge_cards(),
                     dividers: crate::app::chat::ui::ChatDividers {
                         afk_line: self.chat.afk_lines.get(&chat_room_id).copied(),
                         left_app: self.chat.device_left_at(),
@@ -1348,6 +1359,7 @@ impl App {
                 message_reactions,
                 message_gilds,
                 inline_images: &self.chat.inline_image_cache,
+                news_cards: self.chat.news.lounge_cards(),
                 dividers: crate::app::chat::ui::ChatDividers {
                     afk_line: self.chat.afk_lines.get(&chat_room_id).copied(),
                     left_app: self.chat.device_left_at(),
@@ -1428,6 +1440,7 @@ impl App {
                     message_reactions,
                     message_gilds,
                     inline_images: &self.chat.inline_image_cache,
+                    news_cards: self.chat.news.lounge_cards(),
                     dividers: crate::app::chat::ui::ChatDividers {
                         afk_line: self.chat.afk_lines.get(&chat_room_id).copied(),
                         left_app: self.chat.device_left_at(),
@@ -1611,7 +1624,7 @@ impl App {
             || self.show_splash
             || screensaver.is_some()
             || news_reader.is_some()
-            || news_watch.is_some()
+            || video_modal.is_some()
             || self.icon_picker_open
             || self.room_search_modal_state.is_open()
             || self.booth_modal_state.is_open()
@@ -1634,7 +1647,7 @@ impl App {
             || self.show_splash
             || screensaver.is_some()
             || news_reader.is_some()
-            || news_watch.is_some()
+            || video_modal.is_some()
             || self.icon_picker_open
             || self.room_search_modal_state.is_open()
             || self.booth_modal_state.is_open()
@@ -1817,6 +1830,7 @@ impl App {
                         show_settings: self.show_settings,
                         settings_modal_state: &self.settings_modal_state,
                         show_quit_confirm: self.show_quit_confirm,
+                        quit_confirm_can_restart,
                         show_mod_modal: self.show_mod_modal,
                         show_hub_modal: self.show_hub_modal,
                         aquarium_state: &self.aquarium_state,
@@ -1828,6 +1842,7 @@ impl App {
                         mod_modal_state: &self.mod_modal_state,
                         show_profile_modal: self.show_profile_modal,
                         profile_modal_state: &self.profile_modal_state,
+                        is_runner,
                         show_sheet_modal: self.show_sheet_modal,
                         sheet_modal_state: &self.sheet_modal_state,
                         show_poll_modal: self.show_poll_modal,
@@ -1879,6 +1894,7 @@ impl App {
                         booth_modal_open: self.booth_modal_state.is_open(),
                         booth_modal_state: &self.booth_modal_state,
                         booth_snapshot: self.audio.queue_snapshot(),
+                        booth_favorites: self.audio.booth_favorites(),
                         booth_submit_enabled: self.audio.booth_submit_enabled(),
                         stations_modal_open: self.stations_modal_state.is_open(),
                         stations_modal_state: &self.stations_modal_state,
@@ -1895,7 +1911,7 @@ impl App {
                         user_id: self.user_id,
                         pet_species: self.pet_state.species,
                         news_reader,
-                        news_watch,
+                        video_modal,
                         is_draining: self.is_draining.load(std::sync::atomic::Ordering::Relaxed),
                         icon_picker_open: self.icon_picker_open,
                         icon_picker_state: &self.icon_picker_state,
@@ -1957,7 +1973,7 @@ impl App {
         draw_result?;
         // The draw recorded the watch player's body; the paired CLI hears
         // about any play, move, or stop that implies.
-        chat::news::watch::svc::sync(self);
+        crate::app::video::svc::sync(self);
 
         // Feed the modal's image capacity (recorded during draw) back into
         // chat state so the next frame's Sixel fetch encodes to fit.
@@ -2257,9 +2273,9 @@ impl App {
                         content_area,
                         &crate::app::door::spectate::ui::SpectateView {
                             state,
-                            entry: state
+                            row: state
                                 .row_in(&ctx.live_rows)
-                                .map(|index| &ctx.live_rows[index].entry),
+                                .map(|index| &ctx.live_rows[index]),
                             watchers: ctx.held_watchers,
                         },
                         crate::app::door::spectate::ui::WatchPane::Open(
@@ -2329,7 +2345,7 @@ impl App {
                         pane,
                         &crate::app::door::spectate::ui::SpectateView {
                             state,
-                            entry: live_selected.map(|index| &ctx.live_rows[index].entry),
+                            row: live_selected.map(|index| &ctx.live_rows[index]),
                             watchers: ctx.held_watchers,
                         },
                         crate::app::door::spectate::ui::WatchPane::Preview,
@@ -2838,7 +2854,13 @@ impl App {
         }
 
         if ctx.show_profile_modal {
-            profile_modal::ui::draw(frame, inner, ctx.profile_modal_state, ctx.marquee_tick);
+            profile_modal::ui::draw(
+                frame,
+                inner,
+                ctx.profile_modal_state,
+                ctx.is_runner,
+                ctx.marquee_tick,
+            );
         }
 
         if ctx.show_sheet_modal {
@@ -2955,9 +2977,10 @@ impl App {
         }
 
         if ctx.show_quit_confirm {
-            quit_confirm::ui::draw(frame, inner);
+            quit_confirm::ui::draw(frame, inner, ctx.quit_confirm_can_restart);
             push_quit_confirm_sayonara_placement(
                 inner,
+                ctx.quit_confirm_can_restart,
                 ctx.terminal_image_protocol,
                 terminal_images,
             );
@@ -2968,8 +2991,8 @@ impl App {
         }
 
         // Over the whole terminal, not the app frame: Full is every cell.
-        if let Some(watch) = ctx.news_watch {
-            chat::news::watch::ui::draw(frame, area, watch);
+        if let Some(modal) = ctx.video_modal {
+            crate::app::video::ui::draw(frame, area, modal);
         }
 
         if ctx.room_search_modal_open {
@@ -3028,6 +3051,7 @@ impl App {
                 inner,
                 ctx.booth_modal_state,
                 &ctx.booth_snapshot,
+                ctx.booth_favorites,
                 ctx.booth_submit_enabled,
                 ctx.is_admin || ctx.is_moderator,
             );
@@ -3112,7 +3136,7 @@ fn foreground_terminal_overlay_open(ctx: &DrawContext<'_>) -> bool {
         || ctx.show_help
         || ctx.show_ultimate_modal
         || ctx.news_reader.is_some()
-        || ctx.news_watch.is_some()
+        || ctx.video_modal.is_some()
         || ctx.room_search_modal_open
         || ctx.chat_state.history_modal.is_open()
         || ctx.booth_modal_open
@@ -3132,6 +3156,25 @@ fn own_chat_split(
     }
 }
 
+/// The numbered page tabs in the frame title, by the screen each one is.
+const FRAME_TABS: [(Screen, &str); 8] = [
+    (Screen::Clubhouse, "0"),
+    (Screen::Dashboard, "1"),
+    (Screen::Arcade, "2"),
+    (Screen::Games, "3"),
+    (Screen::Artboard, "4"),
+    (Screen::Profiles, "5"),
+    (Screen::Leaderboard, "6"),
+    (Screen::Calendars, "7"),
+];
+
+/// A screen off the tab cycle lights the tab of its page (`Screen::page`): a
+/// door keeps Games lit, the daily board keeps Home lit. Zen is a page with
+/// no tab.
+fn tab_is_lit(tab_screen: Screen, screen: Screen) -> bool {
+    tab_screen == screen.page().screen()
+}
+
 fn app_frame_title(screen: Screen, ctx: &DrawContext<'_>) -> Line<'static> {
     let mut spans = vec![Span::styled(
         " late.sh ",
@@ -3141,43 +3184,11 @@ fn app_frame_title(screen: Screen, ctx: &DrawContext<'_>) -> Line<'static> {
     )];
 
     spans.push(Span::styled("| ", Style::default().fg(theme::BORDER_DIM())));
-    let tabs = [
-        (Screen::Clubhouse, "0"),
-        (Screen::Dashboard, "1"),
-        (Screen::Arcade, "2"),
-        (Screen::Games, "3"),
-        (Screen::Artboard, "4"),
-        (Screen::Profiles, "5"),
-        (Screen::Leaderboard, "6"),
-        (Screen::Calendars, "7"),
-    ];
-    for (idx, (tab_screen, key)) in tabs.iter().enumerate() {
+    for (idx, (tab_screen, key)) in FRAME_TABS.iter().enumerate() {
         if idx > 0 {
             spans.push(Span::raw(" "));
         }
-        // While a door game is open the user is "inside" the Games hub, so keep
-        // the Games tab lit rather than leaving no tab highlighted. The daily
-        // board is a Home-surface feature, so Home stays lit there.
-        let active = *tab_screen == screen
-            || (*tab_screen == Screen::Games
-                && matches!(
-                    screen,
-                    Screen::Lateania
-                        | Screen::Rebels
-                        | Screen::Nethack
-                        | Screen::Dcss
-                        | Screen::Brogue
-                        | Screen::Usurper
-                        | Screen::Dopewars
-                        | Screen::Bashquest
-                        | Screen::Codekeep
-                        | Screen::Zork
-                        | Screen::GreenDragon
-                ))
-            || (*tab_screen == Screen::Dashboard
-                && matches!(screen, Screen::DailyMatch | Screen::HouseTable))
-            || (*tab_screen == Screen::Clubhouse
-                && matches!(screen, Screen::City | Screen::Nightcap));
+        let active = tab_is_lit(*tab_screen, screen);
         let style = if active {
             Style::default()
                 .fg(theme::BG_SELECTION())

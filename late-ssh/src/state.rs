@@ -114,6 +114,7 @@ pub struct State {
     pub translation_service: crate::app::ai::translate::TranslationService,
     pub summary_service: crate::app::ai::summary::SummaryService,
     pub paper_service: crate::app::paper::svc::PaperService,
+    pub herald_service: crate::app::herald::svc::HeraldService,
     pub jobs_service: crate::app::jobs::svc::JobsService,
     pub audio_service: AudioService,
     pub voice_service: VoiceService,
@@ -149,6 +150,7 @@ pub struct State {
     pub arcade_handle_service: crate::app::door::arcade::ArcadeHandleService,
     pub live_games: crate::app::door::spectate::svc::LiveGamesService,
     pub door_rc_service: crate::app::door::rc::DoorRcService,
+    pub games_hub_service: crate::app::door::hub::svc::GamesHubService,
     pub daily_service: crate::app::lobby::daily::svc::DailyService,
     pub realm_service: crate::app::door::realm::svc::RealmService,
     pub house_registry: crate::app::lobby::house::registry::HouseTableRegistry,
@@ -179,7 +181,6 @@ pub struct State {
     /// Live 24h username effects (snapshot-swap; seeded and written by
     /// `ShopService`, resolved per session in the tick loop).
     pub flair_directory: crate::app::common::username_effect::NameFlairDirectory,
-    pub crown_service: crate::app::crown::svc::CrownService,
     pub pot_service: crate::app::pot::svc::PotService,
     pub referral_service: crate::app::referral::svc::ReferralService,
     pub activity_feed: broadcast::Sender<ActivityEvent>,
