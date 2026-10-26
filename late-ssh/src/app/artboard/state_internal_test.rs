@@ -185,6 +185,7 @@ fn paste_bytes_activates_floating_preview_before_stamping() {
         state.move_right((80, 24));
     }
     state.move_down((80, 24));
+    let blank = state.snapshot.canvas.clone();
 
     state.paste_bytes(b"hello\nworld", (80, 24));
 
@@ -194,7 +195,10 @@ fn paste_bytes_activates_floating_preview_before_stamping() {
     assert_eq!(floating.anchor, Pos { x: 2, y: 1 });
     assert_eq!(floating.width, 5);
     assert_eq!(floating.height, 2);
-    assert_eq!(state.snapshot.canvas.get(Pos { x: 2, y: 1 }), ' ');
+    assert!(
+        state.snapshot.canvas == blank,
+        "the preview must not write to the canvas"
+    );
 
     state.move_right((80, 24));
     state.move_down((80, 24));
@@ -215,8 +219,13 @@ fn paste_bytes_activates_floating_preview_before_stamping() {
 #[test]
 fn paste_bytes_preserves_wide_glyph_cells_and_dismiss_leaves_canvas_clean() {
     let mut state = test_state();
+    let blank = state.snapshot.canvas.clone();
     state.paste_bytes("A👍\r\n B".as_bytes(), (80, 24));
 
+    assert!(
+        state.snapshot.canvas == blank,
+        "the preview must not write to the canvas"
+    );
     let floating = state.floating_view().expect("floating preview");
     assert_eq!(floating.width, 3);
     assert_eq!(floating.height, 2);
@@ -234,7 +243,10 @@ fn paste_bytes_preserves_wide_glyph_cells_and_dismiss_leaves_canvas_clean() {
 
     assert!(state.dismiss_floating());
     assert!(!state.has_floating());
-    assert_eq!(state.snapshot.canvas.get(Pos { x: 0, y: 0 }), ' ');
+    assert!(
+        state.snapshot.canvas == blank,
+        "dismissing the preview must leave the canvas untouched"
+    );
 }
 
 #[test]
@@ -245,7 +257,7 @@ fn paste_bytes_ignores_whitespace_only_and_caps_to_canvas_dimensions() {
     state.paste_bytes(b"   \r\n  ", (80, 24));
     assert!(!state.has_floating());
 
-    state.paste_bytes("ABC👍\n123456\n789".as_bytes(), (80, 24));
+    state.paste_bytes("ABC👍D\n123456\n789".as_bytes(), (80, 24));
     let floating = state.floating_view().expect("capped floating preview");
     assert_eq!(floating.width, 4);
     assert_eq!(floating.height, 2);
