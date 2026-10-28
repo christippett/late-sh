@@ -19,6 +19,7 @@ use late_core::{
         media_source::MediaSource,
         radio_listen::RadioListen,
         user::{AudioSource, RadioSlots, RadioStation, User},
+        youtube_listen::YoutubeListen,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ use uuid::Uuid;
 use super::{thumbnail::Thumbnail, youtube::YoutubeClient};
 use crate::{
     authz::Permissions,
-    metrics::{self, RadioRollCallResult},
+    metrics::{self, RollCallResult},
     paired_clients::PairedClientRegistry,
     state::ActiveUsers,
 };
@@ -41,15 +42,23 @@ const SUBMISSION_WINDOW: chrono::Duration = chrono::Duration::minutes(5);
 const FALLBACK_DEBOUNCE: Duration = Duration::from_secs(10);
 const PLAYBACK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
-/// How often each replica writes down who is on the radio
-/// (`radio_roll_call`). A listener gone inside one interval is missed,
+/// How often each replica writes down who is on the radio and who is on
+/// YouTube (`roll_call`). A listener gone inside one interval is missed,
 /// which is what keeps a station flipped through from counting.
-pub const RADIO_ROLL_CALL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+pub const ROLL_CALL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const STREAM_CAP: Duration = Duration::from_secs(60 * 60);
 const MIN_VIDEO_DURATION_MS: i32 = 30_000;
 const SKIP_VOTE_PERCENT: usize = 30;
 const SKIP_VOTE_MIN: u32 = 2;
 const HISTORY_LIMIT: i64 = 200;
+
+/// What one roll call found on this replica: the radio's listeners per
+/// station, and how many were on YouTube.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RollCall {
+    pub stations: Vec<(RadioStation, u64)>,
+    pub youtube: u64,
+}
 
 #[derive(Clone)]
 pub struct AudioService {
@@ -579,7 +588,7 @@ impl AudioService {
 
         let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
         reconcile.tick().await;
-        let mut roll_call = tokio::time::interval(RADIO_ROLL_CALL_INTERVAL);
+        let mut roll_call = tokio::time::interval(ROLL_CALL_INTERVAL);
         roll_call.tick().await;
         loop {
             tokio::select! {
@@ -594,16 +603,20 @@ impl AudioService {
                     }
                 }
                 _ = roll_call.tick() => {
-                    match self.radio_roll_call(Utc::now()).await {
-                        Ok(listeners) => {
-                            metrics::record_radio_roll_call(RadioRollCallResult::Called, &listeners);
+                    match self.roll_call(Utc::now()).await {
+                        Ok(called) => {
+                            metrics::record_roll_call(
+                                RollCallResult::Called,
+                                &called.stations,
+                                called.youtube,
+                            );
                         }
                         Err(err) => {
-                            metrics::record_radio_roll_call(RadioRollCallResult::Failed, &[]);
+                            metrics::record_roll_call(RollCallResult::Failed, &[], 0);
                             late_core::error_span!(
                                 "radio_roll_call_failed",
                                 error = ?err,
-                                "failed to write the radio roll call"
+                                "failed to write the roll call"
                             );
                         }
                     }
@@ -614,30 +627,58 @@ impl AudioService {
         tracing::info!("audio service shutting down");
     }
 
-    /// The roll call: every paired client on the radio source, written to
-    /// `radio_listens` for `now`'s UTC day under its station
-    /// (`RadioListen::record`). Each replica calls its own paired clients
-    /// and a listener already written today is a no-op, so a day's rows
-    /// are its distinct listeners per station. Returns how many listeners
-    /// each station had on this call, for the counter.
-    pub async fn radio_roll_call(&self, now: DateTime<Utc>) -> Result<Vec<(RadioStation, u64)>> {
-        let listeners = self.paired_clients.radio_listeners();
-        if listeners.is_empty() {
-            return Ok(Vec::new());
+    /// The roll call: every human online on this replica (the roster the
+    /// sidebar's source counts read), written down for `now`'s UTC day by
+    /// the source they have picked: on the radio under its station
+    /// (`RadioListen::record`), on YouTube once (`YoutubeListen::record`).
+    /// It counts who is tuned in, not who is audible: an account with no
+    /// paired CLI, or a muted one, is on its source all the same. Each
+    /// replica calls its own roster and a listener already written today is
+    /// a no-op, so a day's rows are its distinct listeners. Returns how many
+    /// listeners this call found, for the counters.
+    pub async fn roll_call(&self, now: DateTime<Utc>) -> Result<RollCall> {
+        let online: Vec<Uuid> = crate::state::online_human_ids(&self.active_users.lock_recover())
+            .into_iter()
+            .collect();
+        let mut called = RollCall::default();
+        if online.is_empty() {
+            return Ok(called);
         }
         let day = now.date_naive();
         let client = self.db.get().await?;
-        let mut by_station: Vec<(RadioStation, u64)> = Vec::new();
-        for (user_id, station) in listeners {
-            RadioListen::record(&client, user_id, station, day)
-                .await
-                .with_context(|| format!("recording {user_id} on {}", station.as_str()))?;
-            match by_station.iter_mut().find(|(key, _)| *key == station) {
-                Some((_, count)) => *count += 1,
-                None => by_station.push((station, 1)),
+        let tunings = User::audio_tunings_by_ids(&client, &online)
+            .await
+            .context("reading the roster's audio sources")?;
+        for tuning in tunings {
+            match tuning.source {
+                AudioSource::Radio => {
+                    RadioListen::record(&client, tuning.user_id, tuning.station, day)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "recording {} on {}",
+                                tuning.user_id,
+                                tuning.station.as_str()
+                            )
+                        })?;
+                    match called
+                        .stations
+                        .iter_mut()
+                        .find(|(key, _)| *key == tuning.station)
+                    {
+                        Some((_, count)) => *count += 1,
+                        None => called.stations.push((tuning.station, 1)),
+                    }
+                }
+                AudioSource::Youtube => {
+                    YoutubeListen::record(&client, tuning.user_id, day)
+                        .await
+                        .with_context(|| format!("recording {} on youtube", tuning.user_id))?;
+                    called.youtube += 1;
+                }
             }
         }
-        Ok(by_station)
+        Ok(called)
     }
 
     pub async fn submit_url(&self, user_id: Uuid, url: &str) -> Result<SubmitQueueResponse> {

@@ -37,6 +37,7 @@ use late_core::models::paper::{
 use late_core::models::radio_listen::{RadioListen, StationListeners};
 use late_core::models::user::{User, extract_langs};
 use late_core::models::work_profile::WorkProfile;
+use late_core::models::youtube_listen::YoutubeListen;
 use late_core::radio::RadioStation;
 use tokio::sync::broadcast;
 use tokio_postgres::Client;
@@ -632,10 +633,11 @@ impl PaperService {
 
     /// "Yesterday on late.sh": the covered day in numbers, from late.sh's
     /// own rows and no model call: the games finished on each shelf, the
-    /// radio's top stations by listener, the tracks queued in the booth.
-    /// The games and the radio are read by the covered day (their tables
-    /// are kept by UTC day), the booth over the edition's window, which is
-    /// the same day. `Ok(None)` on a day nothing happened.
+    /// radio's top stations by listener, the booth's listeners and the
+    /// tracks queued in it. The games and the listeners are read by the
+    /// covered day (their tables are kept by UTC day), the queue over the
+    /// edition's window, which is the same day. `Ok(None)` on a day nothing
+    /// happened.
     async fn write_yesterday_page(
         &self,
         edition: NaiveDate,
@@ -649,8 +651,11 @@ impl PaperService {
         let tallies = day_tallies(&client, covered).await?;
         let stations =
             RadioListen::top_stations_on(&client, covered, PAPER_YESTERDAY_STATIONS).await?;
-        let queued = MediaQueueItem::count_queued_between(&client, floor, ceiling).await?;
-        Ok(yesterday_column(&tallies, &stations, queued))
+        let booth = Booth {
+            listeners: YoutubeListen::listeners_on(&client, covered).await?,
+            queued: MediaQueueItem::count_queued_between(&client, floor, ceiling).await?,
+        };
+        Ok(yesterday_column(&tallies, &stations, booth))
     }
 
     /// "What we were reading": the day's News shares, editorialized.
@@ -1222,8 +1227,17 @@ pub(crate) fn outside_prompt(edition: NaiveDate, covered: &[(NaiveDate, String)]
     prompt
 }
 
+/// The booth's day for the YESTERDAY column: the accounts on YouTube, and
+/// the tracks queued.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Booth {
+    pub(crate) listeners: i64,
+    pub(crate) queued: i64,
+}
+
 /// The YESTERDAY column's lines: the radio first (its stations by
-/// listener, the most listened first), then the booth, then one per
+/// listener, the most listened first), then the booth (its listeners next
+/// to its tracks queued), then one per
 /// shelf anyone played on: the arcade's and the Lobby's finishes, and
 /// which game had the most of them, or that one game had them all; the
 /// doors opened, per door by openings, and the runs won. The radio, the
@@ -1233,7 +1247,7 @@ pub(crate) fn outside_prompt(edition: NaiveDate, covered: &[(NaiveDate, String)]
 pub(crate) fn yesterday_column(
     tallies: &[DayTally],
     stations: &[StationListeners],
-    queued: i64,
+    booth: Booth,
 ) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     if let Some((first, rest)) = stations.split_first() {
@@ -1250,10 +1264,21 @@ pub(crate) fn yesterday_column(
         }
         lines.push(line);
     }
-    match queued {
-        0 => {}
-        1 => lines.push("Booth: 1 track queued".to_string()),
-        queued => lines.push(format!("Booth: {queued} tracks queued")),
+    let listeners = match booth.listeners {
+        0 => None,
+        1 => Some("1 listener".to_string()),
+        listeners => Some(format!("{listeners} listeners")),
+    };
+    let queued = match booth.queued {
+        0 => None,
+        1 => Some("1 track queued".to_string()),
+        queued => Some(format!("{queued} tracks queued")),
+    };
+    match (listeners, queued) {
+        (None, None) => {}
+        (Some(listeners), None) => lines.push(format!("Booth: {listeners}")),
+        (None, Some(queued)) => lines.push(format!("Booth: {queued}")),
+        (Some(listeners), Some(queued)) => lines.push(format!("Booth: {listeners}, {queued}")),
     }
     for shelf in Shelf::ALL {
         let on_shelf: Vec<&DayTally> = tallies

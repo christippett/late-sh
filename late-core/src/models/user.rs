@@ -1244,6 +1244,35 @@ impl User {
         Ok(extract_radio_station(&settings))
     }
 
+    /// The audio source and radio station each of `user_ids` has picked, read
+    /// from their settings as `audio_source` and `radio_station` read them.
+    /// An id with no account is left out.
+    pub async fn audio_tunings_by_ids(
+        client: &impl GenericClient,
+        user_ids: &[Uuid],
+    ) -> Result<Vec<AudioTuning>> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = client
+            .query(
+                "SELECT id, settings FROM users WHERE id = ANY($1)",
+                &[&user_ids],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let settings: Value = row.get("settings");
+                AudioTuning {
+                    user_id: row.get("id"),
+                    source: extract_audio_source(&settings),
+                    station: extract_radio_station(&settings),
+                }
+            })
+            .collect())
+    }
+
     pub async fn start_with_music_muted(client: &Client, user_id: Uuid) -> Result<bool> {
         let settings = Self::settings_for_user(client, user_id).await?;
         Ok(extract_start_with_music_muted(&settings))
@@ -1953,6 +1982,15 @@ impl User {
         }
         Ok(())
     }
+}
+
+/// What one account has picked to hear: its source, and the station it
+/// would be on whenever that source is the radio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioTuning {
+    pub user_id: Uuid,
+    pub source: AudioSource,
+    pub station: RadioStation,
 }
 
 #[derive(Clone, Debug)]

@@ -168,13 +168,13 @@ pub enum HeraldBriefResult {
     Failed,
 }
 
-/// How one radio roll call (`app/audio`, every `RADIO_ROLL_CALL_INTERVAL`
-/// on every replica) went: `Called` wrote this replica's paired radio
+/// How one roll call (`app/audio`, every `ROLL_CALL_INTERVAL` on every
+/// replica) went: `Called` wrote this replica's online radio and YouTube
 /// listeners down for the day, `Failed` stopped at the first listener it
 /// could not write (the ones before it are written, and the next call
 /// fills the gap: a listener already written is a no-op).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RadioRollCallResult {
+pub enum RollCallResult {
     Called,
     Failed,
 }
@@ -792,9 +792,9 @@ mod inner {
         NewsShareReward, NightcapHouseFailure, NightcapOrderResult, OldSignalPayout,
         OnlineTimeFlushResult, OutputKind, PaperOpenResult, PaperPrintResult, Place,
         PoolShotOutcome, PotRefusal, PotReminderOutcome, Presence, PresenceScope, PresenceWire,
-        RadioRollCallResult, RadioStation, RealmChatRoomAttach, RealmPayout, RealmSeasonOpen,
-        RealmSnapshotRowError, Refresh, RefreshOutcome, RenderReason, RoundRefusal, RunnerDoor,
-        Screen, SendRefusal, SessionStartStage, SessionUser, SnapshotRowError, SongQueueReward,
+        RadioStation, RealmChatRoomAttach, RealmPayout, RealmSeasonOpen, RealmSnapshotRowError,
+        Refresh, RefreshOutcome, RenderReason, RollCallResult, RoundRefusal, RunnerDoor, Screen,
+        SendRefusal, SessionStartStage, SessionUser, SnapshotRowError, SongQueueReward,
         SshRejectReason, SummaryResult, TailorBeat, ThumbnailFetch, TranslationResult,
         VizWireBands, WatchDoor,
     };
@@ -1838,10 +1838,10 @@ mod inner {
         })
     }
 
-    fn radio_roll_call_result_label(result: RadioRollCallResult) -> &'static str {
+    fn roll_call_result_label(result: RollCallResult) -> &'static str {
         match result {
-            RadioRollCallResult::Called => "called",
-            RadioRollCallResult::Failed => "failed",
+            RollCallResult::Called => "called",
+            RollCallResult::Failed => "failed",
         }
     }
 
@@ -1851,7 +1851,7 @@ mod inner {
             meter()
                 .u64_counter("late_ssh_radio_roll_calls_total")
                 .with_description(
-                    "Radio roll calls (paired listeners written to radio_listens) by result",
+                    "Roll calls (online radio and YouTube listeners written to radio_listens and youtube_listens) by result",
                 )
                 .build()
         })
@@ -1863,25 +1863,38 @@ mod inner {
             meter()
                 .u64_counter("late_ssh_radio_listeners_total")
                 .with_description(
-                    "Paired clients on the radio source at each roll call, by station",
+                    "Online accounts on the radio source at each roll call, by station",
                 )
                 .build()
         })
     }
 
-    /// One roll call: its result, and how many listeners it found on each
-    /// station (a listener is one account on one station).
-    pub fn record_radio_roll_call(result: RadioRollCallResult, listeners: &[(RadioStation, u64)]) {
+    fn youtube_listeners_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_youtube_listeners_total")
+                .with_description("Online accounts on the YouTube source at each roll call")
+                .build()
+        })
+    }
+
+    /// One roll call: its result, how many listeners it found on each
+    /// station (a listener is one account on one station), and how many
+    /// were on YouTube.
+    pub fn record_roll_call(
+        result: RollCallResult,
+        stations: &[(RadioStation, u64)],
+        youtube: u64,
+    ) {
         radio_roll_calls_total().add(
             1,
-            &[KeyValue::new(
-                "result",
-                radio_roll_call_result_label(result),
-            )],
+            &[KeyValue::new("result", roll_call_result_label(result))],
         );
-        for (station, count) in listeners {
+        for (station, count) in stations {
             radio_listeners_total().add(*count, &[KeyValue::new("station", station.as_str())]);
         }
+        youtube_listeners_total().add(youtube, &[]);
     }
 
     fn booth_thumbnails_total() -> &'static Counter<u64> {
@@ -4305,9 +4318,9 @@ mod inner {
         NewsShareReward, NightcapHouseFailure, NightcapOrderResult, OldSignalPayout,
         OnlineTimeFlushResult, OutputKind, PaperOpenResult, PaperPrintResult, Place,
         PoolShotOutcome, PotRefusal, PotReminderOutcome, Presence, PresenceScope, PresenceWire,
-        RadioRollCallResult, RadioStation, RealmChatRoomAttach, RealmPayout, RealmSeasonOpen,
-        RealmSnapshotRowError, Refresh, RefreshOutcome, RenderReason, RoundRefusal, RunnerDoor,
-        Screen, SendRefusal, SessionStartStage, SessionUser, SnapshotRowError, SongQueueReward,
+        RadioStation, RealmChatRoomAttach, RealmPayout, RealmSeasonOpen, RealmSnapshotRowError,
+        Refresh, RefreshOutcome, RenderReason, RollCallResult, RoundRefusal, RunnerDoor, Screen,
+        SendRefusal, SessionStartStage, SessionUser, SnapshotRowError, SongQueueReward,
         SshRejectReason, SummaryResult, TailorBeat, ThumbnailFetch, TranslationResult,
         VizWireBands, WatchDoor,
     };
@@ -4426,9 +4439,10 @@ mod inner {
     pub fn record_news_save(_outcome: NewsSaveOutcome) {}
     pub fn record_news_card(_outcome: NewsCardOutcome) {}
     pub fn record_song_queued(_reward: SongQueueReward) {}
-    pub fn record_radio_roll_call(
-        _result: RadioRollCallResult,
-        _listeners: &[(RadioStation, u64)],
+    pub fn record_roll_call(
+        _result: RollCallResult,
+        _stations: &[(RadioStation, u64)],
+        _youtube: u64,
     ) {
     }
     pub fn record_booth_thumbnail(_outcome: ThumbnailFetch) {}
