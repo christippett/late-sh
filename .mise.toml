@@ -1,4 +1,46 @@
 [tools]
 rust = "latest"
-mold = "latest"
+mold = { version = "latest", os = ["linux"] }
 "cargo:cargo-nextest" = "latest"
+
+[tasks."dev:env"]
+description = "Copy `.env.dev` to `.env`"
+quiet = true
+run = "cp .env.dev .env"
+
+[tasks."dev:keys"]
+description = "Generate `server_key` (ed25519) if missing"
+quiet = true
+run = "if [ ! -f server_key ]; then ssh-keygen -t ed25519 -f server_key -N '' -q; fi"
+
+[tasks.dev]
+description = "Run the barebones stack (`postgres` + `late-ssh`) in the foreground with `cargo-watch`"
+depends = ["dev:env", "dev:keys"]
+quiet = true
+run = "docker compose -f docker-compose.barebones.yml up --build"
+
+[tasks."dev:up"]
+description = "Start the barebones stack (`postgres` + `late-ssh`) in the background"
+depends = ["dev:env", "dev:keys"]
+quiet = true
+run = "docker compose -f docker-compose.barebones.yml up -d --build"
+
+[tasks."dev:stop"]
+description = "Stop the barebones stack containers without removing them"
+quiet = true
+run = "docker compose -f docker-compose.barebones.yml stop"
+
+[tasks."dev:down"]
+description = "Remove the barebones stack containers (keeps `postgres-data` and Cargo volumes)"
+quiet = true
+run = "docker compose -f docker-compose.barebones.yml down"
+
+[tasks."dev:logs"]
+description = "Follow logs from the barebones stack"
+quiet = true
+run = "docker compose -f docker-compose.barebones.yml logs -f"
+
+[tasks."dev:ps"]
+description = "List containers in the barebones stack"
+quiet = true
+run = "docker compose -f docker-compose.barebones.yml ps"
