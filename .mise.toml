@@ -1,4 +1,4 @@
 [tools]
 rust = "latest"
-mold = { version = "latest", os = ["linux"] }
+mold = "latest"
 "cargo:cargo-nextest" = "latest"

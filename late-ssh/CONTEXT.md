@@ -217,11 +217,7 @@ one `session wire summary` line (`log_wire_summary`). How to read it:
   holds, so a re-placement is an `a=p` of a few dozen bytes. iTerm2 and Sixel
   have no delete-by-id, so `pre_frame_persistent_raster_wipe_bytes` writes wipe
   spaces ahead of the frame on transitions (modal closed, image swapped,
-  overlay opened, screen changed, protocol changed). Inside the draw,
-  `redraw_vacated_persistent_raster` marks the cells under last frame's
-  iTerm2/Sixel images that this frame places none on as
-  `CellDiffOption::AlwaysUpdate`, so the diff rewrites a cell drawn the same
-  (a square a chess piece left, a board dealt fresh). A timed-out side-channel
+  overlay opened, screen changed, protocol changed). A timed-out side-channel
   write calls `force_full_repaint` and abandons the batch.
 - **Video never passes through the server:** the paired CLI's mpv draws to
   the user's tty; the server paints the player black and sends the CLI the
@@ -319,7 +315,7 @@ Keyless sessions (ghost bots, tests) apply a change for the session only.
 `late-ssh/src/config.rs` and `late-web/src/config.rs` hold `dev`, `dev2` and
 `prod` profiles as code, selected by `LATE_ENV` (missing or unknown is a startup
 error). The only other env reads are secrets (DB, LiveKit, door secrets) and
-dev opt-ins keyed on presence: `LATE_AI_API_KEY` (or `GEMINI_API_KEY`), the R2 pair
+dev opt-ins keyed on presence: `LATE_AI_API_KEY`, the R2 pair
 `LATE_FILES_S3_ACCESS_KEY_ID`/`..._SECRET_ACCESS_KEY` (half set is an error),
 `LATE_YOUTUBE_API_KEY`, the herald's pairs `LATE_HERALD_MASTODON_INSTANCE`/
 `..._MASTODON_TOKEN` and `LATE_HERALD_BLUESKY_IDENTIFIER`/`..._BLUESKY_PASSWORD`
