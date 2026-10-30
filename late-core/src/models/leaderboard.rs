@@ -67,14 +67,20 @@ roster!(
     /// daily game here enrolls it in all four surfaces at once. The one thing
     /// the roster cannot enforce: the new game's win-insert statement must
     /// compose `bump_daily_win_total_sql`, or its all-time board stays empty.
-    DailyPuzzle: Sudoku, Nonogram, Minesweeper, Solitaire, LeWord, RubiksCube, SlidingPuzzle
+    ///
+    /// Declaration order is the Arcade lobby's order, and with it the day
+    /// card's, the backtick cycle's, the rollover's, and every board list
+    /// that iterates `ALL`. One order, so nothing else lists the dailies.
+    DailyPuzzle: LeWord, WordWheel, Quartets, Sudoku, Nonogram, Minesweeper, Netwalk,
+        ChessPuzzle, Solitaire, SlidingPuzzle, RubiksCube
 );
 
 roster!(
     /// The score-game roster. Each variant has final-score events in
     /// `game_score_events` plus a legacy best-score table; monthly boards
     /// union both, all-time boards read the legacy table of record.
-    ScoreGame: Lateris, TwentyFortyEight, Snake, Traffic
+    /// Declaration order is the Arcade lobby's order, below the dailies.
+    ScoreGame: TwentyFortyEight, Lateris, Snake, Traffic
 );
 
 roster!(
@@ -96,78 +102,135 @@ roster!(
         Briscola, Cribbage, GinRummy, EightBall, NineBall, Snooker
 );
 
+/// The `difficulty_key` of a single-tier puzzle's one board: the `detail` of
+/// its `GameWon`, its reward-template key, its daily-status rows.
+pub const SINGLE_TIER_KEY: &str = "daily";
+
+/// The three tiers a keyed daily with easy/medium/hard boards pays.
+const THREE_TIERS: &[(&str, Difficulty)] = &[
+    (Difficulty::Easy.key(), Difficulty::Easy),
+    (Difficulty::Medium.key(), Difficulty::Medium),
+    (Difficulty::Hard.key(), Difficulty::Hard),
+];
+
+/// The boards a daily pays for, easiest first. Each board's [`Difficulty`]
+/// sets both its chip bonus ([`Difficulty::chips`], which its
+/// `reward_templates` row mirrors) and its Arcade Wins points
+/// ([`Difficulty::points`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tiers {
+    /// One board a day. Its win table has no `difficulty_key` column; every
+    /// win reports [`SINGLE_TIER_KEY`].
+    Single(Difficulty),
+    /// One board per `difficulty_key`, each on its own tier.
+    Keyed(&'static [(&'static str, Difficulty)]),
+}
+
+impl Tiers {
+    /// Every board as `(difficulty_key, tier)`, easiest first.
+    pub fn list(self) -> Vec<(&'static str, Difficulty)> {
+        match self {
+            Self::Single(difficulty) => vec![(SINGLE_TIER_KEY, difficulty)],
+            Self::Keyed(tiers) => tiers.to_vec(),
+        }
+    }
+}
+
 impl DailyPuzzle {
     /// The stable game key used in activity params and status rows.
     pub const fn key(self) -> &'static str {
         match self {
+            Self::LeWord => "le_word",
+            Self::RubiksCube => "rubiks_cube",
+            Self::SlidingPuzzle => "sliding_puzzle",
             Self::Sudoku => "sudoku",
             Self::Nonogram => "nonogram",
             Self::Minesweeper => "minesweeper",
             Self::Solitaire => "solitaire",
-            Self::LeWord => "le_word",
-            Self::RubiksCube => "rubiks_cube",
-            Self::SlidingPuzzle => "sliding_puzzle",
+            Self::Netwalk => "netwalk",
+            Self::ChessPuzzle => "chess_puzzle",
+            Self::WordWheel => "word_wheel",
+            Self::Quartets => "quartets",
         }
     }
 
     pub const fn title(self) -> &'static str {
         match self {
+            Self::LeWord => "Le Word",
+            Self::RubiksCube => "Rubik's Cube",
+            Self::SlidingPuzzle => "Sliding Puzzle",
             Self::Sudoku => "Sudoku",
             Self::Nonogram => "Nonograms",
             Self::Minesweeper => "Minesweeper",
             Self::Solitaire => "Solitaire",
-            Self::LeWord => "Le Word",
-            Self::RubiksCube => "Rubik's Cube",
-            Self::SlidingPuzzle => "Sliding Puzzle",
+            Self::Netwalk => "Netwalk",
+            Self::ChessPuzzle => "Chess Puzzle",
+            Self::WordWheel => "Word Wheel",
+            Self::Quartets => "Quartets",
+        }
+    }
+
+    /// The boards this daily pays for. The lobby card's marks, the solvers
+    /// roster, the guide's payout and points lists, and the Arcade Wins
+    /// points SQL all read this, so what is shown is what is paid.
+    pub const fn tiers(self) -> Tiers {
+        match self {
+            Self::LeWord => Tiers::Single(Difficulty::Easy),
+            Self::RubiksCube | Self::Quartets => Tiers::Single(Difficulty::Medium),
+            Self::SlidingPuzzle
+            | Self::Sudoku
+            | Self::Nonogram
+            | Self::Minesweeper
+            | Self::Netwalk
+            | Self::ChessPuzzle
+            | Self::WordWheel => Tiers::Keyed(THREE_TIERS),
+            Self::Solitaire => {
+                Tiers::Keyed(&[("draw-1", Difficulty::Medium), ("draw-3", Difficulty::Hard)])
+            }
         }
     }
 
     /// The per-user daily-win fact table.
     pub(crate) const fn wins_table(self) -> &'static str {
         match self {
+            Self::LeWord => "le_word_daily_wins",
+            Self::RubiksCube => "rubiks_cube_daily_wins",
+            Self::SlidingPuzzle => "sliding_puzzle_daily_wins",
             Self::Sudoku => "sudoku_daily_wins",
             Self::Nonogram => "nonogram_daily_wins",
             Self::Minesweeper => "minesweeper_daily_wins",
             Self::Solitaire => "solitaire_daily_wins",
-            Self::LeWord => "le_word_daily_wins",
-            Self::RubiksCube => "rubiks_cube_daily_wins",
-            Self::SlidingPuzzle => "sliding_puzzle_daily_wins",
+            Self::Netwalk => "netwalk_daily_wins",
+            Self::ChessPuzzle => "chess_puzzle_daily_wins",
+            Self::WordWheel => "word_wheel_daily_wins",
+            Self::Quartets => "quartets_daily_wins",
         }
     }
 
     /// SQL expression producing this puzzle's Arcade Wins points for one win
-    /// row. Every weight comes from [`Difficulty::points`]; a difficulty key
-    /// outside the puzzle's real set scores 0, never a silent default.
+    /// row, from [`Self::tiers`]. A difficulty key outside the puzzle's real
+    /// set scores 0, never a silent default.
     pub(crate) fn points_sql(self) -> String {
-        match self {
-            Self::Sudoku | Self::Nonogram | Self::Minesweeper | Self::SlidingPuzzle => {
-                let whens: String = Difficulty::ALL
+        match self.tiers() {
+            Tiers::Single(difficulty) => difficulty.points().to_string(),
+            Tiers::Keyed(tiers) => {
+                let whens: String = tiers
                     .iter()
-                    .map(|d| format!("WHEN '{}' THEN {}", d.key(), d.points()))
+                    .map(|(key, difficulty)| format!("WHEN '{key}' THEN {}", difficulty.points()))
                     .collect::<Vec<_>>()
                     .join(" ");
                 format!("CASE difficulty_key {whens} ELSE 0 END")
             }
-            Self::Solitaire => format!(
-                "CASE difficulty_key WHEN 'draw-1' THEN {} WHEN 'draw-3' THEN {} ELSE 0 END",
-                Difficulty::Easy.points(),
-                Difficulty::Hard.points()
-            ),
-            Self::LeWord => Difficulty::Easy.points().to_string(),
-            Self::RubiksCube => Difficulty::Medium.points().to_string(),
         }
     }
 
     /// SQL expression for the difficulty column of a daily-status row.
-    /// Fixed-tier puzzles have no difficulty column and report `'daily'`.
-    const fn status_difficulty_sql(self) -> &'static str {
-        match self {
-            Self::Sudoku
-            | Self::Nonogram
-            | Self::Minesweeper
-            | Self::Solitaire
-            | Self::SlidingPuzzle => "difficulty_key",
-            Self::LeWord | Self::RubiksCube => "'daily'",
+    /// Single-tier puzzles have no difficulty column and report
+    /// [`SINGLE_TIER_KEY`].
+    fn status_difficulty_sql(self) -> String {
+        match self.tiers() {
+            Tiers::Single(_) => format!("'{SINGLE_TIER_KEY}'"),
+            Tiers::Keyed(_) => "difficulty_key".to_string(),
         }
     }
 
@@ -253,8 +316,8 @@ impl ScoreGame {
     /// The `game_score_events.game` key.
     pub const fn score_event_key(self) -> &'static str {
         match self {
-            Self::Lateris => "tetris",
             Self::TwentyFortyEight => "2048",
+            Self::Lateris => "tetris",
             Self::Snake => "snake",
             Self::Traffic => "traffic",
         }
@@ -262,8 +325,8 @@ impl ScoreGame {
 
     pub const fn title(self) -> &'static str {
         match self {
-            Self::Lateris => "Lateris",
             Self::TwentyFortyEight => "2048",
+            Self::Lateris => "Lateris",
             Self::Snake => "Snake",
             Self::Traffic => "Traffic",
         }
@@ -272,8 +335,8 @@ impl ScoreGame {
     /// The per-user best-score table of record.
     const fn legacy_table(self) -> &'static str {
         match self {
-            Self::Lateris => "tetris_high_scores",
             Self::TwentyFortyEight => "twenty_forty_eight_high_scores",
+            Self::Lateris => "tetris_high_scores",
             Self::Snake => "snake_high_scores",
             Self::Traffic => "traffic_high_scores",
         }
@@ -592,8 +655,9 @@ pub struct DayTally {
 impl DayTally {
     /// The shelf's most played game of the day: the most plays, the first
     /// in tally order on a tie; `None` when nothing on the shelf was
-    /// played. The paper's YESTERDAY line and the front page's headline
-    /// read this one rule.
+    /// played. The paper's YESTERDAY arcade line and the front page's
+    /// headline read this one rule; the Lobby's line weighs its starts
+    /// too (`day_lobby_starts`).
     pub fn most_played(tallies: &[Self], shelf: Shelf) -> Option<&Self> {
         tallies
             .iter()
@@ -619,7 +683,7 @@ impl DayTally {
 
 /// A game of the Arcade shelf: a daily puzzle or a score game. The front
 /// page draws one picture per variant, so a new arcade game breaks the
-/// build there until it has one.
+/// build there until it has one. The Arcade lobby's selection is one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArcadeGame {
     Puzzle(DailyPuzzle),
@@ -627,6 +691,14 @@ pub enum ArcadeGame {
 }
 
 impl ArcadeGame {
+    /// Every game in lobby order: the daily puzzles, then the score games,
+    /// each in its roster's order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        let puzzles = DailyPuzzle::ALL.iter().map(|&puzzle| Self::Puzzle(puzzle));
+        let scores = ScoreGame::ALL.iter().map(|&game| Self::Score(game));
+        puzzles.chain(scores)
+    }
+
     pub const fn title(self) -> &'static str {
         match self {
             Self::Puzzle(puzzle) => puzzle.title(),
@@ -841,6 +913,54 @@ pub async fn day_tallies(client: &Client, day: NaiveDate) -> Result<Vec<DayTally
         .collect::<Result<Vec<_>>>()?;
     tallies.sort_by_key(|(position, _)| *position);
     Ok(tallies.into_iter().map(|(_, tally)| tally).collect())
+}
+
+/// One Lobby game's matches started on one UTC day: the claims that took
+/// a challenge to a match. The day's other side of `DayTally`, which
+/// counts the Lobby by its finishes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LobbyStarts {
+    pub game: LobbyGame,
+    pub started: i64,
+}
+
+/// The UTC day `day` in the Lobby, one count per game a match of was
+/// started (`daily_matches.started_at`, stamped by the claim; migration
+/// 272), in roster order. Whatever the match did after, finished, still
+/// active or forfeited, it started that day.
+pub async fn day_lobby_starts(client: &Client, day: NaiveDate) -> Result<Vec<LobbyStarts>> {
+    let floor = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+    let ceiling = floor + chrono::Duration::days(1);
+    let rows = client
+        .query(
+            "SELECT game_kind, count(*)::bigint AS started
+             FROM daily_matches
+             WHERE started_at >= $1 AND started_at < $2
+             GROUP BY game_kind",
+            &[&floor, &ceiling],
+        )
+        .await?;
+    let mut starts = rows
+        .into_iter()
+        .map(|row| {
+            let kind: String = row.get("game_kind");
+            let (position, game) = match LobbyGame::ALL
+                .iter()
+                .enumerate()
+                .find(|(_, game)| game.kind() == kind)
+            {
+                Some((position, game)) => (position, *game),
+                None => anyhow::bail!("day_lobby_starts found an unknown game kind {kind:?}"),
+            };
+            let started = LobbyStarts {
+                game,
+                started: row.get("started"),
+            };
+            Ok((position, started))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    starts.sort_by_key(|(position, _)| *position);
+    Ok(starts.into_iter().map(|(_, started)| started).collect())
 }
 
 pub async fn fetch_leaderboard_data(client: &Client) -> Result<LeaderboardData> {

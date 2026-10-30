@@ -677,26 +677,6 @@ impl PairedClientRegistry {
         }
     }
 
-    /// Every account with a paired client on the radio source and not
-    /// muted, with the station it is on, once per account and station
-    /// however many sockets it holds: the audio service's roll call
-    /// (`app/audio/svc.rs`). A muted client hears nothing, so it is no
-    /// listener; a quiet volume can be deliberate and still counts.
-    pub fn radio_listeners(&self) -> Vec<(Uuid, RadioStation)> {
-        let clients = self.clients.lock_recover();
-        let mut listeners: Vec<(Uuid, RadioStation)> = Vec::new();
-        for entry in clients.values().flatten() {
-            if entry.audio_source != AudioSource::Radio || entry.state.muted {
-                continue;
-            }
-            let listener = (entry.user_id, entry.radio_station);
-            if !listeners.contains(&listener) {
-                listeners.push(listener);
-            }
-        }
-        listeners
-    }
-
     /// Update every entry for `user_id` to the new station and push
     /// `SetPlaybackSource` to each, so a radio listener retunes at once.
     pub fn set_radio_station(&self, user_id: Uuid, station: RadioStation) {

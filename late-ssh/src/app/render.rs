@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear},
 };
 
-use late_core::models::leaderboard::LeaderboardData;
+use late_core::models::leaderboard::{ArcadeGame, LeaderboardData, ScoreGame};
 use late_core::models::statusline::StatusComponentSetting;
 use late_core::models::user::{RightSidebarComponentSetting, RightSidebarMode, RoomListMode};
 
@@ -174,8 +174,9 @@ struct DrawContext<'a> {
     calendar: &'a crate::app::calendar::state::CalendarState,
     dashboard_view: chat::ui::DashboardChatView<'a>,
     chat_view: chat::ui::ChatRenderInput<'a>,
-    game_selection: usize,
+    game_selection: ArcadeGame,
     is_playing_game: bool,
+    arcade_solvers_open: bool,
     door_delete_confirm: bool,
     usernames: &'a crate::usernames::UsernameLookup<'a>,
     /// Embedded match chat for the daily board; `None` while spectating,
@@ -274,6 +275,10 @@ struct DrawContext<'a> {
     nonogram_state: &'a crate::app::arcade::nonogram::state::State,
     solitaire_state: &'a crate::app::arcade::solitaire::state::State,
     minesweeper_state: &'a crate::app::arcade::minesweeper::state::State,
+    netwalk_state: &'a crate::app::arcade::netwalk::state::State,
+    chess_puzzle_state: &'a crate::app::arcade::chess_puzzle::state::State,
+    word_wheel_state: &'a crate::app::arcade::word_wheel::state::State,
+    quartets_state: &'a crate::app::arcade::quartets::state::State,
     dartboard_state: Option<&'a crate::app::artboard::state::State>,
     scratchpad: Option<&'a crate::app::scratchpad::state::ScratchpadState>,
     directory_state: &'a crate::app::directory::state::DirectoryState,
@@ -1654,8 +1659,10 @@ impl App {
             || self.stations_modal_state.is_open()
             || self.stream_modal.is_some()
             || self.chat.history_modal.is_open();
-        // No screen places a non-modal persistent raster today; the slot
-        // stays so a screen that does can tag its raster here.
+        // The chess boards' piece images need no tag: the cells a piece
+        // leaves are redrawn inside the frame (`redraw_vacated_persistent_raster`
+        // below). The slot stays for a raster whose pixels must go before
+        // the frame draws.
         let non_modal_image_tag: Option<u64> = None;
         let pre_wipe = self
             .terminal_image_render_state
@@ -1700,6 +1707,7 @@ impl App {
                         chat_view,
                         game_selection: self.game_selection,
                         is_playing_game: self.is_playing_game,
+                        arcade_solvers_open: self.arcade_solvers_open,
                         door_delete_confirm: self.door_delete_confirm,
                         usernames: chat_usernames,
                         daily_chat_view,
@@ -1768,6 +1776,10 @@ impl App {
                         nonogram_state: &self.nonogram_state,
                         solitaire_state: &self.solitaire_state,
                         minesweeper_state: &self.minesweeper_state,
+                        netwalk_state: &self.netwalk_state,
+                        chess_puzzle_state: &self.chess_puzzle_state,
+                        word_wheel_state: &self.word_wheel_state,
+                        quartets_state: &self.quartets_state,
                         dartboard_state: self.dartboard_state.as_ref(),
                         scratchpad: self.scratchpad.as_ref(),
                         directory_state: &self.directory_state,
@@ -1958,6 +1970,12 @@ impl App {
                 for effect in ultimate_effects {
                     crate::app::ultimates::apply_ultimate_postprocess(frame.buffer_mut(), effect);
                 }
+                self.terminal_image_render_state
+                    .redraw_vacated_persistent_raster(
+                        frame.buffer_mut(),
+                        &terminal_image_frame,
+                        suppress_new_raster,
+                    );
             })
             .context("failed to draw frame");
 
@@ -2560,10 +2578,21 @@ impl App {
                     nonogram_state: ctx.nonogram_state,
                     solitaire_state: ctx.solitaire_state,
                     minesweeper_state: ctx.minesweeper_state,
+                    netwalk_state: ctx.netwalk_state,
+                    chess_puzzle_state: ctx.chess_puzzle_state,
+                    word_wheel_state: ctx.word_wheel_state,
+                    quartets_state: ctx.quartets_state,
                     daily_completion: ctx.leaderboard.user_daily_statuses.get(&ctx.user_id),
                     session_daily_completion: ctx.session_daily_wins.today(),
                     quest_state: ctx.quest_state,
+                    today_statuses: &ctx.leaderboard.user_daily_statuses,
+                    usernames: ctx.usernames,
+                    user_id: ctx.user_id,
+                    username: ctx.clubhouse_own_username,
+                    show_solvers: ctx.arcade_solvers_open,
+                    image_protocol: ctx.terminal_image_protocol,
                 },
+                terminal_images,
             ),
             Screen::Leaderboard => crate::app::leaderboard::ui::draw(
                 frame,
@@ -3550,13 +3579,10 @@ fn append_arcade_title_extras(spans: &mut Vec<Span<'static>>, ctx: &DrawContext<
 
     spans.push(Span::styled("· ", Style::default().fg(theme::TEXT_DIM())));
     spans.push(Span::styled(
-        format!(
-            "{} ",
-            crate::app::arcade::ui::game_title(ctx.game_selection)
-        ),
+        format!("{} ", ctx.game_selection.title()),
         Style::default().fg(theme::TEXT_BRIGHT()),
     ));
-    if ctx.game_selection == crate::app::state::GAME_SELECTION_SNAKE {
+    if ctx.game_selection == ArcadeGame::Score(ScoreGame::Snake) {
         spans.push(Span::styled("by github.com/AndreLobato ", dim));
     }
 }

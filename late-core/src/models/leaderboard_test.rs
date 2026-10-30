@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::{
     models::{
+        chess_puzzle,
         chips::{ChipMove, Difficulty, UserChips},
         drink_round::Bar,
         drinks::{UserDrinks, WELCOME_DRINK_POINTS},
@@ -13,8 +14,10 @@ use crate::{
             LobbyGame, OnlineTimeIncrement, RankedEntry, ScoreGame, WeekBest, WeekGame,
             apply_online_time_batch, fetch_leaderboard_data, week_bests,
         },
+        minesweeper,
         mud_character::MudCharacter,
-        rubiks_cube, sliding_puzzle, snake, sudoku, tetris, twenty_forty_eight,
+        netwalk, nonogram, quartets, rubiks_cube, sliding_puzzle, snake, solitaire, sudoku, tetris,
+        twenty_forty_eight, word_wheel,
     },
     test_utils::{
         create_test_user, roll_high_scores_back_a_month, roll_score_events_back_a_month, test_db,
@@ -231,6 +234,140 @@ async fn daily_boards_and_arcade_points_follow_the_roster() {
     assert!(rival_status.completed_difficulty(DailyPuzzle::RubiksCube, "daily"));
     assert!(rival_status.completed(DailyPuzzle::SlidingPuzzle));
     assert!(rival_status.completed_difficulty(DailyPuzzle::SlidingPuzzle, "hard"));
+}
+
+/// The Arcade Wins weights, pinned whole: each comes from the puzzle's
+/// `tiers()`, so a tier moved in the roster shows up here as a changed
+/// string, never as a quietly different board.
+#[test]
+fn points_sql_follows_each_puzzles_tiers() {
+    let three =
+        "CASE difficulty_key WHEN 'easy' THEN 1 WHEN 'medium' THEN 3 WHEN 'hard' THEN 5 ELSE 0 END";
+    let points: Vec<(DailyPuzzle, String)> = DailyPuzzle::ALL
+        .iter()
+        .map(|puzzle| (*puzzle, puzzle.points_sql()))
+        .collect();
+    assert_eq!(
+        points,
+        vec![
+            (DailyPuzzle::LeWord, "1".to_string()),
+            (DailyPuzzle::WordWheel, three.to_string()),
+            (DailyPuzzle::Quartets, "3".to_string()),
+            (DailyPuzzle::Sudoku, three.to_string()),
+            (DailyPuzzle::Nonogram, three.to_string()),
+            (DailyPuzzle::Minesweeper, three.to_string()),
+            (DailyPuzzle::Netwalk, three.to_string()),
+            (DailyPuzzle::ChessPuzzle, three.to_string()),
+            (
+                DailyPuzzle::Solitaire,
+                "CASE difficulty_key WHEN 'draw-1' THEN 3 WHEN 'draw-3' THEN 5 ELSE 0 END"
+                    .to_string()
+            ),
+            (DailyPuzzle::SlidingPuzzle, three.to_string()),
+            (DailyPuzzle::RubiksCube, "3".to_string()),
+        ]
+    );
+}
+
+/// One win of `puzzle` on its board `difficulty_key`, through the
+/// puzzle's own model: the win insert that has to carry the rollup bump.
+async fn record_daily_win(
+    client: &tokio_postgres::Client,
+    puzzle: DailyPuzzle,
+    user_id: Uuid,
+    difficulty_key: &str,
+    tier: Difficulty,
+    day: NaiveDate,
+) {
+    let key = difficulty_key.to_string();
+    match puzzle {
+        DailyPuzzle::LeWord => {
+            le_word::DailyWin::record_win(client, user_id, day, 4)
+                .await
+                .expect("le word win");
+        }
+        DailyPuzzle::RubiksCube => {
+            rubiks_cube::DailyWin::record_win(client, user_id, day)
+                .await
+                .expect("rubiks cube win");
+        }
+        DailyPuzzle::SlidingPuzzle => {
+            sliding_puzzle::DailyWin::record_win(client, user_id, tier, day, 30)
+                .await
+                .expect("sliding puzzle win");
+        }
+        DailyPuzzle::Sudoku => {
+            sudoku::DailyWin::record_win(client, user_id, key, day, 100)
+                .await
+                .expect("sudoku win");
+        }
+        DailyPuzzle::Nonogram => {
+            nonogram::DailyWin::record_win(client, user_id, key, day)
+                .await
+                .expect("nonogram win");
+        }
+        DailyPuzzle::Minesweeper => {
+            minesweeper::DailyWin::record_win(client, user_id, key, day, 100)
+                .await
+                .expect("minesweeper win");
+        }
+        DailyPuzzle::Solitaire => {
+            solitaire::DailyWin::record_win(client, user_id, key, day, 100)
+                .await
+                .expect("solitaire win");
+        }
+        DailyPuzzle::Netwalk => {
+            netwalk::DailyWin::record_win(client, user_id, tier, day, 30)
+                .await
+                .expect("netwalk win");
+        }
+        DailyPuzzle::ChessPuzzle => {
+            chess_puzzle::DailyWin::record_win(client, user_id, tier, day, 1)
+                .await
+                .expect("chess puzzle win");
+        }
+        DailyPuzzle::WordWheel => {
+            word_wheel::DailyWin::record_win(client, user_id, tier, day, 40)
+                .await
+                .expect("word wheel win");
+        }
+        DailyPuzzle::Quartets => {
+            quartets::DailyWin::record_win(client, user_id, day, 1)
+                .await
+                .expect("quartets win");
+        }
+    }
+}
+
+/// The win inserts are the one thing the roster cannot generate: each must
+/// compose `bump_daily_win_total_sql`, or the puzzle's all-time board stays
+/// empty. Every puzzle's every board, won once and then replayed, counts
+/// one win per board in the rollup.
+#[tokio::test]
+async fn every_daily_win_insert_bumps_the_all_time_rollup_once() {
+    let test_db = test_db().await;
+    let client = test_db.db.get().await.expect("db client");
+    let solver = create_test_user(&test_db.db, "lb_rollup_every_daily").await;
+    let today = Utc::now().date_naive();
+
+    for puzzle in DailyPuzzle::ALL {
+        let tiers = puzzle.tiers().list();
+        for (difficulty_key, tier) in &tiers {
+            for _ in 0..2 {
+                record_daily_win(&client, *puzzle, solver.id, difficulty_key, *tier, today).await;
+            }
+        }
+        // Raw witness on the rollup itself.
+        let wins: i64 = client
+            .query_one(
+                "SELECT wins FROM daily_win_totals WHERE game = $1 AND user_id = $2",
+                &[&puzzle.key(), &solver.id],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{puzzle:?} rollup row: {error}"))
+            .get(0);
+        assert_eq!(wins, tiers.len() as i64, "{puzzle:?}");
+    }
 }
 
 /// Same-day replays upsert the win row (keep-best-score), so they must not
@@ -1034,8 +1171,8 @@ async fn the_weeks_best_counts_only_the_week() {
     assert_eq!(
         week_bests(&client, last).await.expect("week"),
         vec![
-            best(WeekGame::Daily(DailyPuzzle::Sudoku), 1),
             best(WeekGame::Daily(DailyPuzzle::LeWord), 3),
+            best(WeekGame::Daily(DailyPuzzle::Sudoku), 1),
             best(WeekGame::Score(ScoreGame::Lateris), 900),
             best(WeekGame::Lobby(LobbyGame::Chess), 1),
             best(WeekGame::Door(DoorGame::Dcss), 4_000),
@@ -1148,8 +1285,8 @@ async fn a_days_tallies_count_the_days_finishes_by_game() {
     assert_eq!(
         day_tallies(&client, today).await.expect("day"),
         vec![
-            tally(DayGame::Daily(DailyPuzzle::Sudoku), 1, 1),
             tally(DayGame::Daily(DailyPuzzle::LeWord), 3, 3),
+            tally(DayGame::Daily(DailyPuzzle::Sudoku), 1, 1),
             tally(DayGame::Score(ScoreGame::Lateris), 1, 0),
             tally(DayGame::Lobby(LobbyGame::Chess), 2, 2),
             tally(DayGame::Door(DoorCard::Lateania), 1, 0),
@@ -1190,6 +1327,71 @@ async fn a_days_tallies_count_the_days_finishes_by_game() {
         day_shelves,
         vec![Shelf::Arcade, Shelf::Arcade, Shelf::Lobby, Shelf::Doors],
         "every hub card is a door of the day's shelf"
+    );
+}
+
+/// A day's Lobby starts are the claims made that day, by game in roster
+/// order, whatever the match did after: finished or still active both
+/// count, an open or cancelled challenge never does, and a match claimed
+/// on another day is that day's.
+#[tokio::test]
+async fn a_days_lobby_starts_count_the_days_claims_by_game() {
+    use crate::models::daily_match::DailyMatch;
+    use crate::models::leaderboard::{LobbyStarts, day_lobby_starts};
+    let test_db = test_db().await;
+    let client = test_db.db.get().await.expect("db client");
+    let host = create_test_user(&test_db.db, "starts_host").await;
+    let guest = create_test_user(&test_db.db, "starts_guest").await;
+    let today = Utc::now().date_naive();
+    let state = json!({});
+
+    lobby_win(&client, LobbyGame::Snooker, host.id, guest.id, "paid").await;
+    let mut claimed = Vec::new();
+    for game in [LobbyGame::Chess, LobbyGame::Chess, LobbyGame::Reversi] {
+        let challenge = DailyMatch::create_challenge(&client, game.kind(), host.id)
+            .await
+            .expect("create challenge");
+        DailyMatch::claim(
+            &client,
+            challenge.id,
+            guest.id,
+            host.id,
+            Utc::now() + Duration::hours(1),
+            &state,
+        )
+        .await
+        .expect("claim")
+        .expect("challenge was open");
+        claimed.push(challenge.id);
+    }
+    DailyMatch::create_challenge(&client, LobbyGame::Chess.kind(), host.id)
+        .await
+        .expect("an open challenge");
+    let cancelled = DailyMatch::create_challenge(&client, LobbyGame::Reversi.kind(), host.id)
+        .await
+        .expect("a cancelled challenge");
+    DailyMatch::cancel_challenge(&client, cancelled.id, host.id)
+        .await
+        .expect("cancel");
+    client
+        .execute(
+            "UPDATE daily_matches SET started_at = started_at - INTERVAL '10 days' WHERE id = $1",
+            &[&claimed[2]],
+        )
+        .await
+        .expect("a reversi match claimed ten days ago");
+
+    let started = |game, started| LobbyStarts { game, started };
+    assert_eq!(
+        day_lobby_starts(&client, today).await.expect("today"),
+        vec![started(LobbyGame::Chess, 2), started(LobbyGame::Snooker, 1)],
+        "chess: two claims still active; snooker: claimed and finished; the open and cancelled challenges never started"
+    );
+    assert_eq!(
+        day_lobby_starts(&client, today - Duration::days(10))
+            .await
+            .expect("ten days ago"),
+        vec![started(LobbyGame::Reversi, 1)]
     );
 }
 

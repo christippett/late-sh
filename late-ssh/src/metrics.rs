@@ -1,6 +1,7 @@
 use late_core::models::article::NewsShareReward;
 use late_core::models::chat_message_gild::GildTier;
 use late_core::models::chat_room::WatchDoor;
+use late_core::models::chips::Difficulty;
 use late_core::models::door_opening::DoorCard;
 use late_core::models::leaderboard::{DailyPuzzle, DoorGame};
 use late_core::models::media_queue_item::SongQueueReward;
@@ -25,7 +26,8 @@ use crate::app::clubhouse::state::Tutorial;
 use crate::app::common::primitives::Screen;
 use crate::app::deadchannel::haunt::state::GateVerdict;
 use crate::app::door::realm::svc::{
-    RealmChatRoomAttach, RealmPayout, RealmSeasonOpen, RealmSnapshotRowError,
+    RealmChatRoomAttach, RealmFightResult, RealmNightOutcome, RealmOrderOutcome, RealmPayout,
+    RealmSeasonOpen, RealmSnapshotRowError,
 };
 use crate::app::door::zork::protocol::{Action as ZorkAction, Edition as ZorkEdition};
 use crate::app::games::chips::svc::{GiftDrinkRefusal, RoundRefusal};
@@ -168,13 +170,13 @@ pub enum HeraldBriefResult {
     Failed,
 }
 
-/// How one radio roll call (`app/audio`, every `RADIO_ROLL_CALL_INTERVAL`
-/// on every replica) went: `Called` wrote this replica's paired radio
+/// How one roll call (`app/audio`, every `ROLL_CALL_INTERVAL` on every
+/// replica) went: `Called` wrote this replica's online radio and YouTube
 /// listeners down for the day, `Failed` stopped at the first listener it
 /// could not write (the ones before it are written, and the next call
 /// fills the gap: a listener already written is a no-op).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RadioRollCallResult {
+pub enum RollCallResult {
     Called,
     Failed,
 }
@@ -535,7 +537,7 @@ pub enum ArcadeMode {
 }
 
 /// The difficulty of a finished Arcade board. `Single` is a game with one
-/// board a day and no difficulty (Le Word, Rubik's Cube).
+/// board a day and no difficulty (Le Word, Rubik's Cube, Quartets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArcadeDifficulty {
     Easy,
@@ -546,13 +548,33 @@ pub enum ArcadeDifficulty {
     Single,
 }
 
-/// How an Arcade board ended. Only Le Word (out of guesses) and
-/// Minesweeper (out of lives) can be lost; the rest end solved or not at
-/// all.
+impl ArcadeDifficulty {
+    /// The label of a board on one of the three shared tiers.
+    pub const fn of(difficulty: Difficulty) -> Self {
+        match difficulty {
+            Difficulty::Easy => Self::Easy,
+            Difficulty::Medium => Self::Medium,
+            Difficulty::Hard => Self::Hard,
+        }
+    }
+}
+
+/// How an Arcade board ended. Only Le Word (out of guesses), Minesweeper
+/// and Chess Puzzle (out of lives) and Quartets (out of strikes) can be
+/// lost; the rest end solved or not at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArcadeFinish {
     Won,
     Lost,
+}
+
+/// How one load of a database-claimed daily's puzzle and saved progress
+/// ended (`arcade/daily_load.rs`), at connect, after a failed load, or at
+/// the UTC rollover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArcadeDailyLoad {
+    Loaded,
+    Failed,
 }
 
 /// Whether a session's second of attention had a key press behind it
@@ -783,18 +805,19 @@ mod inner {
     use super::ShareCardKind;
     use super::SlidingPuzzleArtLoad;
     use super::{
-        ActivityGame, ArcadeDifficulty, ArcadeFinish, ArcadeMode, AwardAnnouncementOutcome,
-        BioScreenOutcome, DailyPuzzle, DailyWinPayout, DoorCard, DoorGame, DoorOpeningResult,
-        DoorWatchOutcome, FightBeat, FirstContactBeat, GalleryApplauseResult, GalleryHangResult,
-        GalleryTakeDownResult, GateVerdict, GiftDrinkRefusal, GildRefusal, GildTier,
-        HeraldBriefResult, HeraldDeliveryResult, HeraldLookResult, HeraldPostResult,
-        JobsFetchResult, JobsPostResult, JobsPressResult, JobsReadResult, LoungeBeat,
-        NewsShareReward, NightcapHouseFailure, NightcapOrderResult, OldSignalPayout,
-        OnlineTimeFlushResult, OutputKind, PaperOpenResult, PaperPrintResult, Place,
-        PoolShotOutcome, PotRefusal, PotReminderOutcome, Presence, PresenceScope, PresenceWire,
-        RadioRollCallResult, RadioStation, RealmChatRoomAttach, RealmPayout, RealmSeasonOpen,
-        RealmSnapshotRowError, Refresh, RefreshOutcome, RenderReason, RoundRefusal, RunnerDoor,
-        Screen, SendRefusal, SessionStartStage, SessionUser, SnapshotRowError, SongQueueReward,
+        ActivityGame, ArcadeDailyLoad, ArcadeDifficulty, ArcadeFinish, ArcadeMode,
+        AwardAnnouncementOutcome, BioScreenOutcome, DailyPuzzle, DailyWinPayout, DoorCard,
+        DoorGame, DoorOpeningResult, DoorWatchOutcome, FightBeat, FirstContactBeat,
+        GalleryApplauseResult, GalleryHangResult, GalleryTakeDownResult, GateVerdict,
+        GiftDrinkRefusal, GildRefusal, GildTier, HeraldBriefResult, HeraldDeliveryResult,
+        HeraldLookResult, HeraldPostResult, JobsFetchResult, JobsPostResult, JobsPressResult,
+        JobsReadResult, LoungeBeat, NewsShareReward, NightcapHouseFailure, NightcapOrderResult,
+        OldSignalPayout, OnlineTimeFlushResult, OutputKind, PaperOpenResult, PaperPrintResult,
+        Place, PoolShotOutcome, PotRefusal, PotReminderOutcome, Presence, PresenceScope,
+        PresenceWire, RadioStation, RealmChatRoomAttach, RealmFightResult, RealmNightOutcome,
+        RealmOrderOutcome, RealmPayout, RealmSeasonOpen, RealmSnapshotRowError, Refresh,
+        RefreshOutcome, RenderReason, RollCallResult, RoundRefusal, RunnerDoor, Screen,
+        SendRefusal, SessionStartStage, SessionUser, SnapshotRowError, SongQueueReward,
         SshRejectReason, SummaryResult, TailorBeat, ThumbnailFetch, TranslationResult,
         VizWireBands, WatchDoor,
     };
@@ -835,6 +858,9 @@ mod inner {
             ActivityGame::Blackjack => "blackjack",
             ActivityGame::Brogue => "brogue",
             ActivityGame::Chess => "chess",
+            ActivityGame::ChessPuzzle => "chess_puzzle",
+            ActivityGame::WordWheel => "word_wheel",
+            ActivityGame::Quartets => "quartets",
             ActivityGame::Darkroom => "darkroom",
             ActivityGame::Dcss => "dcss",
             ActivityGame::GreenDragon => "greendragon",
@@ -842,6 +868,7 @@ mod inner {
             ActivityGame::Minesweeper => "minesweeper",
             ActivityGame::Mud => "mud",
             ActivityGame::Nethack => "nethack",
+            ActivityGame::Netwalk => "netwalk",
             ActivityGame::Nonogram => "nonogram",
             ActivityGame::Poker => "poker",
             ActivityGame::Realm => "realm",
@@ -1702,6 +1729,42 @@ mod inner {
         })
     }
 
+    fn realm_nights_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_realm_nights_total")
+                .with_description(
+                    "Realm campaign nights, one per day turned over, by outcome: resolved, won, dissolved, failed (nothing written, the next sweep retries)",
+                )
+                .build()
+        })
+    }
+
+    fn realm_fights_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_realm_fights_total")
+                .with_description(
+                    "Realm campaign fights resolved at the night, one per target (fizzled: one per order no longer legal), by result: taken, held, bounced, fizzled",
+                )
+                .build()
+        })
+    }
+
+    fn realm_orders_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_realm_orders_total")
+                .with_description(
+                    "Realm campaign orders given, by outcome: placed, withdrawn, refused (by the rules, for free)",
+                )
+                .build()
+        })
+    }
+
     fn realm_snapshot_rows_rejected_total() -> &'static Counter<u64> {
         static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
         METRIC.get_or_init(|| {
@@ -1838,10 +1901,10 @@ mod inner {
         })
     }
 
-    fn radio_roll_call_result_label(result: RadioRollCallResult) -> &'static str {
+    fn roll_call_result_label(result: RollCallResult) -> &'static str {
         match result {
-            RadioRollCallResult::Called => "called",
-            RadioRollCallResult::Failed => "failed",
+            RollCallResult::Called => "called",
+            RollCallResult::Failed => "failed",
         }
     }
 
@@ -1851,7 +1914,7 @@ mod inner {
             meter()
                 .u64_counter("late_ssh_radio_roll_calls_total")
                 .with_description(
-                    "Radio roll calls (paired listeners written to radio_listens) by result",
+                    "Roll calls (online radio and YouTube listeners written to radio_listens and youtube_listens) by result",
                 )
                 .build()
         })
@@ -1863,25 +1926,38 @@ mod inner {
             meter()
                 .u64_counter("late_ssh_radio_listeners_total")
                 .with_description(
-                    "Paired clients on the radio source at each roll call, by station",
+                    "Online accounts on the radio source at each roll call, by station",
                 )
                 .build()
         })
     }
 
-    /// One roll call: its result, and how many listeners it found on each
-    /// station (a listener is one account on one station).
-    pub fn record_radio_roll_call(result: RadioRollCallResult, listeners: &[(RadioStation, u64)]) {
+    fn youtube_listeners_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_youtube_listeners_total")
+                .with_description("Online accounts on the YouTube source at each roll call")
+                .build()
+        })
+    }
+
+    /// One roll call: its result, how many listeners it found on each
+    /// station (a listener is one account on one station), and how many
+    /// were on YouTube.
+    pub fn record_roll_call(
+        result: RollCallResult,
+        stations: &[(RadioStation, u64)],
+        youtube: u64,
+    ) {
         radio_roll_calls_total().add(
             1,
-            &[KeyValue::new(
-                "result",
-                radio_roll_call_result_label(result),
-            )],
+            &[KeyValue::new("result", roll_call_result_label(result))],
         );
-        for (station, count) in listeners {
+        for (station, count) in stations {
             radio_listeners_total().add(*count, &[KeyValue::new("station", station.as_str())]);
         }
+        youtube_listeners_total().add(youtube, &[]);
     }
 
     fn booth_thumbnails_total() -> &'static Counter<u64> {
@@ -1975,6 +2051,18 @@ mod inner {
                 .u64_counter("late_ssh_arcade_finishes_total")
                 .with_description(
                     "Arcade daily-puzzle boards ended on a session, by game, mode, difficulty and finish",
+                )
+                .build()
+        })
+    }
+
+    fn arcade_daily_loads_total() -> &'static Counter<u64> {
+        static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+        METRIC.get_or_init(|| {
+            meter()
+                .u64_counter("late_ssh_arcade_daily_loads_total")
+                .with_description(
+                    "Loads of a database-claimed Arcade daily (puzzle and saved progress), by game and outcome",
                 )
                 .build()
         })
@@ -2658,6 +2746,24 @@ mod inner {
         );
     }
 
+    fn arcade_daily_load_label(load: ArcadeDailyLoad) -> &'static str {
+        match load {
+            ArcadeDailyLoad::Loaded => "loaded",
+            ArcadeDailyLoad::Failed => "failed",
+        }
+    }
+
+    /// One load of today's `puzzle` and the player's saved progress on it.
+    pub fn record_arcade_daily_load(puzzle: DailyPuzzle, load: ArcadeDailyLoad) {
+        arcade_daily_loads_total().add(
+            1,
+            &[
+                KeyValue::new("game", puzzle.key()),
+                KeyValue::new("outcome", arcade_daily_load_label(load)),
+            ],
+        );
+    }
+
     fn screen_label(screen: Screen) -> &'static str {
         match screen {
             Screen::Dashboard => "dashboard",
@@ -2893,13 +2999,7 @@ mod inner {
 
     fn share_card_kind_label(kind: ShareCardKind) -> &'static str {
         match kind {
-            ShareCardKind::LeWord => "le_word",
-            ShareCardKind::Nonogram => "nonogram",
-            ShareCardKind::Sudoku => "sudoku",
-            ShareCardKind::Minesweeper => "minesweeper",
-            ShareCardKind::Solitaire => "solitaire",
-            ShareCardKind::RubiksCube => "rubiks_cube",
-            ShareCardKind::SlidingPuzzle => "sliding_puzzle",
+            ShareCardKind::Daily(puzzle) => puzzle.key(),
             ShareCardKind::Day => "day",
             ShareCardKind::Road => "road",
         }
@@ -3024,6 +3124,47 @@ mod inner {
 
     pub fn record_realm_chat_rooms_reaped(deleted: u64) {
         realm_chat_rooms_reaped_total().add(deleted, &[]);
+    }
+
+    fn realm_night_label(outcome: RealmNightOutcome) -> &'static str {
+        match outcome {
+            RealmNightOutcome::Resolved => "resolved",
+            RealmNightOutcome::Won => "won",
+            RealmNightOutcome::Dissolved => "dissolved",
+            RealmNightOutcome::Failed => "failed",
+        }
+    }
+
+    pub fn record_realm_night(outcome: RealmNightOutcome) {
+        realm_nights_total().add(1, &[KeyValue::new("outcome", realm_night_label(outcome))]);
+    }
+
+    fn realm_fight_label(result: RealmFightResult) -> &'static str {
+        match result {
+            RealmFightResult::Taken => "taken",
+            RealmFightResult::Held => "held",
+            RealmFightResult::Bounced => "bounced",
+            RealmFightResult::Fizzled => "fizzled",
+        }
+    }
+
+    pub fn record_realm_fights(result: RealmFightResult, count: u32) {
+        realm_fights_total().add(
+            u64::from(count),
+            &[KeyValue::new("result", realm_fight_label(result))],
+        );
+    }
+
+    fn realm_order_label(outcome: RealmOrderOutcome) -> &'static str {
+        match outcome {
+            RealmOrderOutcome::Placed => "placed",
+            RealmOrderOutcome::Withdrawn => "withdrawn",
+            RealmOrderOutcome::Refused => "refused",
+        }
+    }
+
+    pub fn record_realm_order(outcome: RealmOrderOutcome) {
+        realm_orders_total().add(1, &[KeyValue::new("outcome", realm_order_label(outcome))]);
     }
 
     fn realm_snapshot_row_rejected_label(error: &RealmSnapshotRowError) -> &'static str {
@@ -4296,18 +4437,19 @@ mod inner {
     use super::ShareCardKind;
     use super::SlidingPuzzleArtLoad;
     use super::{
-        ActivityGame, ArcadeDifficulty, ArcadeFinish, ArcadeMode, AwardAnnouncementOutcome,
-        BioScreenOutcome, DailyPuzzle, DailyWinPayout, DoorCard, DoorGame, DoorOpeningResult,
-        DoorWatchOutcome, FightBeat, FirstContactBeat, GalleryApplauseResult, GalleryHangResult,
-        GalleryTakeDownResult, GateVerdict, GiftDrinkRefusal, GildRefusal, GildTier,
-        HeraldBriefResult, HeraldDeliveryResult, HeraldLookResult, HeraldPostResult,
-        JobsFetchResult, JobsPostResult, JobsPressResult, JobsReadResult, LoungeBeat,
-        NewsShareReward, NightcapHouseFailure, NightcapOrderResult, OldSignalPayout,
-        OnlineTimeFlushResult, OutputKind, PaperOpenResult, PaperPrintResult, Place,
-        PoolShotOutcome, PotRefusal, PotReminderOutcome, Presence, PresenceScope, PresenceWire,
-        RadioRollCallResult, RadioStation, RealmChatRoomAttach, RealmPayout, RealmSeasonOpen,
-        RealmSnapshotRowError, Refresh, RefreshOutcome, RenderReason, RoundRefusal, RunnerDoor,
-        Screen, SendRefusal, SessionStartStage, SessionUser, SnapshotRowError, SongQueueReward,
+        ActivityGame, ArcadeDailyLoad, ArcadeDifficulty, ArcadeFinish, ArcadeMode,
+        AwardAnnouncementOutcome, BioScreenOutcome, DailyPuzzle, DailyWinPayout, DoorCard,
+        DoorGame, DoorOpeningResult, DoorWatchOutcome, FightBeat, FirstContactBeat,
+        GalleryApplauseResult, GalleryHangResult, GalleryTakeDownResult, GateVerdict,
+        GiftDrinkRefusal, GildRefusal, GildTier, HeraldBriefResult, HeraldDeliveryResult,
+        HeraldLookResult, HeraldPostResult, JobsFetchResult, JobsPostResult, JobsPressResult,
+        JobsReadResult, LoungeBeat, NewsShareReward, NightcapHouseFailure, NightcapOrderResult,
+        OldSignalPayout, OnlineTimeFlushResult, OutputKind, PaperOpenResult, PaperPrintResult,
+        Place, PoolShotOutcome, PotRefusal, PotReminderOutcome, Presence, PresenceScope,
+        PresenceWire, RadioStation, RealmChatRoomAttach, RealmFightResult, RealmNightOutcome,
+        RealmOrderOutcome, RealmPayout, RealmSeasonOpen, RealmSnapshotRowError, Refresh,
+        RefreshOutcome, RenderReason, RollCallResult, RoundRefusal, RunnerDoor, Screen,
+        SendRefusal, SessionStartStage, SessionUser, SnapshotRowError, SongQueueReward,
         SshRejectReason, SummaryResult, TailorBeat, ThumbnailFetch, TranslationResult,
         VizWireBands, WatchDoor,
     };
@@ -4390,6 +4532,7 @@ mod inner {
         _finish: ArcadeFinish,
     ) {
     }
+    pub fn record_arcade_daily_load(_puzzle: DailyPuzzle, _load: ArcadeDailyLoad) {}
     pub fn record_attention(
         _screen: Screen,
         _place: Place,
@@ -4416,6 +4559,9 @@ mod inner {
     pub fn record_realm_season_open(_outcome: RealmSeasonOpen) {}
     pub fn record_realm_chat_room_attach(_outcome: RealmChatRoomAttach) {}
     pub fn record_realm_chat_rooms_reaped(_deleted: u64) {}
+    pub fn record_realm_night(_outcome: RealmNightOutcome) {}
+    pub fn record_realm_fights(_result: RealmFightResult, _count: u32) {}
+    pub fn record_realm_order(_outcome: RealmOrderOutcome) {}
     pub fn record_realm_snapshot_row_rejected(_error: &RealmSnapshotRowError) {}
     pub fn record_irc_history(_request: IrcHistoryRequest, _outcome: IrcHistoryOutcome) {}
     pub fn record_news_shared(_reward: NewsShareReward) {}
@@ -4426,9 +4572,10 @@ mod inner {
     pub fn record_news_save(_outcome: NewsSaveOutcome) {}
     pub fn record_news_card(_outcome: NewsCardOutcome) {}
     pub fn record_song_queued(_reward: SongQueueReward) {}
-    pub fn record_radio_roll_call(
-        _result: RadioRollCallResult,
-        _listeners: &[(RadioStation, u64)],
+    pub fn record_roll_call(
+        _result: RollCallResult,
+        _stations: &[(RadioStation, u64)],
+        _youtube: u64,
     ) {
     }
     pub fn record_booth_thumbnail(_outcome: ThumbnailFetch) {}
